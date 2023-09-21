@@ -29,7 +29,6 @@ def diagonalize_pprpa_singlet(nocc, mo_energy, Lpq, nocc_act, nvir_act):
     nvir_fro = nvir - nvir_act  # number of frozen virtual orbitals
 
     oo_dim = int((nocc_act + 1) * nocc_act / 2)  # number of hole-hole pairs
-    vv_dim = int((nvir_act + 1) * nvir_act / 2)  # number of particle-particle pairs
 
     tri_row_o, tri_col_o = numpy.tril_indices(nocc_act)
     tri_row_v, tri_col_v = numpy.tril_indices(nvir_act)
@@ -54,53 +53,53 @@ def diagonalize_pprpa_singlet(nocc, mo_energy, Lpq, nocc_act, nvir_act):
     A = A[tri_row_v, tri_col_v, ...]
     A = A[..., tri_row_v, tri_col_v]
 
-    if nocc_act > 0:
-        # B matrix: particle-hole block
-        B = einsum("Pai,Pbj->abij", Lpq_act[:, nocc_act:, :nocc_act], Lpq_act[:, nocc_act:, :nocc_act], optimize=True)
-        B += einsum("Paj,Pbi->abij", Lpq_act[:, nocc_act:, :nocc_act], Lpq_act[:, nocc_act:, :nocc_act], optimize=True)
+    # B matrix: particle-hole block
+    B = einsum("Pai,Pbj->abij", Lpq_act[:, nocc_act:, :nocc_act], Lpq_act[:, nocc_act:, :nocc_act], optimize=True)
+    B += einsum("Paj,Pbi->abij", Lpq_act[:, nocc_act:, :nocc_act], Lpq_act[:, nocc_act:, :nocc_act], optimize=True)
 
-        B[numpy.diag_indices(nvir_act)] *= 1.0 / numpy.sqrt(2)
-        B = B.transpose(2, 3, 0, 1)
-        B[numpy.diag_indices(nocc_act)] *= 1.0 / numpy.sqrt(2)
-        B = B.transpose(2, 3, 0, 1)
+    B[numpy.diag_indices(nvir_act)] *= 1.0 / numpy.sqrt(2)
+    B = B.transpose(2, 3, 0, 1)
+    B[numpy.diag_indices(nocc_act)] *= 1.0 / numpy.sqrt(2)
+    B = B.transpose(2, 3, 0, 1)
 
-        B = B[tri_row_v, tri_col_v, ...]
-        B = B[..., tri_row_o, tri_col_o]
+    B = B[tri_row_v, tri_col_v, ...]
+    B = B[..., tri_row_o, tri_col_o]
 
-        # C matrix: hole-hole block
-        C = einsum("Pik,Pjl->ijkl", Lpq_act[:, :nocc_act, :nocc_act], Lpq_act[:, :nocc_act, :nocc_act], optimize=True)
-        C += einsum("Pil,Pjk->ijkl", Lpq_act[:, :nocc_act, :nocc_act], Lpq_act[:, :nocc_act, :nocc_act], optimize=True)
+    # C matrix: hole-hole block
+    C = einsum("Pik,Pjl->ijkl", Lpq_act[:, :nocc_act, :nocc_act], Lpq_act[:, :nocc_act, :nocc_act], optimize=True)
+    C += einsum("Pil,Pjk->ijkl", Lpq_act[:, :nocc_act, :nocc_act], Lpq_act[:, :nocc_act, :nocc_act], optimize=True)
 
-        C[numpy.diag_indices(nocc_act)] *= 1.0 / numpy.sqrt(2)
-        C = C.transpose(2, 3, 0, 1)
-        C[numpy.diag_indices(nocc_act)] *= 1.0 / numpy.sqrt(2)
-        C = C.transpose(2, 3, 0, 1)
+    C[numpy.diag_indices(nocc_act)] *= 1.0 / numpy.sqrt(2)
+    C = C.transpose(2, 3, 0, 1)
+    C[numpy.diag_indices(nocc_act)] *= 1.0 / numpy.sqrt(2)
+    C = C.transpose(2, 3, 0, 1)
 
-        C = C.reshape(nocc_act*nocc_act, nocc_act*nocc_act)
-        orb_sum = numpy.asarray(mo_energy[nocc_fro:nocc_act, None] + mo_energy[None, nocc_fro:nocc_act]).reshape(-1)
-        orb_sum -= 2.0 * mu
-        numpy.fill_diagonal(C, C.diagonal() - orb_sum)
-        C = C.reshape(nocc_act, nocc_act, nocc_act, nocc_act)
+    C = C.reshape(nocc_act*nocc_act, nocc_act*nocc_act)
+    orb_sum = numpy.asarray(mo_energy[nocc_fro:nocc_act, None] + mo_energy[None, nocc_fro:nocc_act]).reshape(-1)
+    orb_sum -= 2.0 * mu
+    numpy.fill_diagonal(C, C.diagonal() - orb_sum)
+    C = C.reshape(nocc_act, nocc_act, nocc_act, nocc_act)
 
-        C = C[tri_row_o, tri_col_o, ...]
-        C = C[..., tri_row_o, tri_col_o]
+    C = C[tri_row_o, tri_col_o, ...]
+    C = C[..., tri_row_o, tri_col_o]
 
-        # combine A, B and C matrix as
-        # | A B |
-        # |B^T C|
-        M_upper = numpy.concatenate((A, B), axis=1)
-        M_lower = numpy.concatenate((B.T, C), axis=1)
-        M = numpy.concatenate((M_upper, M_lower), axis=0)
+    # combine A, B and C matrix as
+    # | C B^T |
+    # |B A|
+    M_upper = numpy.concatenate((C, B.T), axis=1)
+    M_lower = numpy.concatenate((B, A), axis=1)
+    M = numpy.concatenate((M_upper, M_lower), axis=0)
 
-        # M = MW, W is the metric matrix [[I,0],[0,-I]]
-        M[:][vv_dim:] *= -1.0
-    else:
-        M = A
+    # M = MW, W is the metric matrix [[I,0],[0,-I]]
+    M[:oo_dim][:] *= -1.0
 
-    exci, xy = scipy.linalg.eigh(M)
+    exci, xy = scipy.linalg.eig(M)
+    exci = exci.real
+    xy = xy.T
+    xy = numpy.asarray(list(x for _, x in sorted(zip(exci, xy), reverse=False)))
+    exci = numpy.sort(exci)
 
-    TDA = True if nocc_act == 0 else False
-    pprpa_orthonormalize_eigenvector(multi="s", nocc=nocc_act, TDA=TDA, exci=exci, xy=xy)
+    pprpa_orthonormalize_eigenvector(multi="s", nocc=nocc_act, TDA=None, exci=exci, xy=xy)
 
     trace_A = numpy.trace(A)
     sum_exci = numpy.sum(exci[oo_dim:])
@@ -132,7 +131,6 @@ def diagonalize_pprpa_triplet(nocc, mo_energy, Lpq, nocc_act, nvir_act):
     nvir_fro = nvir - nvir_act  # number of frozen virtual orbitals
 
     oo_dim = int((nocc_act - 1) * nocc_act / 2)  # number of hole-hole pairs
-    vv_dim = int((nvir_act - 1) * nvir_act / 2)  # number of particle-particle pairs
 
     tri_row_o, tri_col_o = numpy.tril_indices(nocc_act, -1)
     tri_row_v, tri_col_v = numpy.tril_indices(nvir_act, -1)
@@ -152,43 +150,43 @@ def diagonalize_pprpa_triplet(nocc, mo_energy, Lpq, nocc_act, nvir_act):
     A = A[tri_row_v, tri_col_v, ...]
     A = A[..., tri_row_v, tri_col_v]
 
-    if nocc_act > 0:
-        # B matrix: particle-hole block
-        B = einsum("Pai,Pbj->abij", Lpq_act[:, nocc_act:, :nocc_act], Lpq_act[:, nocc_act:, :nocc_act], optimize=True)
-        B -= einsum("Paj,Pbi->abij", Lpq_act[:, nocc_act:, :nocc_act], Lpq_act[:, nocc_act:, :nocc_act], optimize=True)
+    # B matrix: particle-hole block
+    B = einsum("Pai,Pbj->abij", Lpq_act[:, nocc_act:, :nocc_act], Lpq_act[:, nocc_act:, :nocc_act], optimize=True)
+    B -= einsum("Paj,Pbi->abij", Lpq_act[:, nocc_act:, :nocc_act], Lpq_act[:, nocc_act:, :nocc_act], optimize=True)
 
-        B = B[tri_row_v, tri_col_v, ...]
-        B = B[..., tri_row_o, tri_col_o]
+    B = B[tri_row_v, tri_col_v, ...]
+    B = B[..., tri_row_o, tri_col_o]
 
-        # C matrix: hole-hole block
-        C = einsum("Pik,Pjl->ijkl", Lpq_act[:, :nocc_act, :nocc_act], Lpq_act[:, :nocc_act, :nocc_act], optimize=True)
-        C -= einsum("Pil,Pjk->ijkl", Lpq_act[:, :nocc_act, :nocc_act], Lpq_act[:, :nocc_act, :nocc_act], optimize=True)
+    # C matrix: hole-hole block
+    C = einsum("Pik,Pjl->ijkl", Lpq_act[:, :nocc_act, :nocc_act], Lpq_act[:, :nocc_act, :nocc_act], optimize=True)
+    C -= einsum("Pil,Pjk->ijkl", Lpq_act[:, :nocc_act, :nocc_act], Lpq_act[:, :nocc_act, :nocc_act], optimize=True)
 
-        C = C.reshape(nocc_act*nocc_act, nocc_act*nocc_act)
-        orb_sum = numpy.asarray(mo_energy[nocc_fro:nocc, None] + mo_energy[None, nocc_fro:nocc]).reshape(-1)
-        orb_sum -= 2.0 * mu
-        numpy.fill_diagonal(C, C.diagonal() - orb_sum)
-        C = C.reshape(nocc_act, nocc_act, nocc_act, nocc_act)
+    C = C.reshape(nocc_act*nocc_act, nocc_act*nocc_act)
+    orb_sum = numpy.asarray(mo_energy[nocc_fro:nocc, None] + mo_energy[None, nocc_fro:nocc]).reshape(-1)
+    orb_sum -= 2.0 * mu
+    numpy.fill_diagonal(C, C.diagonal() - orb_sum)
+    C = C.reshape(nocc_act, nocc_act, nocc_act, nocc_act)
 
-        C = C[tri_row_o, tri_col_o, ...]
-        C = C[..., tri_row_o, tri_col_o]
+    C = C[tri_row_o, tri_col_o, ...]
+    C = C[..., tri_row_o, tri_col_o]
 
-        # combine A, B and C matrix as
-        # | A B |
-        # |B^T C|
-        M_upper = numpy.concatenate((A, B), axis=1)
-        M_lower = numpy.concatenate((B.T, C), axis=1)
-        M = numpy.concatenate((M_upper, M_lower), axis=0)
+    # combine A, B and C matrix as
+    # | C B^T |
+    # |B A|
+    M_upper = numpy.concatenate((C, B.T), axis=1)
+    M_lower = numpy.concatenate((B, A), axis=1)
+    M = numpy.concatenate((M_upper, M_lower), axis=0)
 
-        # M = MW, W is the metric matrix [[I,0],[0,-I]]
-        M[:][vv_dim:] *= -1.0
-    else:
-        M = A
+    # M = MW, W is the metric matrix [[I,0],[0,-I]]
+    M[:oo_dim][:] *= -1.0
 
-    exci, xy = scipy.linalg.eigh(M)
+    exci, xy = scipy.linalg.eig(M)
+    exci = exci.real
+    xy = xy.T
+    xy = numpy.asarray(list(x for _, x in sorted(zip(exci, xy), reverse=False)))
+    exci = numpy.sort(exci)
 
-    TDA = True if nocc_act == 0 else False
-    pprpa_orthonormalize_eigenvector(multi="t", nocc=nocc_act, TDA=TDA, exci=exci, xy=xy)
+    pprpa_orthonormalize_eigenvector(multi="t", nocc=nocc_act, TDA="None", exci=exci, xy=xy)
 
     trace_A = numpy.trace(A)
     sum_exci = numpy.sum(exci[oo_dim:])
@@ -231,20 +229,22 @@ def _pprpa_print_eigenvector(multi, nocc, nvir, nocc_fro, thresh, hh_state, pp_s
 
     for istate in range(min(hh_state, oo_dim)):
         print("#%-d %s de-excitation:  exci= %-12.4f  eV   2e=  %-12.4f  eV" %
-              (istate + 1, multi, (exci[oo_dim-hh_state+istate] - exci0) * au2ev, exci[oo_dim-hh_state+istate] * au2ev))
+              (istate + 1, multi, (exci[oo_dim-istate-1] - exci0) * au2ev, exci[oo_dim-istate-1] * au2ev))
         for i in range(nocc):
             for j in range(i + is_singlet):
                 ij = ij2index(i, j, tri_row_o, tri_col_o)
-                percentage = numpy.power(xy[istate][ij], 2)
+                percentage = numpy.power(xy[oo_dim-istate-1][ij], 2)
                 if percentage > thresh:
                     pprpa_print_a_pair(is_pp=False, p=i+nocc_fro, q=j+nocc_fro, percentage=percentage)
 
         for a in range(nocc, nmo):
             for b in range(nocc, a + is_singlet):
                 ab = ij2index(a - nocc, b - nocc, tri_row_v, tri_col_v)
-                percentage = numpy.power(xy[istate][oo_dim + ab], 2)
+                percentage = numpy.power(xy[oo_dim-istate-1][oo_dim + ab], 2)
                 if percentage > thresh:
                     pprpa_print_a_pair(is_pp=True, p=a+nocc_fro, q=b+nocc_fro, percentage=percentage)
+
+        print("")
 
     for istate in range(min(pp_state, vv_dim)):
         print("#%-d %s excitation:  exci= %-12.4f  eV   2e=  %-12.4f  eV" %
@@ -252,14 +252,14 @@ def _pprpa_print_eigenvector(multi, nocc, nvir, nocc_fro, thresh, hh_state, pp_s
         for i in range(nocc):
             for j in range(i + is_singlet):
                 ij = ij2index(i, j, tri_row_o, tri_col_o)
-                percentage = numpy.power(xy[istate][ij], 2)
+                percentage = numpy.power(xy[oo_dim+istate][ij], 2)
                 if percentage > thresh:
                     pprpa_print_a_pair(is_pp=False, p=i+nocc_fro, q=j+nocc_fro, percentage=percentage)
 
         for a in range(nocc, nmo):
             for b in range(nocc, a + is_singlet):
                 ab = ij2index(a - nocc, b - nocc, tri_row_v, tri_col_v)
-                percentage = numpy.power(xy[istate][oo_dim + ab], 2)
+                percentage = numpy.power(xy[oo_dim+istate][oo_dim + ab], 2)
                 if percentage > thresh:
                     pprpa_print_a_pair(is_pp=True, p=a+nocc_fro, q=b+nocc_fro, percentage=percentage)
 
@@ -270,21 +270,27 @@ def _pprpa_print_eigenvector(multi, nocc, nvir, nocc_fro, thresh, hh_state, pp_s
 
 class ppRPA_direct():
     def __init__(
-            self, nocc, mo_energy, Lpq, TDA=False, nocc_act=None, nvir_act=None, hh_state=0, pp_state=5,
-            print_thresh=0.1):
+            self, nocc, mo_energy, Lpq, TDA=None, nocc_act=None, nvir_act=None, hh_state=5, pp_state=5,
+            nelec="n-2", print_thresh=0.1):
         # necessary input
         self.nocc = nocc  # number of occupied orbitals
         self.mo_energy = numpy.asarray(mo_energy)  # orbital energy
         self.Lpq = numpy.asarray(Lpq)  # three-center density-fitting matrix in MO space
 
         # options
-        self.multi = None  # multiplicity
-        self.TDA = TDA  # Tamm–Dancoff approximation, only use A matrix
+        self.TDA = TDA  # Tamm–Dancoff approximation, "pp" or "hh"
         self.nocc_act = nocc_act  # number of active occupied orbitals
         self.nvir_act = nvir_act  # number of active virtual orbitals
         self.hh_state = hh_state  # number of hole-hole states to print
         self.pp_state = pp_state  # number of particle-particle states to print
+        self.nelec = nelec  #  "n-2" or "n+2" for system is an N-2 or N+2 system
         self.print_thresh = print_thresh  #  threshold to print component
+
+        # internal flags
+        self.multi = None  # multiplicity
+        self.nmo = len(self.mo_energy)  # number of orbitals
+        self.nvir = self.nmo - self.nocc  # number of virtual orbitals
+        self.naux = Lpq.shape[0]  # number of auxiliary basis functions
 
         # results
         self.ec = None  # correlation energy
@@ -300,25 +306,24 @@ class ppRPA_direct():
         return
 
     def check_parameter(self):
-        nocc = self.nocc
-        nmo = len(self.mo_energy)
-        nvir = nmo - nocc
-
-        if self.TDA is True:
+        assert self.TDA in ["pp", "hh", None]
+        if self.TDA == "pp":
             self.nocc_act = 0
-            self.nvir_act = nvir
+            self.nvir_act = self.nvir
+        if self.TDA == "hh":
+            self.nocc_act = self.nocc
+            self.nvir_act = 0
 
-        self.nocc_act = nocc if self.nocc_act is None else min(self.nocc_act, nocc)
-        self.nvir_act = nvir if self.nvir_act is None else min(self.nvir_act, nvir)
+        self.nocc_act = self.nocc if self.nocc_act is None else min(self.nocc_act, self.nocc)
+        self.nvir_act = self.nvir if self.nvir_act is None else min(self.nvir_act, self.nvir)
 
-        assert self.Lpq.shape[1] == self.Lpq.shape[2] == nmo
+        assert 0.0 < self.print_thresh < 1.0
+        assert self.nelec in ["n-2", "n+2"]
 
         return
 
     def dump_flags(self):
         print('\n******** %s ********' % self.__class__)
-        nmo = len(self.mo_energy)
-        nvir = nmo - self.nocc
         if self.multi == "s":
             oo_dim = int((self.nocc_act + 1) * self.nocc_act / 2)
             vv_dim = int((self.nvir_act + 1) * self.nvir_act / 2)
@@ -327,17 +332,17 @@ class ppRPA_direct():
             vv_dim = int((self.nvir_act - 1) * self.nvir_act / 2)
         full_dim = oo_dim + vv_dim
         print('multiplicity = %s' % ("singlet" if self.multi == "s" else "triplet"))
-        print('Tamm-Dancoff approximation = %s' % self.TDA)
-        print('nmo = %d' % nmo)
-        print('nocc = %d' % self.nocc)
-        print('nvir = %d' % nvir)
-        print('nocc_act = %d' % self.nocc_act)
-        print('nvir_act = %d' % self.nvir_act)
-        print('occ-occ dimension = %d' % oo_dim)
-        print('vir-vir dimension = %d' % vv_dim)
+        if self.TDA is not None:
+            print('Tamm-Dancoff approximation = %s' % self.TDA)
+        print('naux = %d' % self.naux)
+        print('nmo = %d' % self.nmo)
+        print('nocc = %d nvir = %d' % (self.nocc, self.nvir))
+        print('nocc_act = %d nvir_act = %d' % (self.nocc_act, self.nvir_act))
+        print('occ-occ dimension = %d vir-vir dimension = %d' % (oo_dim, vv_dim))
         print('full dimension = %d' % full_dim)
         print('interested hh state = %d' % self.hh_state)
         print('interested pp state = %d' % self.pp_state)
+        print('ground state = %s' % self.nelec)
         print('print threshold = %.2f' % self.print_thresh)
         print('')
         return
@@ -379,17 +384,12 @@ class ppRPA_direct():
             nocc_fro = self.nocc - self.nocc_act
         oo_dim_s = int((self.nocc_act + 1) * self.nocc_act / 2)
         oo_dim_t = int((self.nocc_act - 1) * self.nocc_act / 2)
-        print(self.exci_s[oo_dim_s])
-        print(self.exci_t[oo_dim_t])
         if self.exci_s is not None and self.exci_t is not None:
             print("both singlet and triplet results found.")
-            if self.exci_s[oo_dim_s] < self.exci_t[oo_dim_t]:
-                exci0 = self.exci_s[oo_dim_s]
-                print("lowest 2e addition energy is singlet: %-12.4f eV\n" % (exci0*27.211386))
+            if self.nelec == "n-2":
+                exci0 = min(self.exci_s[oo_dim_s], self.exci_t[oo_dim_t])
             else:
-                exci0 = self.exci_t[oo_dim_t]
-                print("lowest 2e addition energy is triplet: %-12.4f eV\n" % (exci0*27.211386))
-
+                exci0 = max(self.exci_s[oo_dim_s-1], self.exci_t[oo_dim_t-1])
             _pprpa_print_eigenvector(
                 multi="s", nocc=self.nocc_act, nvir=self.nvir_act, nocc_fro=nocc_fro, thresh=print_thresh,
                 hh_state=self.hh_state, pp_state=self.pp_state, exci0=exci0, exci=self.exci_s, xy=self.xy_s)

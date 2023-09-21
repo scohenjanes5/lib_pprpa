@@ -433,7 +433,7 @@ def pprpa_orthonormalize_eigenvector(multi, nocc, TDA, exci, xy):
         for j in range(i):
             if abs(exci[i] - exci[j]) < 1.0e-7:
                 inp = inner_product(xy[i], xy[j], oo_dim)
-                xy[i] -= sig[i] * xy[j] * inp
+                xy[i] -= sig[j] * xy[j] * inp
 
     # normalize
     for i in range(nroot):
@@ -551,9 +551,9 @@ class ppRPA_Davidson():
         self.nroot = nroot  # number of desired roots
         self.max_vec = max_vec  # max size of trial vectors
         self.max_iter = max_iter  # max iteration
+        self.nelec = nelec  #  "n-2" or "n+2" for system is an N-2 or N+2 system
         self.residue_thresh = residue_thresh  # residue threshold
         self.print_thresh = print_thresh  #  threshold to print component
-        self.nelec = nelec  #  "n-2" or "n+2" for system is an N-2 or N+2 system
 
         # internal flags
         self.multi = None  # multiplicity
