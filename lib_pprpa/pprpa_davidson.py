@@ -15,7 +15,7 @@ def kernel(pprpa):
     iter = 0
     nprod = 0 # number of contracted vectors
     while iter < pprpa.max_iter:
-        print("\nppRPA Davidson #%d iteration, ntri= %d , nprod= %d ." % (iter+1, ntri, nprod))
+        print("\nppRPA Davidson %d-th iteration, ntri= %d , nprod= %d ." % (iter+1, ntri, nprod))
         mv_prod[nprod:ntri] = _pprpa_contraction(pprpa=pprpa, tri_vec=tri_vec[nprod:ntri])
         nprod = ntri
 
@@ -49,12 +49,10 @@ def kernel(pprpa):
             v_tri = numpy.asarray(list(x for _, x in sorted(zip(e_tri, v_tri), reverse=True)))
             e_tri = numpy.sort(e_tri)
             e_tri = e_tri[::-1]
-            print("subspace eigenvalue\n", e_tri)
 
             # get first hh state by the sign of the eigenvector, not by the sign of the excitation energy
             for i in range(ntri):
                 sum = numpy.sum((v_tri[i] ** 2) * tri_vec_sig[:ntri])
-                print(sum)
                 if sum < 0:
                     first_state = i
                     break
@@ -72,7 +70,7 @@ def kernel(pprpa):
             break
 
     assert conv is True, "ppRPA Davidson algorithm is not converged!"
-    print("ppRPA Davidson converged in %d iterations, final subspace size = %d" % (iter, nprod))
+    print("\nppRPA Davidson converged in %d iterations, final subspace size = %d" % (iter, nprod))
 
     pprpa_orthonormalize_eigenvector(multi=pprpa.multi, nocc=pprpa.nocc, TDA=pprpa.TDA, exci=pprpa.exci, xy=pprpa.xy)
 
@@ -338,7 +336,6 @@ def _pprpa_expand_space(pprpa, first_state, tri_vec, tri_vec_sig, mv_prod, v_tri
 
     is_singlet = 1 if pprpa.multi == "s" else 0
 
-
     tri_row_o, tri_col_o = numpy.tril_indices(nocc, is_singlet-1)
     tri_row_v, tri_col_v = numpy.tril_indices(nvir, is_singlet-1)
 
@@ -357,9 +354,12 @@ def _pprpa_expand_space(pprpa, first_state, tri_vec, tri_vec_sig, mv_prod, v_tri
 
     # check convergence
     conv_record = numpy.zeros(shape=[nroot], dtype=bool)
+    max_residue = 0
     for i in range(nroot):
+        max_residue = max(max_residue, abs(numpy.max(residue[i])))
         conv_record[i] = True if len(residue[i][abs(residue[i]) > residue_thresh]) == 0 else False
     nconv = len(conv_record[conv_record is True])
+    print("max residue = %.6e" % max_residue)
     if nconv == nroot:
         return True, ntri
 
@@ -391,7 +391,7 @@ def _pprpa_expand_space(pprpa, first_state, tri_vec, tri_vec_sig, mv_prod, v_tri
                 inp = -inp
             residue[iroot] += inp * tri_vec[ivec]
 
-            # add a new trial vector
+        # add a new trial vector
         if len(residue[iroot][abs(residue[iroot]) > residue_thresh]) > 0:
             assert ntri < max_vec, ("ppRPA Davidson expansion failed! ntri %d exceeds max_vec %d!" % (ntri, max_vec))
             inp = inner_product(residue[iroot], residue[iroot], pprpa.oo_dim)
@@ -613,6 +613,7 @@ class ppRPA_Davidson():
         print('state channel = %s' % self.channel)
         if self.TDA is not None:
             print('Tamm-Dancoff approximation = %s' % self.TDA)
+        print('naux = %d' % self.naux)
         print('nmo = %d' % self.nmo)
         print('nocc = %d nvir = %d' % (self.nocc, self.nvir))
         print('occ-occ dimension = %d vir-vir dimension = %d' % (self.oo_dim, self.vv_dim))
@@ -632,7 +633,7 @@ class ppRPA_Davidson():
         if mem < 1000:
             print("ppRPA needs at least %d MB memory." % mem)
         else:
-            print("ppRPA needs at least %.1f GB memory." % mem / 1.0e3)
+            print("ppRPA needs at least %.1f GB memory." % (mem / 1.0e3))
         return
 
     def kernel(self, multi):

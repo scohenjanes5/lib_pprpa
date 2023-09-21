@@ -356,7 +356,7 @@ class ppRPA_direct():
         if mem < 1000:
             print("ppRPA needs at least %d MB memory." % mem)
         else:
-            print("ppRPA needs at least %.1f GB memory." % mem / 1.0e3)
+            print("ppRPA needs at least %.1f GB memory." % (mem / 1.0e3))
         return
 
     def kernel(self, multi):
