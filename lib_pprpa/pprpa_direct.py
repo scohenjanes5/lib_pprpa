@@ -3,7 +3,8 @@ import scipy
 
 from numpy import einsum
 
-from lib_pprpa.pprpa_davidson import ij2index, pprpa_orthonormalize_eigenvector, pprpa_print_a_pair
+from lib_pprpa.pprpa_davidson import pprpa_orthonormalize_eigenvector, pprpa_print_a_pair
+from lib_pprpa.pprpa_util import ij2index, start_clock, stop_clock
 
 
 def diagonalize_pprpa_singlet(nocc, mo_energy, Lpq, nocc_act, nvir_act):
@@ -357,7 +358,7 @@ class ppRPA_direct():
         full_dim = oo_dim + vv_dim
 
         # ppRPA matrix, singlet+triplet eigenvector
-        mem = (3 * full_dim * full_dim) * 64 / 1.0e6
+        mem = (3 * full_dim * full_dim) * 8 / 1.0e6
         if mem < 1000:
             print("ppRPA needs at least %d MB memory." % mem)
         else:
@@ -369,12 +370,14 @@ class ppRPA_direct():
         self.check_parameter()
         self.dump_flags()
         self.check_memory()
+        start_clock("ppRPA direct: %s" % multi)
         if self.multi == "s":
             self.exci_s, self.xy_s, self.ec_s = diagonalize_pprpa_singlet(
                 nocc=self.nocc, mo_energy=self.mo_energy, Lpq=self.Lpq, nocc_act=self.nocc_act, nvir_act=self.nvir_act)
         else:
             self.exci_t, self.xy_t, self.ec_t = diagonalize_pprpa_triplet(
                 nocc=self.nocc, mo_energy=self.mo_energy, Lpq=self.Lpq, nocc_act=self.nocc_act, nvir_act=self.nvir_act)
+        stop_clock("ppRPA direct: %s" % multi)
         return
 
     def analyze(self, nocc_fro=None):
@@ -413,6 +416,7 @@ class ppRPA_direct():
 
     def get_correlation(self):
         self.check_parameter()
+        start_clock("ppRPA correlation energy")
         if self.ec_s is None:
             self.exci_s, self.xy_s, self.ec_s = diagonalize_pprpa_singlet(
                 nocc=self.nocc, mo_energy=self.mo_energy, Lpq=self.Lpq, nocc_act=self.nocc_act, nvir_act=self.nvir_act)
@@ -420,6 +424,6 @@ class ppRPA_direct():
         if self.ec_t is None:
             self.exci_t, self.xy_t, self.ec_t = diagonalize_pprpa_triplet(
                 nocc=self.nocc, mo_energy=self.mo_energy, Lpq=self.Lpq, nocc_act=self.nocc_act, nvir_act=self.nvir_act)
-
+        stop_clock("ppRPA correlation energy")
         self.ec = self.ec_s + self.ec_t
         return self.ec

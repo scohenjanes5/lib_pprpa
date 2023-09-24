@@ -3,6 +3,8 @@ import scipy
 
 from numpy import einsum
 
+from lib_pprpa.pprpa_util import ij2index, inner_product, start_clock, stop_clock
+
 
 def kernel(pprpa):
     # initialize trial vector and product matrix
@@ -75,42 +77,6 @@ def kernel(pprpa):
     pprpa_orthonormalize_eigenvector(multi=pprpa.multi, nocc=pprpa.nocc, TDA=pprpa.TDA, exci=pprpa.exci, xy=pprpa.xy)
 
     return
-
-
-# utility functions
-def ij2index(r, c, row, col):
-    """Get index of a row and column in a square matrix in a lower triangular matrix.
-
-    Args:
-        r (int): row index in s square matrix.
-        c (int): column index in s square matrix.
-        row (int array): row index array of a lower triangular matrix.
-        col (int array): column index array of a lower triangular matrix.
-
-    Returns:
-        i (int): index in the lower triangular matrix.
-    """
-    for i in range(len(row)):
-        if r == row[i] and c == col[i]:
-            return i
-
-    raise ValueError("cannot find the index!")
-
-
-def inner_product(u, v, oo_dim):
-    """Calculate ppRPA inner product.
-    product = <Y1,Y2> - <X1,X2>, where X is occ-occ block, Y is vir-vir block.
-
-    Args:
-        u (double array): first vector.
-        v (double array): second vector
-        oo_dim (int): occ-occ block dimension
-
-    Returns:
-        inp (double): inner product.
-    """
-    inp = -numpy.sum(u[:oo_dim] * v[:oo_dim]) + numpy.sum(u[oo_dim:] * v[oo_dim:])
-    return inp
 
 
 # Davidson algorithm functions
@@ -623,13 +589,13 @@ class ppRPA_Davidson():
         print('max iteration = %d' % self.max_iter)
         print('ground state = %s' % self.nelec)
         print('residue threshold = %.3e' % self.residue_thresh)
-        print('print threshold = %.2f' % self.print_thresh)
+        print('print threshold = %.2f%%' % (self.print_thresh*100))
         print('')
         return
 
     def check_memory(self):
-        # intermediate in contraction; mv_prod, tri_vec
-        mem = (self.naux * self.nmo * self.nmo + 2 * self.max_vec * self.full_dim) * 64 / 1.0e6
+        # intermediate in contraction; mv_prod, tri_vec, xy_s, xy_t
+        mem = (self.naux * self.nmo * self.nmo + 4 * self.max_vec * self.full_dim) * 8 / 1.0e6
         if mem < 1000:
             print("ppRPA needs at least %d MB memory." % mem)
         else:
@@ -641,7 +607,9 @@ class ppRPA_Davidson():
         self.check_parameter()
         self.dump_flags()
         self.check_memory()
+        start_clock("ppRPA Davidson: %s" % multi)
         kernel(pprpa=self)
+        stop_clock("ppRPA Davidson: %s" % multi)
         if self.multi == "s":
             self.exci_s = self.exci
             self.xy_s = self.xy
