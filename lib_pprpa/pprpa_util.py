@@ -36,6 +36,68 @@ def inner_product(u, v, oo_dim):
     return inp
 
 
+def get_chemical_potential(nocc, mo_energy):
+    """Get chemical potential as the average between HOMO and LUMO.
+    In the case there is no occupied or virtual orbital, return 0.
+
+    Args:
+        nocc (int/int array): number of occupied orbitals.
+        mo_energy (double array/double ndarray): orbital energy.
+
+    Raises:
+        ValueError: unrecognized mo_energy dimension.
+
+    Returns:
+        mu (double): chemical potential.
+    """
+    if mo_energy.ndim == 1:
+        nmo = len(mo_energy)
+        mu = 0.0 if nocc == 0 or nocc == nmo else (mo_energy[nocc-1] + mo_energy[nocc]) * 0.5
+    elif mo_energy.ndim == 2:
+        nmo = mo_energy.shape[1]
+        if (nocc[0] == nocc[1] == 0) or (nocc[0] == nocc[1] == nmo):
+            mu = 0.0
+        else:
+            assert nocc[0] >= nocc[1]
+            homo = mo_energy[0][nocc[0]-1] if nocc[1] == 0 else max(mo_energy[0][nocc[0]-1], mo_energy[1][nocc[1]-1])
+            lumo = min(mo_energy[0][nocc[0]], mo_energy[1][nocc[1]])
+            mu = (homo + lumo) * 0.5
+    else:
+        raise ValueError("unrecognized mo_energy shape: %s" % (mo_energy.shape, ))
+
+    return mu
+
+
+def print_citation():
+    __version__ = "0.1"
+
+    __doc__ = \
+    """
+\nlib_pprpa   version %s
+A package for particle-particle random phase approximation.
+
+    Thanks for using the ppRPA library!
+    Any papers that use lib_pprpa should cite the these two papers:
+    [1] in preparation, Jiachen Li, Jincheng Yu, Weitao Yang.
+    [2] van Aggelen, Helen, Yang Yang, and Weitao Yang.
+        "Exchange-correlation energy from pairing matrix fluctuation and the particle-particle random-phase approximation."
+        Physical Review A 88.3 (2013): 030501.
+
+    If you used the active-space ppRPA, please cite
+    [3] update soon.
+
+    If you used the Davidson algorithm in ppRPA, please cite
+    [4] Yang, Yang, Degao Peng, Jianfeng Lu, and Weitao Yang.
+        "Excitation energies from particle-particle random phase approximation: Davidson algorithm and benchmark studies."
+        The Journal of Chemical Physics 141, no. 12 (2014).
+
+    Have a nice day!\n
+    """ % (__version__)
+
+    print(__doc__)
+    return
+
+
 # time counting global variables and functions
 clock_names = []
 clocks = []

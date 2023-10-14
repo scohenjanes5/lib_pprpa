@@ -4,18 +4,20 @@ import scipy
 from numpy import einsum
 
 from lib_pprpa.pprpa_davidson import pprpa_orthonormalize_eigenvector, pprpa_print_a_pair
-from lib_pprpa.pprpa_util import ij2index, start_clock, stop_clock
+from lib_pprpa.pprpa_util import ij2index, get_chemical_potential, start_clock, stop_clock, print_citation
 
 
-def diagonalize_pprpa_singlet(nocc, mo_energy, Lpq, nocc_act, nvir_act):
+def diagonalize_pprpa_singlet(nocc, mo_energy, Lpq, mu=None):
     """Diagonalize singlet ppRPA matrix.
+
+    Reference:
+    [1] https://doi.org/10.1063/1.4828728
 
     Args:
         nocc (int): number of occupied orbitals.
         mo_energy (double array): orbital energy.
         Lpq (double ndarray): three-center density-fitting matrix in MO space.
-        nocc_act (int): number of active occupied orbitals.
-        nvir_act (int): number of active virtual orbitals.
+        mu (double, optional): chemical potential. Defaults to None.
 
     Returns:
         exci (double array): ppRPA eigenvalue.
@@ -24,63 +26,64 @@ def diagonalize_pprpa_singlet(nocc, mo_energy, Lpq, nocc_act, nvir_act):
     """
     nmo = len(mo_energy)
     nvir = nmo - nocc
-    mu = (mo_energy[nocc-1] + mo_energy[nocc]) * 0.5  # chemical potential
+    if mu is None:
+        mu = get_chemical_potential(nocc=nocc, mo_energy=mo_energy)
 
-    nocc_fro = nocc - nocc_act  # number of frozen occupied orbitals
-    nvir_fro = nvir - nvir_act  # number of frozen virtual orbitals
+    oo_dim = int((nocc + 1) * nocc / 2)  # number of hole-hole pairs
 
-    oo_dim = int((nocc_act + 1) * nocc_act / 2)  # number of hole-hole pairs
-
-    tri_row_o, tri_col_o = numpy.tril_indices(nocc_act)
-    tri_row_v, tri_col_v = numpy.tril_indices(nvir_act)
-
-    Lpq_act = numpy.asarray(Lpq[:, nocc_fro:(nmo-nvir_fro), nocc_fro:(nmo-nvir_fro)])
+    # low triangular index (including diagonal)
+    tri_row_o, tri_col_o = numpy.tril_indices(nocc)
+    tri_row_v, tri_col_v = numpy.tril_indices(nvir)
 
     # A matrix: particle-particle block
-    A = einsum("Pac,Pbd->abcd", Lpq_act[:, nocc_act:, nocc_act:], Lpq_act[:, nocc_act:, nocc_act:], optimize=True)
-    A += einsum("Pad,Pbc->abcd", Lpq_act[:, nocc_act:, nocc_act:], Lpq_act[:, nocc_act:, nocc_act:], optimize=True)
-
-    A[numpy.diag_indices(nvir_act)] *= 1.0 / numpy.sqrt(2)
-    A = A.transpose(2, 3, 0, 1)
-    A[numpy.diag_indices(nvir_act)] *= 1.0 / numpy.sqrt(2)
-    A = A.transpose(2, 3, 0, 1)
-
-    A = A.reshape(nvir_act*nvir_act, nvir_act*nvir_act)
-    orb_sum = numpy.asarray(mo_energy[nocc:(nmo-nvir_fro), None] + mo_energy[None, nocc:(nmo-nvir_fro)]).reshape(-1)
+    # two-electron integral part, <ab|cd>+<ab|dc>
+    A = einsum("Pac,Pbd->abcd", Lpq[:, nocc:, nocc:], Lpq[:, nocc:, nocc:], optimize=True)
+    A += einsum("Pad,Pbc->abcd", Lpq[:, nocc:, nocc:], Lpq[:, nocc:, nocc:], optimize=True)
+    # scale the diagonal elements
+    A[numpy.diag_indices(nvir)] *= 1.0 / numpy.sqrt(2)  # a=b
+    A = A.transpose(2, 3, 0, 1)  # A_{ab,cd} to A_{cd,ab}
+    A[numpy.diag_indices(nvir)] *= 1.0 / numpy.sqrt(2)  # c=d
+    A = A.transpose(2, 3, 0, 1)  # A_{cd,ab} to A_{ab,cd}
+    # orbital energy part
+    A = A.reshape(nvir*nvir, nvir*nvir)
+    orb_sum = numpy.asarray(mo_energy[nocc:, None] + mo_energy[None, nocc:]).reshape(-1)
     orb_sum -= 2.0 * mu
     numpy.fill_diagonal(A, A.diagonal() + orb_sum)
-    A = A.reshape(nvir_act, nvir_act, nvir_act, nvir_act)
-
+    A = A.reshape(nvir, nvir, nvir, nvir)
+    # take only low-triangular part
     A = A[tri_row_v, tri_col_v, ...]
     A = A[..., tri_row_v, tri_col_v]
+    trace_A = numpy.trace(A)
 
     # B matrix: particle-hole block
-    B = einsum("Pai,Pbj->abij", Lpq_act[:, nocc_act:, :nocc_act], Lpq_act[:, nocc_act:, :nocc_act], optimize=True)
-    B += einsum("Paj,Pbi->abij", Lpq_act[:, nocc_act:, :nocc_act], Lpq_act[:, nocc_act:, :nocc_act], optimize=True)
-
-    B[numpy.diag_indices(nvir_act)] *= 1.0 / numpy.sqrt(2)
-    B = B.transpose(2, 3, 0, 1)
-    B[numpy.diag_indices(nocc_act)] *= 1.0 / numpy.sqrt(2)
-    B = B.transpose(2, 3, 0, 1)
-
+    # two-electron integral part, <ab|ij>+<ab|ji>
+    B = einsum("Pai,Pbj->abij", Lpq[:, nocc:, :nocc], Lpq[:, nocc:, :nocc], optimize=True)
+    B += einsum("Paj,Pbi->abij", Lpq[:, nocc:, :nocc], Lpq[:, nocc:, :nocc], optimize=True)
+    # scale the diagonal elements
+    B[numpy.diag_indices(nvir)] *= 1.0 / numpy.sqrt(2)  # a=b
+    B = B.transpose(2, 3, 0, 1)  # B_{ab,ij} to B_{ij,ab}
+    B[numpy.diag_indices(nocc)] *= 1.0 / numpy.sqrt(2)  # i=j
+    B = B.transpose(2, 3, 0, 1)  # B_{ij,ab} to B_{ab,ij}
+    # take only low-triangular part
     B = B[tri_row_v, tri_col_v, ...]
     B = B[..., tri_row_o, tri_col_o]
 
     # C matrix: hole-hole block
-    C = einsum("Pik,Pjl->ijkl", Lpq_act[:, :nocc_act, :nocc_act], Lpq_act[:, :nocc_act, :nocc_act], optimize=True)
-    C += einsum("Pil,Pjk->ijkl", Lpq_act[:, :nocc_act, :nocc_act], Lpq_act[:, :nocc_act, :nocc_act], optimize=True)
-
-    C[numpy.diag_indices(nocc_act)] *= 1.0 / numpy.sqrt(2)
-    C = C.transpose(2, 3, 0, 1)
-    C[numpy.diag_indices(nocc_act)] *= 1.0 / numpy.sqrt(2)
-    C = C.transpose(2, 3, 0, 1)
-
-    C = C.reshape(nocc_act*nocc_act, nocc_act*nocc_act)
-    orb_sum = numpy.asarray(mo_energy[nocc_fro:nocc, None] + mo_energy[None, nocc_fro:nocc]).reshape(-1)
+    # two-electron integral part, <ij|kl>+<ij|lk>
+    C = einsum("Pik,Pjl->ijkl", Lpq[:, :nocc, :nocc], Lpq[:, :nocc, :nocc], optimize=True)
+    C += einsum("Pil,Pjk->ijkl", Lpq[:, :nocc, :nocc], Lpq[:, :nocc, :nocc], optimize=True)
+    # scale the diagonal elements
+    C[numpy.diag_indices(nocc)] *= 1.0 / numpy.sqrt(2)  # i=j
+    C = C.transpose(2, 3, 0, 1)  # C_{ij,kl} to C_{kl,ij}
+    C[numpy.diag_indices(nocc)] *= 1.0 / numpy.sqrt(2)  # k=l
+    C = C.transpose(2, 3, 0, 1)  # C_{kl,ij} to C_{ij,kl}
+    # orbital energy part
+    C = C.reshape(nocc*nocc, nocc*nocc)
+    orb_sum = numpy.asarray(mo_energy[:nocc, None] + mo_energy[None, :nocc]).reshape(-1)
     orb_sum -= 2.0 * mu
     numpy.fill_diagonal(C, C.diagonal() - orb_sum)
-    C = C.reshape(nocc_act, nocc_act, nocc_act, nocc_act)
-
+    C = C.reshape(nocc, nocc, nocc, nocc)
+    # take only low-triangular part
     C = C[tri_row_o, tri_col_o, ...]
     C = C[..., tri_row_o, tri_col_o]
 
@@ -90,34 +93,36 @@ def diagonalize_pprpa_singlet(nocc, mo_energy, Lpq, nocc_act, nvir_act):
     M_upper = numpy.concatenate((C, B.T), axis=1)
     M_lower = numpy.concatenate((B, A), axis=1)
     M = numpy.concatenate((M_upper, M_lower), axis=0)
-
-    # M = MW, W is the metric matrix [[I,0],[0,-I]]
+    del A, B, C
+    # M to MW, W is the metric matrix [[-I,0],[0,I]]
     M[:oo_dim][:] *= -1.0
 
+    # diagonalize ppRPA matrix
     exci, xy = scipy.linalg.eig(M)
     exci = exci.real
-    xy = xy.T
+    xy = xy.T  # Fortran to Python order
     xy = numpy.asarray(list(x for _, x in sorted(zip(exci, xy), reverse=False)))
     exci = numpy.sort(exci)
 
-    pprpa_orthonormalize_eigenvector(multi="s", nocc=nocc_act, TDA=None, exci=exci, xy=xy)
+    pprpa_orthonormalize_eigenvector(multi="s", nocc=nocc, TDA=None, exci=exci, xy=xy)
 
-    trace_A = numpy.trace(A)
     sum_exci = numpy.sum(exci[oo_dim:])
     ec = sum_exci - trace_A
 
     return exci, xy, ec
 
 
-def diagonalize_pprpa_triplet(nocc, mo_energy, Lpq, nocc_act, nvir_act):
+def diagonalize_pprpa_triplet(nocc, mo_energy, Lpq, mu=None):
     """Diagonalize triplet ppRPA matrix.
+
+    Reference:
+    [1] https://doi.org/10.1063/1.4828728
 
     Args:
         nocc (int): number of occupied orbitals.
         mo_energy (double array): orbital energy.
         Lpq (double ndarray): three-center density-fitting matrix in MO space.
-        nocc_act (int): number of active occupied orbitals.
-        nvir_act (int): number of active virtual orbitals.
+        mu (double, optional): chemical potential. Defaults to None.
 
     Returns:
         exci (double array): ppRPA eigenvalue.
@@ -126,48 +131,49 @@ def diagonalize_pprpa_triplet(nocc, mo_energy, Lpq, nocc_act, nvir_act):
     """
     nmo = len(mo_energy)
     nvir = nmo - nocc
-    mu = (mo_energy[nocc-1] + mo_energy[nocc]) * 0.5  # chemical potential
+    if mu is None:
+        mu = get_chemical_potential(nocc=nocc, mo_energy=mo_energy)
 
-    nocc_fro = nocc - nocc_act  # number of frozen occupied orbitals
-    nvir_fro = nvir - nvir_act  # number of frozen virtual orbitals
+    oo_dim = int((nocc - 1) * nocc / 2)  # number of hole-hole pairs
 
-    oo_dim = int((nocc_act - 1) * nocc_act / 2)  # number of hole-hole pairs
-
-    tri_row_o, tri_col_o = numpy.tril_indices(nocc_act, -1)
-    tri_row_v, tri_col_v = numpy.tril_indices(nvir_act, -1)
-
-    Lpq_act = numpy.asarray(Lpq[:, nocc_fro:(nmo-nvir_fro), nocc_fro:(nmo-nvir_fro)])
+    # low triangular index (not including diagonal)
+    tri_row_o, tri_col_o = numpy.tril_indices(nocc, -1)
+    tri_row_v, tri_col_v = numpy.tril_indices(nvir, -1)
 
     # A matrix: particle-particle block
-    A = einsum("Pac,Pbd->abcd", Lpq_act[:, nocc_act:, nocc_act:], Lpq_act[:, nocc_act:, nocc_act:], optimize=True)
-    A -= einsum("Pad,Pbc->abcd", Lpq_act[:, nocc_act:, nocc_act:], Lpq_act[:, nocc_act:, nocc_act:], optimize=True)
-
-    A = A.reshape(nvir_act*nvir_act, nvir_act*nvir_act)
-    orb_sum = numpy.asarray(mo_energy[nocc:(nmo-nvir_fro), None] + mo_energy[None, nocc:(nmo-nvir_fro)]).reshape(-1)
+    # two-electron integral part, <ab|cd>-<ab|dc>
+    A = einsum("Pac,Pbd->abcd", Lpq[:, nocc:, nocc:], Lpq[:, nocc:, nocc:], optimize=True)
+    A -= einsum("Pad,Pbc->abcd", Lpq[:, nocc:, nocc:], Lpq[:, nocc:, nocc:], optimize=True)
+    # orbital energy part
+    A = A.reshape(nvir*nvir, nvir*nvir)
+    orb_sum = numpy.asarray(mo_energy[nocc:, None] + mo_energy[None, nocc:]).reshape(-1)
     orb_sum -= 2.0 * mu
     numpy.fill_diagonal(A, A.diagonal() + orb_sum)
-    A = A.reshape(nvir_act, nvir_act, nvir_act, nvir_act)
-
+    A = A.reshape(nvir, nvir, nvir, nvir)
+    # take only low-triangular part
     A = A[tri_row_v, tri_col_v, ...]
     A = A[..., tri_row_v, tri_col_v]
+    trace_A = numpy.trace(A)
 
     # B matrix: particle-hole block
-    B = einsum("Pai,Pbj->abij", Lpq_act[:, nocc_act:, :nocc_act], Lpq_act[:, nocc_act:, :nocc_act], optimize=True)
-    B -= einsum("Paj,Pbi->abij", Lpq_act[:, nocc_act:, :nocc_act], Lpq_act[:, nocc_act:, :nocc_act], optimize=True)
-
+    # two-electron integral part, <ab|ij>-<ab|ji>
+    B = einsum("Pai,Pbj->abij", Lpq[:, nocc:, :nocc], Lpq[:, nocc:, :nocc], optimize=True)
+    B -= einsum("Paj,Pbi->abij", Lpq[:, nocc:, :nocc], Lpq[:, nocc:, :nocc], optimize=True)
+    # take only low-triangular part
     B = B[tri_row_v, tri_col_v, ...]
     B = B[..., tri_row_o, tri_col_o]
 
     # C matrix: hole-hole block
-    C = einsum("Pik,Pjl->ijkl", Lpq_act[:, :nocc_act, :nocc_act], Lpq_act[:, :nocc_act, :nocc_act], optimize=True)
-    C -= einsum("Pil,Pjk->ijkl", Lpq_act[:, :nocc_act, :nocc_act], Lpq_act[:, :nocc_act, :nocc_act], optimize=True)
-
-    C = C.reshape(nocc_act*nocc_act, nocc_act*nocc_act)
-    orb_sum = numpy.asarray(mo_energy[nocc_fro:nocc, None] + mo_energy[None, nocc_fro:nocc]).reshape(-1)
+    # two-electron integral part, <ij|kl>-<ij|lk>
+    C = einsum("Pik,Pjl->ijkl", Lpq[:, :nocc, :nocc], Lpq[:, :nocc, :nocc], optimize=True)
+    C -= einsum("Pil,Pjk->ijkl", Lpq[:, :nocc, :nocc], Lpq[:, :nocc, :nocc], optimize=True)
+    # orbital energy part
+    C = C.reshape(nocc*nocc, nocc*nocc)
+    orb_sum = numpy.asarray(mo_energy[:nocc, None] + mo_energy[None, :nocc]).reshape(-1)
     orb_sum -= 2.0 * mu
     numpy.fill_diagonal(C, C.diagonal() - orb_sum)
-    C = C.reshape(nocc_act, nocc_act, nocc_act, nocc_act)
-
+    C = C.reshape(nocc, nocc, nocc, nocc)
+    # take only low-triangular part
     C = C[tri_row_o, tri_col_o, ...]
     C = C[..., tri_row_o, tri_col_o]
 
@@ -177,19 +183,19 @@ def diagonalize_pprpa_triplet(nocc, mo_energy, Lpq, nocc_act, nvir_act):
     M_upper = numpy.concatenate((C, B.T), axis=1)
     M_lower = numpy.concatenate((B, A), axis=1)
     M = numpy.concatenate((M_upper, M_lower), axis=0)
-
-    # M = MW, W is the metric matrix [[I,0],[0,-I]]
+    del A, B, C
+    # M to MW, W is the metric matrix [[-I,0],[0,I]]
     M[:oo_dim][:] *= -1.0
 
+    # diagonalize ppRPA matrix
     exci, xy = scipy.linalg.eig(M)
     exci = exci.real
-    xy = xy.T
+    xy = xy.T  # Fortran to Python order
     xy = numpy.asarray(list(x for _, x in sorted(zip(exci, xy), reverse=False)))
     exci = numpy.sort(exci)
 
-    pprpa_orthonormalize_eigenvector(multi="t", nocc=nocc_act, TDA="None", exci=exci, xy=xy)
+    pprpa_orthonormalize_eigenvector(multi="t", nocc=nocc, TDA="None", exci=exci, xy=xy)
 
-    trace_A = numpy.trace(A)
     sum_exci = numpy.sum(exci[oo_dim:])
     ec = (sum_exci - trace_A) * 3.0
 
@@ -284,14 +290,15 @@ class ppRPA_direct():
         self.nvir_act = nvir_act  # number of active virtual orbitals
         self.hh_state = hh_state  # number of hole-hole states to print
         self.pp_state = pp_state  # number of particle-particle states to print
-        self.nelec = nelec  #  "n-2" or "n+2" for system is an N-2 or N+2 system
-        self.print_thresh = print_thresh  #  threshold to print component
+        self.nelec = nelec  # "n-2" or "n+2" for system is an N-2 or N+2 system
+        self.print_thresh = print_thresh  # threshold to print component
 
         # internal flags
         self.multi = None  # multiplicity
         self.nmo = len(self.mo_energy)  # number of orbitals
         self.nvir = self.nmo - self.nocc  # number of virtual orbitals
         self.naux = Lpq.shape[0]  # number of auxiliary basis functions
+        self.mu = None  # chemical potential
 
         # results
         self.ec = None  # correlation energy
@@ -303,6 +310,8 @@ class ppRPA_direct():
         self.xy_s = None  # singlet two-electron addition eigenvector
         self.exci_t = None  # triplet two-electron addition energy
         self.xy_t = None  # triplet two-electron addition eigenvector
+
+        print_citation()
 
         return
 
@@ -320,6 +329,9 @@ class ppRPA_direct():
 
         assert 0.0 < self.print_thresh < 1.0
         assert self.nelec in ["n-2", "n+2"]
+
+        if self.mu is None:
+            self.mu = get_chemical_potential(nocc=self.nocc, mo_energy=self.mo_energy)
 
         return
 
@@ -357,7 +369,7 @@ class ppRPA_direct():
             vv_dim = int((self.nvir_act - 1) * self.nvir_act / 2)
         full_dim = oo_dim + vv_dim
 
-        # ppRPA matrix, singlet+triplet eigenvector
+        # ppRPA matrix: A block and full matrix, eigenvector
         mem = (3 * full_dim * full_dim) * 8 / 1.0e6
         if mem < 1000:
             print("ppRPA needs at least %d MB memory." % mem)
@@ -371,12 +383,16 @@ class ppRPA_direct():
         self.dump_flags()
         self.check_memory()
         start_clock("ppRPA direct: %s" % multi)
+        nocc_fro = self.nocc - self.nocc_act  # number of frozen occupied orbitals
+        nvir_fro = self.nvir - self.nvir_act  # number of frozen virtual orbitals
+        mo_energy_act = self.mo_energy[nocc_fro:(self.nmo-nvir_fro)]
+        Lpq_act = self.Lpq[:, nocc_fro:(self.nmo-nvir_fro), nocc_fro:(self.nmo-nvir_fro)]
         if self.multi == "s":
             self.exci_s, self.xy_s, self.ec_s = diagonalize_pprpa_singlet(
-                nocc=self.nocc, mo_energy=self.mo_energy, Lpq=self.Lpq, nocc_act=self.nocc_act, nvir_act=self.nvir_act)
-        else:
+                nocc=self.nocc_act, mo_energy=mo_energy_act, Lpq=Lpq_act, mu=self.mu)
+        elif multi == "t":
             self.exci_t, self.xy_t, self.ec_t = diagonalize_pprpa_triplet(
-                nocc=self.nocc, mo_energy=self.mo_energy, Lpq=self.Lpq, nocc_act=self.nocc_act, nvir_act=self.nvir_act)
+                nocc=self.nocc_act, mo_energy=mo_energy_act, Lpq=Lpq_act, mu=self.mu)
         stop_clock("ppRPA direct: %s" % multi)
         return
 
@@ -416,14 +432,19 @@ class ppRPA_direct():
 
     def get_correlation(self):
         self.check_parameter()
+        assert self.nvir_act > 0  # A block is needed for the correlation energy
         start_clock("ppRPA correlation energy")
+        nocc_fro = self.nocc - self.nocc_act  # number of frozen occupied orbitals
+        nvir_fro = self.nvir - self.nvir_act  # number of frozen virtual orbitals
+        mo_energy_act = self.mo_energy[nocc_fro:(self.nmo-nvir_fro)]
+        Lpq_act = self.Lpq[:, nocc_fro:(self.nmo-nvir_fro), nocc_fro:(self.nmo-nvir_fro)]
         if self.ec_s is None:
             self.exci_s, self.xy_s, self.ec_s = diagonalize_pprpa_singlet(
-                nocc=self.nocc, mo_energy=self.mo_energy, Lpq=self.Lpq, nocc_act=self.nocc_act, nvir_act=self.nvir_act)
+                nocc=self.nocc_act, mo_energy=mo_energy_act, Lpq=Lpq_act, mu=self.mu)
 
         if self.ec_t is None:
             self.exci_t, self.xy_t, self.ec_t = diagonalize_pprpa_triplet(
-                nocc=self.nocc, mo_energy=self.mo_energy, Lpq=self.Lpq, nocc_act=self.nocc_act, nvir_act=self.nvir_act)
+                nocc=self.nocc_act, mo_energy=mo_energy_act, Lpq=Lpq_act, mu=self.mu)
         stop_clock("ppRPA correlation energy")
         self.ec = self.ec_s + self.ec_t
         return self.ec
