@@ -4,7 +4,7 @@ import scipy
 from numpy import einsum
 
 from lib_pprpa.pprpa_davidson import pprpa_orthonormalize_eigenvector, pprpa_print_a_pair
-from lib_pprpa.pprpa_util import ij2index, get_chemical_potential, start_clock, stop_clock, print_citation
+from lib_pprpa.pprpa_util import get_chemical_potential, start_clock, stop_clock, print_citation
 
 
 def diagonalize_pprpa_singlet(nocc, mo_energy, Lpq, mu=None):
@@ -227,7 +227,6 @@ def _pprpa_print_eigenvector(multi, nocc, nvir, nocc_fro, thresh, hh_state, pp_s
         vv_dim = int((nvir - 1) * nvir / 2)
         is_singlet = 0
         print("\n     print ppRPA excitations: triplet\n")
-    nmo = nocc + nvir
 
     tri_row_o, tri_col_o = numpy.tril_indices(nocc, is_singlet-1)
     tri_row_v, tri_col_v = numpy.tril_indices(nvir, is_singlet-1)
@@ -237,38 +236,38 @@ def _pprpa_print_eigenvector(multi, nocc, nvir, nocc_fro, thresh, hh_state, pp_s
     for istate in range(min(hh_state, oo_dim)):
         print("#%-d %s de-excitation:  exci= %-12.4f  eV   2e=  %-12.4f  eV" %
               (istate + 1, multi, (exci[oo_dim-istate-1] - exci0) * au2ev, exci[oo_dim-istate-1] * au2ev))
-        for i in range(nocc):
-            for j in range(i + is_singlet):
-                ij = ij2index(i, j, tri_row_o, tri_col_o)
-                percentage = numpy.power(xy[oo_dim-istate-1][ij], 2)
-                if percentage > thresh:
-                    pprpa_print_a_pair(is_pp=False, p=i+nocc_fro, q=j+nocc_fro, percentage=percentage)
+        full = numpy.zeros(shape=[nocc, nocc], dtype=numpy.double)
+        full[tri_row_o, tri_col_o] = xy[oo_dim-istate-1][:oo_dim]
+        full = numpy.power(full, 2)
+        pairs = numpy.argwhere(full > thresh)
+        for i, j in pairs:
+            pprpa_print_a_pair(is_pp=False, p=i+nocc_fro, q=j+nocc_fro, percentage=full[i, j])
 
-        for a in range(nocc, nmo):
-            for b in range(nocc, a + is_singlet):
-                ab = ij2index(a - nocc, b - nocc, tri_row_v, tri_col_v)
-                percentage = numpy.power(xy[oo_dim-istate-1][oo_dim + ab], 2)
-                if percentage > thresh:
-                    pprpa_print_a_pair(is_pp=True, p=a+nocc_fro, q=b+nocc_fro, percentage=percentage)
+        full = numpy.zeros(shape=[nvir, nvir], dtype=numpy.double)
+        full[tri_row_v, tri_col_v] = xy[oo_dim-istate-1][oo_dim:]
+        full = numpy.power(full, 2)
+        pairs = numpy.argwhere(full > thresh)
+        for a, b in pairs:
+            pprpa_print_a_pair(is_pp=True, p=a+nocc_fro+nocc, q=b+nocc_fro+nocc, percentage=full[a, b])
 
         print("")
 
     for istate in range(min(pp_state, vv_dim)):
         print("#%-d %s excitation:  exci= %-12.4f  eV   2e=  %-12.4f  eV" %
               (istate + 1, multi, (exci[oo_dim+istate] - exci0) * au2ev, exci[oo_dim+istate] * au2ev))
-        for i in range(nocc):
-            for j in range(i + is_singlet):
-                ij = ij2index(i, j, tri_row_o, tri_col_o)
-                percentage = numpy.power(xy[oo_dim+istate][ij], 2)
-                if percentage > thresh:
-                    pprpa_print_a_pair(is_pp=False, p=i+nocc_fro, q=j+nocc_fro, percentage=percentage)
+        full = numpy.zeros(shape=[nocc, nocc], dtype=numpy.double)
+        full[tri_row_o, tri_col_o] = xy[oo_dim+istate][:oo_dim]
+        full = numpy.power(full, 2)
+        pairs = numpy.argwhere(full > thresh)
+        for i, j in pairs:
+            pprpa_print_a_pair(is_pp=False, p=i+nocc_fro, q=j+nocc_fro, percentage=full[i, j])
 
-        for a in range(nocc, nmo):
-            for b in range(nocc, a + is_singlet):
-                ab = ij2index(a - nocc, b - nocc, tri_row_v, tri_col_v)
-                percentage = numpy.power(xy[oo_dim+istate][oo_dim + ab], 2)
-                if percentage > thresh:
-                    pprpa_print_a_pair(is_pp=True, p=a+nocc_fro, q=b+nocc_fro, percentage=percentage)
+        full = numpy.zeros(shape=[nvir, nvir], dtype=numpy.double)
+        full[tri_row_v, tri_col_v] = xy[oo_dim+istate][oo_dim:]
+        full = numpy.power(full, 2)
+        pairs = numpy.argwhere(full > thresh)
+        for a, b in pairs:
+            pprpa_print_a_pair(is_pp=True, p=a+nocc_fro+nocc, q=b+nocc_fro+nocc, percentage=full[a, b])
 
         print("")
 
@@ -356,7 +355,7 @@ class ppRPA_direct():
         print('interested hh state = %d' % self.hh_state)
         print('interested pp state = %d' % self.pp_state)
         print('ground state = %s' % self.nelec)
-        print('print threshold = %.2f' % self.print_thresh)
+        print('print threshold = %.2f%%' % (self.print_thresh*100))
         print('')
         return
 

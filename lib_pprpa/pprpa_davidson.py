@@ -3,7 +3,7 @@ import scipy
 
 from numpy import einsum
 
-from lib_pprpa.pprpa_util import ij2index, inner_product, start_clock, stop_clock
+from lib_pprpa.pprpa_util import ij2index, inner_product, start_clock, stop_clock, print_citation
 
 
 def kernel(pprpa):
@@ -438,7 +438,6 @@ def _pprpa_print_eigenvector(multi, nocc, nvir, thresh, channel, TDA, exci0, exc
         print("\n     print ppRPA excitations: triplet\n")
     if TDA == "pp":
         oo_dim = 0
-    nmo = nocc + nvir
 
     tri_row_o, tri_col_o = numpy.tril_indices(nocc, is_singlet-1)
     tri_row_v, tri_col_v = numpy.tril_indices(nvir, is_singlet-1)
@@ -450,38 +449,38 @@ def _pprpa_print_eigenvector(multi, nocc, nvir, thresh, channel, TDA, exci0, exc
             print("#%-d %s excitation:  exci= %-12.4f  eV   2e=  %-12.4f  eV" %
                   (iroot + 1, multi, (exci[iroot] - exci0) * au2ev, exci[iroot] * au2ev))
             if TDA != "pp":
-                for i in range(nocc):
-                    for j in range(i + is_singlet):
-                        ij = ij2index(i, j, tri_row_o, tri_col_o)
-                        percentage = numpy.power(xy[iroot][ij], 2)
-                        if percentage > thresh:
-                            pprpa_print_a_pair(is_pp=False, p=i, q=j, percentage=percentage)
+                full = numpy.zeros(shape=[nocc, nocc], dtype=numpy.double)
+                full[tri_row_o, tri_col_o] = xy[iroot][:oo_dim]
+                full = numpy.power(full, 2)
+                pairs = numpy.argwhere(full > thresh)
+                for i, j in pairs:
+                    pprpa_print_a_pair(is_pp=False, p=i, q=j, percentage=full[i, j])
 
-            for a in range(nocc, nmo):
-                for b in range(nocc, a + is_singlet):
-                    ab = ij2index(a - nocc, b - nocc, tri_row_v, tri_col_v)
-                    percentage = numpy.power(xy[iroot][oo_dim + ab], 2)
-                    if percentage > thresh:
-                        pprpa_print_a_pair(is_pp=True, p=a, q=b, percentage=percentage)
+            full = numpy.zeros(shape=[nvir, nvir], dtype=numpy.double)
+            full[tri_row_v, tri_col_v] = xy[iroot][oo_dim:]
+            full = numpy.power(full, 2)
+            pairs = numpy.argwhere(full > thresh)
+            for a, b in pairs:
+                pprpa_print_a_pair(is_pp=True, p=a+nocc, q=b+nocc, percentage=full[a, b])
             print("")
     else:
         for iroot in range(nroot):
             print("#%-d %s de-excitation:  exci= %-12.4f  eV   2e=  %-12.4f  eV" %
                   (iroot + 1, multi, (exci[iroot] - exci0) * au2ev, exci[iroot] * au2ev))
-            for i in range(nocc):
-                for j in range(i + is_singlet):
-                    ij = ij2index(i, j, tri_row_o, tri_col_o)
-                    percentage = numpy.power(xy[iroot][ij], 2)
-                    if percentage > thresh:
-                        pprpa_print_a_pair(is_pp=False, p=i, q=j, percentage=percentage)
+            full = numpy.zeros(shape=[nocc, nocc], dtype=numpy.double)
+            full[tri_row_o, tri_col_o] = xy[iroot][:oo_dim]
+            full = numpy.power(full, 2)
+            pairs = numpy.argwhere(full > thresh)
+            for i, j in pairs:
+                pprpa_print_a_pair(is_pp=False, p=i, q=j, percentage=full[i, j])
 
             if TDA != "hh":
-                for a in range(nocc, nmo):
-                    for b in range(nocc, a + is_singlet):
-                        ab = ij2index(a - nocc, b - nocc, tri_row_v, tri_col_v)
-                        percentage = numpy.power(xy[iroot][oo_dim + ab], 2)
-                        if percentage > thresh:
-                            pprpa_print_a_pair(is_pp=True, p=a, q=b, percentage=percentage)
+                full = numpy.zeros(shape=[nvir, nvir], dtype=numpy.double)
+                full[tri_row_v, tri_col_v] = xy[iroot][oo_dim:]
+                full = numpy.power(full, 2)
+                pairs = numpy.argwhere(full > thresh)
+                for a, b in pairs:
+                    pprpa_print_a_pair(is_pp=True, p=a+nocc, q=b+nocc, percentage=full[a, b])
             print("")
 
     return
@@ -539,6 +538,8 @@ class ppRPA_Davidson():
         self.xy_s = None  # singlet two-electron addition eigenvector
         self.exci_t = None  # triplet two-electron addition energy
         self.xy_t = None  # triplet two-electron addition eigenvector
+
+        print_citation()
 
         return
 
