@@ -3,7 +3,7 @@ import scipy
 
 from numpy import einsum
 
-from lib_pprpa.pprpa_util import ij2index, inner_product, start_clock, stop_clock, print_citation
+from lib_pprpa.pprpa_util import ij2index, inner_product, start_clock, stop_clock, print_citation, get_chemical_potential
 
 
 def kernel(pprpa):
@@ -504,7 +504,7 @@ def pprpa_print_a_pair(is_pp, p, q, percentage):
 
 class ppRPA_Davidson():
     def __init__(self, nocc, mo_energy, Lpq, channel="pp", TDA=None, nroot=5, max_vec=200, max_iter=100,
-                 nelec="n-2", residue_thresh=1.0e-7, print_thresh=0.1):
+                 residue_thresh=1.0e-7, print_thresh=0.1):
         # necessary input
         self.nocc = nocc  # number of occupied orbitals
         self.mo_energy = numpy.asarray(mo_energy)  # orbital energy
@@ -516,14 +516,13 @@ class ppRPA_Davidson():
         self.nroot = nroot  # number of desired roots
         self.max_vec = max_vec  # max size of trial vectors
         self.max_iter = max_iter  # max iteration
-        self.nelec = nelec  #  "n-2" or "n+2" for system is an N-2 or N+2 system
         self.residue_thresh = residue_thresh  # residue threshold
         self.print_thresh = print_thresh  #  threshold to print component
 
         # internal flags
         self.multi = None  # multiplicity
         self.is_singlet = None  # multiplicity is singlet
-        self.mu = (self.mo_energy[self.nocc-1] + self.mo_energy[self.nocc]) * 0.5  # chemical potential
+        self.mu = None  # chemical potential
         self.nmo = len(self.mo_energy)  # number of orbitals
         self.nvir = self.nmo - self.nocc  # number of virtual orbitals
         self.naux = Lpq.shape[0]  # number of auxiliary basis functions
@@ -570,7 +569,9 @@ class ppRPA_Davidson():
 
         assert self.residue_thresh > 0
         assert 0.0 < self.print_thresh < 1.0
-        assert self.nelec in ["n-2", "n+2"]
+
+        if self.mu is None:
+            self.mu = get_chemical_potential(nocc=self.nocc, mo_energy=self.mo_energy)
 
         return
 
@@ -588,15 +589,14 @@ class ppRPA_Davidson():
         print('number of roots = %d' % self.nroot)
         print('max subspace size = %d' % self.max_vec)
         print('max iteration = %d' % self.max_iter)
-        print('ground state = %s' % self.nelec)
         print('residue threshold = %.3e' % self.residue_thresh)
         print('print threshold = %.2f%%' % (self.print_thresh*100))
         print('')
         return
 
     def check_memory(self):
-        # intermediate in contraction; mv_prod, tri_vec, xy_s, xy_t
-        mem = (self.naux * self.nmo * self.nmo + 4 * self.max_vec * self.full_dim) * 8 / 1.0e6
+        # intermediate in contraction; mv_prod, tri_vec, xy
+        mem = (self.naux * self.nmo * self.nmo + 3 * self.max_vec * self.full_dim) * 8 / 1.0e6
         if mem < 1000:
             print("ppRPA needs at least %d MB memory." % mem)
         else:
@@ -625,14 +625,9 @@ class ppRPA_Davidson():
         print_thresh = self.print_thresh
         nocc, nvir = self.nocc, self.nvir
 
-        if self.nelec == "n-2":
-            print("system has N-2 electron")
-        else:
-            print("system has N+2 electron")
-
         if self.exci_s is not None and self.exci_t is not None:
             print("both singlet and triplet results found.")
-            exci0 = min(self.exci_s[0], self.exci_t[0]) if self.nelec == "n-2" else max(self.exci_s[0], self.exci_t[0])
+            exci0 = min(self.exci_s[0], self.exci_t[0]) if self.channel == "pp" else max(self.exci_s[0], self.exci_t[0])
             _pprpa_print_eigenvector(multi="s", nocc=nocc, nvir=nvir, thresh=print_thresh, channel=self.channel,
                                      TDA=self.TDA, exci0=exci0, exci=self.exci_s, xy=self.xy_s)
             _pprpa_print_eigenvector(multi="t", nocc=nocc, nvir=nvir, thresh=print_thresh, channel=self.channel,
