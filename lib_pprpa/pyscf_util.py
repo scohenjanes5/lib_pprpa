@@ -1,7 +1,8 @@
+import h5py
 import numpy
 
 
-def get_pyscf_input_mol(mf, auxbasis=None, nocc_act=None, nvir_act=None):
+def get_pyscf_input_mol(mf, auxbasis=None, nocc_act=None, nvir_act=None, dump_file=None):
     """Get ppRPA input from a PySCF molecular SCF calculation.
 
     Args:
@@ -9,6 +10,7 @@ def get_pyscf_input_mol(mf, auxbasis=None, nocc_act=None, nvir_act=None):
         auxbasis (string, optional): auxiliary basis set. Defaults to None.
         nocc_act (int, optional): number of active occupied orbitals. Defaults to None.
         nvir_act (int, optional): number of active virtual orbitals. Defaults to None.
+        dump_file (str, optional): file name to dump matrix for lib_pprpa. Defaults to None.
 
     Returns:
         nocc_act (int): number of occupied orbitals in the active space.
@@ -48,21 +50,30 @@ def get_pyscf_input_mol(mf, auxbasis=None, nocc_act=None, nvir_act=None):
     Lpq = _ao2mo.nr_e2(mf.with_df._cderi, mo, ijslice, aosym='s2', out=Lpq)
     Lpq = Lpq.reshape(naux, nmo_act, nmo_act)
 
+    if dump_file is not None:
+        f = h5py.File(name="%s.h5" % dump_file, mode="w")
+        f["nocc"] = numpy.asarray(nocc_act)
+        f["mo_energy"] = numpy.asarray(mo_energy_act)
+        f["Lpq"] = numpy.asarray(Lpq)
+        f.close()
+
     print("\nget input for lib_pprpa from PySCF (molecule)")
     print("nmo = %-d, nocc= %-d, nvir = %-d" % (nmo, nocc, nvir))
     print("nmo_act = %-d, nocc_act= %-d, nvir_act = %-d" % (nmo_act, nocc_act, nvir_act))
     print("naux = %-d" % naux)
+    print("dump h5py file = %-s" % dump_file)
 
     return nocc_act, mo_energy_act, Lpq
 
 
-def get_pyscf_input_sc(kmf, nocc_act=None, nvir_act=None):
+def get_pyscf_input_sc(kmf, nocc_act=None, nvir_act=None, dump_file=None):
     """Get ppRPA input from a PySCF supercell SCF calculation.
 
     Args:
         mf (pyscf.pbc.scf.RHF/pyscf.pbc.dft.RKS): supercell mean-field object.
         nocc_act (int, optional): number of active occupied orbitals. Defaults to None.
         nvir_act (int, optional): number of active virtual orbitals. Defaults to None.
+        dump_file (str, optional): file name to dump matrix for lib_pprpa. Defaults to None.
 
     Returns:
         nocc_act (int): number of occupied orbitals in the active space.
@@ -99,9 +110,17 @@ def get_pyscf_input_sc(kmf, nocc_act=None, nvir_act=None):
         Lpq.append(tmp)
     Lpq = numpy.vstack(Lpq).reshape(naux, nmo_act, nmo_act)
 
+    if dump_file is not None:
+        f = h5py.File(name="%s.h5" % dump_file, mode="w")
+        f["nocc"] = numpy.asarray(nocc_act)
+        f["mo_energy"] = numpy.asarray(mo_energy_act)
+        f["Lpq"] = numpy.asarray(Lpq)
+        f.close()
+
     print("\nget input for lib_pprpa from PySCF (supercell)")
     print("nmo = %-d, nocc= %-d, nvir = %-d" % (nmo, nocc, nvir))
     print("nmo_act = %-d, nocc_act= %-d, nvir_act = %-d" % (nmo_act, nocc_act, nvir_act))
     print("naux = %-d" % naux)
+    print("dump h5py file = %-s" % dump_file)
 
     return nocc_act, mo_energy_act, Lpq
