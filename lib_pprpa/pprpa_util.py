@@ -78,18 +78,21 @@ A package for particle-particle random phase approximation.
 
     Thanks for using the ppRPA library!
     Any papers that use lib_pprpa should cite the these two papers:
-    [1] in preparation, Jiachen Li, Jincheng Yu, Weitao Yang.
-    [2] van Aggelen, Helen, Yang Yang, and Weitao Yang.
-        "Exchange-correlation energy from pairing matrix fluctuation and the particle-particle random-phase approximation."
-        Physical Review A 88.3 (2013): 030501.
+    [1] Jiachen Li, Jincheng Yu, Weitao Yang.
+        In preparation
+    [2] Helen van Aggelen, Yang Yang, and Weitao Yang.
+        "Exchange-correlation energy from pairing matrix fluctuation and the particle-particle random-phase approximation"
+        Phys. Rev. A 88, 030501(R)
 
     If you used the active-space ppRPA, please cite
-    [3] update soon.
+    [3] Jiachen Li, Jincheng Yu, Zehua Chen, and Weitao Yang.
+        "Linear Scaling Calculations of Excitation Energies with Active-Space Particle–Particle Random-Phase Approximation"
+        J. Phys. Chem. A 2023, 127, 37, 7811-7822
 
     If you used the Davidson algorithm in ppRPA, please cite
-    [4] Yang, Yang, Degao Peng, Jianfeng Lu, and Weitao Yang.
-        "Excitation energies from particle-particle random phase approximation: Davidson algorithm and benchmark studies."
-        The Journal of Chemical Physics 141, no. 12 (2014).
+    [4] Yang Yang, Degao Peng, Jianfeng Lu, and Weitao Yang.
+        "Excitation energies from particle-particle random phase approximation: Davidson algorithm and benchmark studies"
+        J. Chem. Phys. 141, 124104 (2014)
 
     Have a nice day!\n
     """ % (__version__)

@@ -1,6 +1,7 @@
 import h5py
 import numpy
 
+from pprpa_util import start_clock, stop_clock
 
 def get_pyscf_input_mol(mf, auxbasis=None, nocc_act=None, nvir_act=None, dump_file=None):
     """Get ppRPA input from a PySCF molecular SCF calculation.
@@ -19,6 +20,8 @@ def get_pyscf_input_mol(mf, auxbasis=None, nocc_act=None, nvir_act=None, dump_fi
     """
     from pyscf import df
     from pyscf.ao2mo import _ao2mo
+
+    start_clock("getting input for molecule ppRPA from PySCF")
 
     nmo = len(mf.mo_energy)
     nocc = mf.mol.nelectron // 2
@@ -63,6 +66,8 @@ def get_pyscf_input_mol(mf, auxbasis=None, nocc_act=None, nvir_act=None, dump_fi
     print("naux = %-d" % naux)
     print("dump h5py file = %-s" % dump_file)
 
+    stop_clock("getting input for molecule ppRPA from PySCF")
+
     return nocc_act, mo_energy_act, Lpq
 
 
@@ -83,6 +88,8 @@ def get_pyscf_input_sc(kmf, nocc_act=None, nvir_act=None, dump_file=None):
     from pyscf import lib
     from pyscf.ao2mo import _ao2mo
     from pyscf.pbc.df.fft_ao2mo import _format_kpts
+
+    start_clock("getting input for supercell ppRPA from PySCF")
 
     nmo = len(kmf.mo_energy)
     nocc = int(numpy.sum(kmf.mo_occ) / 2)
@@ -122,5 +129,7 @@ def get_pyscf_input_sc(kmf, nocc_act=None, nvir_act=None, dump_file=None):
     print("nmo_act = %-d, nocc_act= %-d, nvir_act = %-d" % (nmo_act, nocc_act, nvir_act))
     print("naux = %-d" % naux)
     print("dump h5py file = %-s" % dump_file)
+
+    stop_clock("getting input for supercell ppRPA from PySCF")
 
     return nocc_act, mo_energy_act, Lpq
