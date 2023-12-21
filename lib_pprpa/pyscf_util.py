@@ -1,7 +1,7 @@
 import h5py
 import numpy
 
-from pprpa_util import start_clock, stop_clock
+from lib_pprpa.pprpa_util import start_clock, stop_clock
 
 def get_pyscf_input_mol(mf, auxbasis=None, nocc_act=None, nvir_act=None, dump_file=None):
     """Get ppRPA input from a PySCF molecular SCF calculation.
