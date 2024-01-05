@@ -83,8 +83,10 @@ def get_pprpa_input_act(nocc, mo_energy, Lpq, nocc_act, nvir_act):
         mo_energy_act (double array/double ndarray): orbital energy in active space.
         Lpq_act (double ndarray): three-center density-fitting matrix in MO space in active space.
     """
-    assert mo_energy.shape[-1] == Lpq.shape[-1] == Lpq.shape[-2]
-    assert nocc <= mo_energy.shape[-1] and (nocc_act + nvir_act) <= mo_energy.shape[-1]
+    nmo = len(mo_energy)
+    nvir = nmo - nocc
+    nocc_act = nvir if nocc_act > nocc else nocc_act
+    nvir_act = nvir if nvir_act > nvir else nvir_act
     mo_energy_act = mo_energy[(nocc-nocc_act):(nocc+nvir_act)]
     Lpq_act = Lpq[:, (nocc-nocc_act):(nocc+nvir_act), (nocc-nocc_act):(nocc+nvir_act)]
     return nocc_act, mo_energy_act, Lpq_act
