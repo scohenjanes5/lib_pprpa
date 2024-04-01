@@ -1,3 +1,4 @@
+import h5py
 import numpy
 import scipy
 
@@ -202,6 +203,7 @@ def diagonalize_pprpa_triplet(nocc, mo_energy, Lpq, mu=None):
     return exci, xy, ec
 
 
+# analysis functions
 def _pprpa_print_eigenvector(multi, nocc, nvir, nocc_fro, thresh, hh_state, pp_state, exci0, exci, xy):
     """Print dominant components of an eigenvector.
 
@@ -271,6 +273,44 @@ def _pprpa_print_eigenvector(multi, nocc, nvir, nocc_fro, thresh, hh_state, pp_s
 
         print("")
 
+    return
+
+
+def _analyze_pprpa_direct(
+        exci_s, xy_s, exci_t, xy_t, nocc, nvir, nocc_act=None, nvir_act=None, nelec="n-2", print_thresh=0.1, hh_state=5,
+        pp_state=5, nocc_fro=None):
+    print("\nanalyze ppRPA results.")
+    nocc_act = nocc if nocc_act is None else min(nocc_act, nocc)
+    nvir_act = nvir if nvir_act is None else min(nvir_act, nvir)
+    if nocc_fro is None:
+        nocc_fro = nocc - nocc_act
+    oo_dim_s = int((nocc_act + 1) * nocc_act / 2)
+    oo_dim_t = int((nocc_act - 1) * nocc_act / 2)
+    if exci_s is not None and exci_t is not None:
+        print("both singlet and triplet results found.")
+        if nelec == "n-2":
+            exci0 = min(exci_s[oo_dim_s], exci_t[oo_dim_t])
+        else:
+            exci0 = max(exci_s[oo_dim_s-1], exci_t[oo_dim_t-1])
+        _pprpa_print_eigenvector(
+            multi="s", nocc=nocc_act, nvir=nvir_act, nocc_fro=nocc_fro, thresh=print_thresh,
+            hh_state=hh_state, pp_state=pp_state, exci0=exci0, exci=exci_s, xy=xy_s)
+        _pprpa_print_eigenvector(
+            multi="t", nocc=nocc_act, nvir=nvir_act, nocc_fro=nocc_fro, thresh=print_thresh,
+            hh_state=hh_state, pp_state=pp_state, exci0=exci0, exci=exci_t, xy=xy_t)
+    else:
+        if exci_s is not None:
+            print("only singlet results found.")
+            _pprpa_print_eigenvector(
+                multi="s", nocc=nocc_act, nvir=nvir_act, nocc_fro=nocc_fro, thresh=print_thresh,
+                hh_state=hh_state, pp_state=pp_state, exci0=exci_s[oo_dim_s],
+                exci=exci_s, xy=xy_s)
+        else:
+            print("only triplet results found.")
+            _pprpa_print_eigenvector(
+                multi="t", nocc=nocc_act, nvir=nvir_act, nocc_fro=nocc_fro, thresh=print_thresh,
+                hh_state=hh_state, pp_state=pp_state, exci0=exci_t[oo_dim_t],
+                exci=exci_t, xy=xy_t)
     return
 
 
@@ -395,38 +435,40 @@ class ppRPA_direct():
         stop_clock("ppRPA direct: %s" % multi)
         return
 
+    def save_pprpa(self, fn):
+        assert self.exci_s is not None or self.exci_t is not None
+        print("\nsave pprpa results to %s.\n" % fn)
+        f = h5py.File(fn, "w")
+        f["nocc"] = numpy.asarray(self.nocc)
+        f["nvir"] = numpy.asarray(self.nvir)
+        f["nocc_act"] = numpy.asarray(self.nocc_act)
+        f["nvir_act"] = numpy.asarray(self.nvir_act)
+        if self.exci_s is not None:
+            f["exci_s"] = numpy.asarray(self.exci_s)
+            f["xy_s"] = numpy.asarray(self.xy_s)
+        if self.exci_t is not None:
+            f["exci_t"] = numpy.asarray(self.exci_t)
+            f["xy_t"] = numpy.asarray(self.xy_t)
+        f.close()
+        return
+
+    def read_pprpa(self, fn, singlet=True, triplet=True):
+        print("\nread pprpa results from %s.\n" % fn)
+        f = h5py.File(fn, "r")
+        if singlet is True:
+            self.exci_s = numpy.asarray(f["exci_s"])
+            self.xy_s = numpy.asarray(f["xy_s"])
+        if triplet is True:
+            self.exci_t = numpy.asarray(f["exci_t"])
+            self.xy_t = numpy.asarray(f["xy_t"])
+        f.close()
+        return
+
     def analyze(self, nocc_fro=None):
-        print("\nanalyze ppRPA results.")
-        print_thresh = self.print_thresh
-        if nocc_fro is None:
-            nocc_fro = self.nocc - self.nocc_act
-        oo_dim_s = int((self.nocc_act + 1) * self.nocc_act / 2)
-        oo_dim_t = int((self.nocc_act - 1) * self.nocc_act / 2)
-        if self.exci_s is not None and self.exci_t is not None:
-            print("both singlet and triplet results found.")
-            if self.nelec == "n-2":
-                exci0 = min(self.exci_s[oo_dim_s], self.exci_t[oo_dim_t])
-            else:
-                exci0 = max(self.exci_s[oo_dim_s-1], self.exci_t[oo_dim_t-1])
-            _pprpa_print_eigenvector(
-                multi="s", nocc=self.nocc_act, nvir=self.nvir_act, nocc_fro=nocc_fro, thresh=print_thresh,
-                hh_state=self.hh_state, pp_state=self.pp_state, exci0=exci0, exci=self.exci_s, xy=self.xy_s)
-            _pprpa_print_eigenvector(
-                multi="t", nocc=self.nocc_act, nvir=self.nvir_act, nocc_fro=nocc_fro, thresh=print_thresh,
-                hh_state=self.hh_state, pp_state=self.pp_state, exci0=exci0, exci=self.exci_t, xy=self.xy_t)
-        else:
-            if self.exci_s is not None:
-                print("only singlet results found.")
-                _pprpa_print_eigenvector(
-                    multi="s", nocc=self.nocc_act, nvir=self.nvir_act, nocc_fro=nocc_fro, thresh=print_thresh,
-                    hh_state=self.hh_state, pp_state=self.pp_state, exci0=self.exci_s[oo_dim_s],
-                    exci=self.exci_s, xy=self.xy_s)
-            else:
-                print("only triplet results found.")
-                _pprpa_print_eigenvector(
-                    multi="t", nocc=self.nocc_act, nvir=self.nvir_act, nocc_fro=nocc_fro, thresh=print_thresh,
-                    hh_state=self.hh_state, pp_state=self.pp_state, exci0=self.exci_t[oo_dim_t],
-                    exci=self.exci_t, xy=self.xy_t)
+        _analyze_pprpa_direct(exci_s=self.exci_s, xy_s=self.xy_s, exci_t=self.exci_t, xy_t=self.xy_t, nocc=self.nocc,
+                              nvir=self.nvir, nocc_act=self.nocc_act, nvir_act=self.nvir_act, nelec=self.nelec,
+                              print_thresh=self.print_thresh, hh_state=self.hh_state, pp_state=self.pp_state,
+                              nocc_fro=nocc_fro)
         return
 
     def get_correlation(self):

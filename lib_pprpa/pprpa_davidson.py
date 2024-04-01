@@ -1,3 +1,4 @@
+import h5py
 import numpy
 import scipy
 
@@ -502,6 +503,28 @@ def pprpa_print_a_pair(is_pp, p, q, percentage):
     return
 
 
+def _analyze_pprpa_davidson(exci_s, xy_s, exci_t, xy_t, nocc, nvir, print_thresh=0.1, channel="pp", TDA=None):
+    print("\nanalyze ppRPA results.")
+
+    if exci_s is not None and exci_t is not None:
+        print("both singlet and triplet results found.")
+        exci0 = min(exci_s[0], exci_t[0]) if channel == "pp" else max(exci_s[0], exci_t[0])
+        _pprpa_print_eigenvector(multi="s", nocc=nocc, nvir=nvir, thresh=print_thresh, channel=channel,
+                                 TDA=TDA, exci0=exci0, exci=exci_s, xy=xy_s)
+        _pprpa_print_eigenvector(multi="t", nocc=nocc, nvir=nvir, thresh=print_thresh, channel=channel,
+                                 TDA=TDA, exci0=exci0, exci=exci_t, xy=xy_t)
+    else:
+        if exci_s is not None:
+            print("only singlet results found.")
+            _pprpa_print_eigenvector(multi="s", nocc=nocc, nvir=nvir, thresh=print_thresh, channel=channel,
+                                     TDA=TDA, exci0=exci_s[0], exci=exci_s, xy=xy_s)
+        else:
+            print("only triplet results found.")
+            _pprpa_print_eigenvector(multi="t", nocc=nocc, nvir=nvir, thresh=print_thresh, channel=channel,
+                                     TDA=TDA, exci0=exci_t[0], exci=exci_t, xy=xy_t)
+    return
+
+
 class ppRPA_Davidson():
     def __init__(self, nocc, mo_energy, Lpq, channel="pp", TDA=None, nroot=5, max_vec=200, max_iter=100,
                  residue_thresh=1.0e-7, print_thresh=0.1):
@@ -620,25 +643,34 @@ class ppRPA_Davidson():
         self.exci = self.xy = None
         return
 
-    def analyze(self):
-        print("\nanalyze ppRPA results.")
-        print_thresh = self.print_thresh
-        nocc, nvir = self.nocc, self.nvir
+    def save_pprpa(self, fn):
+        assert self.exci_s is not None or self.exci_t is not None
+        print("\nsave pprpa results to %s.\n" % fn)
+        f = h5py.File(fn, "w")
+        f["nocc"] = numpy.asarray(self.nocc)
+        f["nvir"] = numpy.asarray(self.nvir)
+        if self.exci_s is not None:
+            f["exci_s"] = numpy.asarray(self.exci_s)
+            f["xy_s"] = numpy.asarray(self.xy_s)
+        if self.exci_t is not None:
+            f["exci_t"] = numpy.asarray(self.exci_t)
+            f["xy_t"] = numpy.asarray(self.xy_t)
+        f.close()
+        return
 
-        if self.exci_s is not None and self.exci_t is not None:
-            print("both singlet and triplet results found.")
-            exci0 = min(self.exci_s[0], self.exci_t[0]) if self.channel == "pp" else max(self.exci_s[0], self.exci_t[0])
-            _pprpa_print_eigenvector(multi="s", nocc=nocc, nvir=nvir, thresh=print_thresh, channel=self.channel,
-                                     TDA=self.TDA, exci0=exci0, exci=self.exci_s, xy=self.xy_s)
-            _pprpa_print_eigenvector(multi="t", nocc=nocc, nvir=nvir, thresh=print_thresh, channel=self.channel,
-                                     TDA=self.TDA, exci0=exci0, exci=self.exci_t, xy=self.xy_t)
-        else:
-            if self.exci_s is not None:
-                print("only singlet results found.")
-                _pprpa_print_eigenvector(multi="s", nocc=nocc, nvir=nvir, thresh=print_thresh, channel=self.channel,
-                                         TDA=self.TDA, exci0=self.exci_s[0], exci=self.exci_s, xy=self.xy_s)
-            else:
-                print("only triplet results found.")
-                _pprpa_print_eigenvector(multi="t", nocc=nocc, nvir=nvir, thresh=print_thresh, channel=self.channel,
-                                         TDA=self.TDA, exci0=self.exci_t[0], exci=self.exci_t, xy=self.xy_t)
+    def read_pprpa(self, fn, singlet=True, triplet=True):
+        print("\nread pprpa results from %s.\n" % fn)
+        f = h5py.File(fn, "r")
+        if singlet is True:
+            self.exci_s = numpy.asarray(f["exci_s"])
+            self.xy_s = numpy.asarray(f["xy_s"])
+        if triplet is True:
+            self.exci_t = numpy.asarray(f["exci_t"])
+            self.xy_t = numpy.asarray(f["xy_t"])
+        f.close()
+        return
+
+    def analyze(self):
+        _analyze_pprpa_davidson(exci_s=self.exci_s, xy_s=self.xy_s, exci_t=self.exci_t, xy_t=self.xy_t, nocc=self.nocc,
+                                nvir=self.nvir, print_thresh=self.print_thresh, channel=self.channel, TDA=self.TDA)
         return
