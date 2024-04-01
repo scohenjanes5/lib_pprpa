@@ -105,7 +105,7 @@ def diagonalize_pprpa_singlet(nocc, mo_energy, Lpq, mu=None):
     xy = numpy.asarray(list(x for _, x in sorted(zip(exci, xy), reverse=False)))
     exci = numpy.sort(exci)
 
-    pprpa_orthonormalize_eigenvector(multi="s", nocc=nocc, TDA=None, exci=exci, xy=xy)
+    pprpa_orthonormalize_eigenvector(multi="s", nocc=nocc, exci=exci, xy=xy)
 
     sum_exci = numpy.sum(exci[oo_dim:])
     ec = sum_exci - trace_A
@@ -195,7 +195,7 @@ def diagonalize_pprpa_triplet(nocc, mo_energy, Lpq, mu=None):
     xy = numpy.asarray(list(x for _, x in sorted(zip(exci, xy), reverse=False)))
     exci = numpy.sort(exci)
 
-    pprpa_orthonormalize_eigenvector(multi="t", nocc=nocc, TDA="None", exci=exci, xy=xy)
+    pprpa_orthonormalize_eigenvector(multi="t", nocc=nocc, exci=exci, xy=xy)
 
     sum_exci = numpy.sum(exci[oo_dim:])
     ec = (sum_exci - trace_A) * 3.0

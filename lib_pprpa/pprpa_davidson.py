@@ -75,7 +75,7 @@ def kernel(pprpa):
     assert conv is True, "ppRPA Davidson algorithm is not converged!"
     print("\nppRPA Davidson converged in %d iterations, final subspace size = %d" % (iter, nprod))
 
-    pprpa_orthonormalize_eigenvector(multi=pprpa.multi, nocc=pprpa.nocc, TDA=pprpa.TDA, exci=pprpa.exci, xy=pprpa.xy)
+    pprpa_orthonormalize_eigenvector(multi=pprpa.multi, nocc=pprpa.nocc, exci=pprpa.exci, xy=pprpa.xy)
 
     return
 
@@ -200,7 +200,7 @@ def _pprpa_contraction(pprpa, tri_vec):
     tri_row_o, tri_col_o = numpy.tril_indices(nocc, is_singlet-1)
     tri_row_v, tri_col_v = numpy.tril_indices(nvir, is_singlet-1)
 
-    if pprpa.TDA == "pp":
+    if nocc == 0:
         for ivec in range(ntri):
             z_vv = numpy.zeros(shape=[nvir, nvir], dtype=numpy.double)
             z_vv[tri_row_v, tri_col_v] = tri_vec[ivec]
@@ -220,7 +220,7 @@ def _pprpa_contraction(pprpa, tri_vec):
         for ivec in range(ntri):
             oz_vv = orb_sum_vv * tri_vec[ivec]
             mv_prod[ivec] += oz_vv
-    elif pprpa.TDA == "hh":
+    elif nvir == 0:
         for ivec in range(ntri):
             z_oo = numpy.zeros(shape=[nocc, nocc], dtype=numpy.double)
             z_oo[tri_row_o, tri_col_o] = tri_vec[ivec]
@@ -342,13 +342,13 @@ def _pprpa_expand_space(pprpa, first_state, tri_vec, tri_vec_sig, mv_prod, v_tri
             continue
 
         # convert residuals
-        if pprpa.TDA == "pp":
-            residue[iroot][pprpa.oo_dim:] /= (exci[iroot] - orb_sum_vv)
-        elif pprpa.TDA == "hh":
-            residue[iroot][:pprpa.oo_dim] /= -(exci[iroot] - orb_sum_oo)
-        else:
-            residue[iroot][:pprpa.oo_dim] /= -(exci[iroot] - orb_sum_oo)
-            residue[iroot][pprpa.oo_dim:] /= (exci[iroot] - orb_sum_vv)
+        #if pprpa.TDA == "pp":
+        #    residue[iroot][pprpa.oo_dim:] /= (exci[iroot] - orb_sum_vv)
+        #elif pprpa.TDA == "hh":
+        #    residue[iroot][:pprpa.oo_dim] /= -(exci[iroot] - orb_sum_oo)
+        #else:
+        residue[iroot][:pprpa.oo_dim] /= -(exci[iroot] - orb_sum_oo)
+        residue[iroot][pprpa.oo_dim:] /= (exci[iroot] - orb_sum_vv)
 
         for ivec in range(ntri):
             # compute product between new vector and old vector
@@ -370,14 +370,13 @@ def _pprpa_expand_space(pprpa, first_state, tri_vec, tri_vec_sig, mv_prod, v_tri
     return conv, ntri
 
 
-def pprpa_orthonormalize_eigenvector(multi, nocc, TDA, exci, xy):
+def pprpa_orthonormalize_eigenvector(multi, nocc, exci, xy):
     """Orthonormalize ppRPA eigenvector.
     The eigenvector is normalized as Y^2 - X^2 = 1.
 
     Args:
         multi (string): multiplicity.
         nocc (int): number of occupied orbitals.
-        TDA (string): "pp" for ppTDA or "hh" for hhTDA.
         exci (double array): ppRPA eigenvalue.
         xy (double ndarray): ppRPA eigenvector.
     """
@@ -387,8 +386,6 @@ def pprpa_orthonormalize_eigenvector(multi, nocc, TDA, exci, xy):
         oo_dim = int((nocc + 1) * nocc / 2)
     elif multi == "t":
         oo_dim = int((nocc - 1) * nocc / 2)
-    if TDA == "pp":
-        oo_dim = 0
 
     # determine the vector is pp or hh
     sig = numpy.zeros(shape=[nroot], dtype=numpy.double)
@@ -415,7 +412,7 @@ def pprpa_orthonormalize_eigenvector(multi, nocc, TDA, exci, xy):
 
 
 # analysis functions
-def _pprpa_print_eigenvector(multi, nocc, nvir, thresh, channel, TDA, exci0, exci, xy):
+def _pprpa_print_eigenvector(multi, nocc, nvir, thresh, channel, exci0, exci, xy):
     """Print dominant components of an eigenvector.
 
     Args:
@@ -423,7 +420,6 @@ def _pprpa_print_eigenvector(multi, nocc, nvir, thresh, channel, TDA, exci0, exc
         nocc (int): number of occupied orbitals.
         nvir (int): number of virtual orbitals.
         thresh (double): threshold to print a pair.
-        TDA (string): "pp" for ppTDA or "hh" for hhTDA.
         channel (string): "pp" for particle-particle or "hh" for hole-hole.
         exci0 (double): lowest eigenvalue.
         exci (double array): ppRPA eigenvalue.
@@ -437,8 +433,6 @@ def _pprpa_print_eigenvector(multi, nocc, nvir, thresh, channel, TDA, exci0, exc
         oo_dim = int((nocc - 1) * nocc / 2)
         is_singlet = 0
         print("\n     print ppRPA excitations: triplet\n")
-    if TDA == "pp":
-        oo_dim = 0
 
     tri_row_o, tri_col_o = numpy.tril_indices(nocc, is_singlet-1)
     tri_row_v, tri_col_v = numpy.tril_indices(nvir, is_singlet-1)
@@ -449,7 +443,7 @@ def _pprpa_print_eigenvector(multi, nocc, nvir, thresh, channel, TDA, exci0, exc
         for iroot in range(nroot):
             print("#%-d %s excitation:  exci= %-12.4f  eV   2e=  %-12.4f  eV" %
                   (iroot + 1, multi, (exci[iroot] - exci0) * au2ev, exci[iroot] * au2ev))
-            if TDA != "pp":
+            if nocc > 0:
                 full = numpy.zeros(shape=[nocc, nocc], dtype=numpy.double)
                 full[tri_row_o, tri_col_o] = xy[iroot][:oo_dim]
                 full = numpy.power(full, 2)
@@ -475,7 +469,7 @@ def _pprpa_print_eigenvector(multi, nocc, nvir, thresh, channel, TDA, exci0, exc
             for i, j in pairs:
                 pprpa_print_a_pair(is_pp=False, p=i, q=j, percentage=full[i, j])
 
-            if TDA != "hh":
+            if nvir > 0:
                 full = numpy.zeros(shape=[nvir, nvir], dtype=numpy.double)
                 full[tri_row_v, tri_col_v] = xy[iroot][oo_dim:]
                 full = numpy.power(full, 2)
@@ -503,31 +497,31 @@ def pprpa_print_a_pair(is_pp, p, q, percentage):
     return
 
 
-def _analyze_pprpa_davidson(exci_s, xy_s, exci_t, xy_t, nocc, nvir, print_thresh=0.1, channel="pp", TDA=None):
+def _analyze_pprpa_davidson(exci_s, xy_s, exci_t, xy_t, nocc, nvir, print_thresh=0.1, channel="pp"):
     print("\nanalyze ppRPA results.")
 
     if exci_s is not None and exci_t is not None:
         print("both singlet and triplet results found.")
         exci0 = min(exci_s[0], exci_t[0]) if channel == "pp" else max(exci_s[0], exci_t[0])
         _pprpa_print_eigenvector(multi="s", nocc=nocc, nvir=nvir, thresh=print_thresh, channel=channel,
-                                 TDA=TDA, exci0=exci0, exci=exci_s, xy=xy_s)
+                                 exci0=exci0, exci=exci_s, xy=xy_s)
         _pprpa_print_eigenvector(multi="t", nocc=nocc, nvir=nvir, thresh=print_thresh, channel=channel,
-                                 TDA=TDA, exci0=exci0, exci=exci_t, xy=xy_t)
+                                 exci0=exci0, exci=exci_t, xy=xy_t)
     else:
         if exci_s is not None:
             print("only singlet results found.")
             _pprpa_print_eigenvector(multi="s", nocc=nocc, nvir=nvir, thresh=print_thresh, channel=channel,
-                                     TDA=TDA, exci0=exci_s[0], exci=exci_s, xy=xy_s)
+                                     exci0=exci_s[0], exci=exci_s, xy=xy_s)
         else:
             print("only triplet results found.")
             _pprpa_print_eigenvector(multi="t", nocc=nocc, nvir=nvir, thresh=print_thresh, channel=channel,
-                                     TDA=TDA, exci0=exci_t[0], exci=exci_t, xy=xy_t)
+                                     exci0=exci_t[0], exci=exci_t, xy=xy_t)
     return
 
 
 class ppRPA_Davidson():
-    def __init__(self, nocc, mo_energy, Lpq, channel="pp", TDA=None, nroot=5, max_vec=200, max_iter=100,
-                 residue_thresh=1.0e-7, print_thresh=0.1):
+    def __init__(self, nocc, mo_energy, Lpq, channel="pp", nroot=5, max_vec=200, max_iter=100, residue_thresh=1.0e-7,
+                 print_thresh=0.1):
         # necessary input
         self.nocc = nocc  # number of occupied orbitals
         self.mo_energy = numpy.asarray(mo_energy)  # orbital energy
@@ -535,7 +529,6 @@ class ppRPA_Davidson():
 
         # options
         self.channel = channel  # channel of desired states, particle-particle or hole-hole
-        self.TDA = TDA  # Tamm–Dancoff approximation, "pp" or "hh"
         self.nroot = nroot  # number of desired roots
         self.max_vec = max_vec  # max size of trial vectors
         self.max_iter = max_iter  # max iteration
@@ -569,11 +562,6 @@ class ppRPA_Davidson():
         assert self.Lpq.shape[1] == self.Lpq.shape[2] == self.nmo
 
         assert self.channel in ["pp", "hh"]
-        assert self.TDA in ["pp", "hh", None]
-        if self.channel == "pp":
-            assert self.TDA != "hh"
-        if self.channel == "hh":
-            assert self.TDA != "pp"
 
         assert self.multi in ["s", "t"]
         if self.multi == "s":
@@ -582,10 +570,6 @@ class ppRPA_Davidson():
         elif self.multi == "t":
             self.oo_dim = int((self.nocc - 1) * self.nocc / 2)
             self.vv_dim = int((self.nvir - 1) * self.nvir / 2)
-        if self.TDA == "pp":
-            self.oo_dim = 0
-        elif self.TDA == "hh":
-            self.vv_dim = 0
         self.full_dim = self.oo_dim + self.vv_dim
 
         self.max_vec = min(self.max_vec, self.full_dim)
@@ -602,8 +586,6 @@ class ppRPA_Davidson():
         print('\n******** %s ********' % self.__class__)
         print('multiplicity = %s' % ("singlet" if self.multi == "s" else "triplet"))
         print('state channel = %s' % self.channel)
-        if self.TDA is not None:
-            print('Tamm-Dancoff approximation = %s' % self.TDA)
         print('naux = %d' % self.naux)
         print('nmo = %d' % self.nmo)
         print('nocc = %d nvir = %d' % (self.nocc, self.nvir))
@@ -672,5 +654,5 @@ class ppRPA_Davidson():
 
     def analyze(self):
         _analyze_pprpa_davidson(exci_s=self.exci_s, xy_s=self.xy_s, exci_t=self.exci_t, xy_t=self.xy_t, nocc=self.nocc,
-                                nvir=self.nvir, print_thresh=self.print_thresh, channel=self.channel, TDA=self.TDA)
+                                nvir=self.nvir, print_thresh=self.print_thresh, channel=self.channel)
         return
