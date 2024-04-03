@@ -1,7 +1,7 @@
 import h5py
 import numpy
 
-from lib_pprpa.nto import get_pprpa_nto
+from lib_pprpa.nto import get_pprpa_nto, get_pprpa_dm
 from lib_pprpa.pprpa_util import start_clock, stop_clock
 
 
@@ -156,3 +156,22 @@ def get_pprpa_nto_pyscf(mf, multi, state, xy, nocc, nvir):
     nocc_full = mf.mol.nelectron // 2
     mo_coeff = numpy.asarray(mf.mo_coeff)
     return get_pprpa_nto(multi, state, xy, nocc, nvir, mo_coeff, nocc_full)
+
+
+def get_pprpa_dm_pyscf(mf, multi, state, xy, nocc, nvir):
+    """Get density matrix with PySCF.
+
+    Args:
+        mf (PySCF mean-field object): PySCF mean-field object.
+        multi (char): multiplicity.
+        state (int): index of the desired state.
+        xy (double ndarray): ppRPA eigenvector.
+        nocc (int or int array): number of (active) occupied orbitals.
+        nvir (int or int array): number of (active) virtual orbitals.
+
+    Returns:
+        density matrix, see get_pprpa_nto().
+    """
+    nocc_full = mf.mol.nelectron // 2
+    mo_coeff = numpy.asarray(mf.mo_coeff)
+    return get_pprpa_dm(multi, state, xy, nocc, nvir, mo_coeff, nocc_full, full_return=False)

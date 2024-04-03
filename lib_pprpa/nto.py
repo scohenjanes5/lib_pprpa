@@ -1,4 +1,7 @@
+
+from functools import reduce
 import numpy
+from numpy import einsum
 
 def get_pprpa_nto(multi, state, xy, nocc, nvir, mo_coeff, nocc_full):
     """Get ppRPA natural transition orbital coefficient and weight.
@@ -35,8 +38,8 @@ def get_pprpa_nto(multi, state, xy, nocc, nvir, mo_coeff, nocc_full):
     is_singlet = 1 if multi == "s" else 0
     tril_row_o, tril_col_o = numpy.tril_indices(nocc, is_singlet-1)
     tril_row_v, tril_col_v = numpy.tril_indices(nvir, is_singlet-1)
-    triu_row_o, triu_col_o = numpy.triu_indices(nocc, is_singlet-1)
-    triu_row_v, triu_col_v = numpy.triu_indices(nvir, is_singlet-1)
+    triu_row_o, triu_col_o = numpy.triu_indices(nocc, 1-is_singlet)
+    triu_row_v, triu_col_v = numpy.triu_indices(nvir, 1-is_singlet)
 
     # 1. remove the index restrictions as equation 17 and 18 in doi.org/10.1039/C4CP04109G
     # 2. renormalize eigenvector as PySCF TDDFT NTO implementation:
@@ -77,3 +80,106 @@ def get_pprpa_nto(multi, state, xy, nocc, nvir, mo_coeff, nocc_full):
         return weight_o, nto_coeff_o1, nto_coeff_o2
     elif vv_dim > 0:
         return weight_v, nto_coeff_v1, nto_coeff_v2
+
+
+def get_pprpa_dm(multi, state, xy, nocc, nvir, mo_coeff, nocc_full, full_return=False):
+    """Get the ppRPA density matrix of the desired state.
+
+    Args:
+        multi (char): multiplicity.
+        state (int): index of the desired state.
+        xy (double ndarray): ppRPA eigenvector.
+        nocc (int or int array): number of (active) occupied orbitals.
+        nvir (int or int array): number of (active) virtual orbitals.
+        mo_coeff (double ndarray): coefficient from AO to MO.
+        nocc_full (int or int array): number of occupied orbitals of the full system.
+        full_return (bool): return all density matrixes.
+
+    Returns:
+        dm (double ndarray): [nspin * nmo_full * nmo_full], density matrix of two spin channels.
+        dm1h (double ndarray): density matrix of the first hole.
+        dm1p (double ndarray): density matrix of the first particle.
+        dm2h (double ndarray): density matrix of the second hole.
+        dm2p (double ndarray): density matrix of the second particle.
+    """
+    print("get ppRPA density matrix for multi=%s state=%d" % (multi, state))
+    nmo_full = mo_coeff.shape[0]
+
+    if multi == "s":
+        oo_dim = int((nocc + 1) * nocc / 2)
+        vv_dim = int((nvir + 1) * nvir / 2)
+    elif multi == "t":
+        oo_dim = int((nocc - 1) * nocc / 2)
+        vv_dim = int((nvir - 1) * nvir / 2)
+    assert oo_dim > 0 or vv_dim > 0
+
+    is_singlet = 1 if multi == "s" else 0
+    tril_row_o, tril_col_o = numpy.tril_indices(nocc, is_singlet-1)
+    tril_row_v, tril_col_v = numpy.tril_indices(nvir, is_singlet-1)
+    triu_row_o, triu_col_o = numpy.triu_indices(nocc, 1-is_singlet)
+    triu_row_v, triu_col_v = numpy.triu_indices(nvir, 1-is_singlet)
+
+    # 1. remove the index restrictions as equation 17 and 18 in doi.org/10.1039/C4CP04109G
+    # 2. renormalize eigenvector as PySCF TDDFT NTO implementation:
+    # https://github.com/pyscf/pyscf/blob/0a17e425e3c3dc28cfba0b54613194909db20548/pyscf/tdscf/rhf.py#L223
+    norm = 0.0
+    if oo_dim > 0:
+        y_full = numpy.zeros(shape=[nocc, nocc], dtype=numpy.double)
+        y_full[tril_row_o, tril_col_o] = xy[state][:oo_dim]
+        y_full[triu_row_o, triu_col_o] = -y_full[tril_row_o, tril_col_o]
+        norm -= numpy.sum(y_full**2)
+
+    if vv_dim > 0:
+        x_full = numpy.zeros(shape=[nvir, nvir], dtype=numpy.double)
+        x_full[tril_row_v, tril_col_v] = xy[state][oo_dim:]
+        x_full[triu_row_v, triu_col_v] = -x_full[tril_row_v, tril_col_v]
+        norm += numpy.sum(x_full**2)
+    norm = numpy.sqrt(numpy.abs(norm))
+
+    if oo_dim > 0:
+        y_full *= 1. / norm
+        dm_oo1 = -einsum('ik,jk->ij', y_full, y_full)
+        dm_oo2 = -einsum('ki,kj->ij', y_full, y_full)
+
+    if vv_dim > 0:
+        x_full *= 1. / norm
+        dm_vv1 = einsum('ac,bc->ab', x_full, x_full)
+        dm_vv2 = einsum('ca,cb->ab', x_full, x_full)
+
+    dm = numpy.zeros(shape=[2, nmo_full, nmo_full], dtype=numpy.double)
+    dm[0, :nocc_full, :nocc_full] = numpy.eye(nocc_full)
+    dm[1, :nocc_full, :nocc_full] = numpy.eye(nocc_full)
+    if multi == "s":
+        dm[0, nocc_full-nocc:nocc_full, nocc_full-nocc:nocc_full] += dm_oo1
+        dm[1, nocc_full-nocc:nocc_full, nocc_full-nocc:nocc_full] += dm_oo2
+        dm[0, nocc_full:nocc_full+nvir, nocc_full:nocc_full+nvir] += dm_vv1
+        dm[1, nocc_full:nocc_full+nvir, nocc_full:nocc_full+nvir] += dm_vv2
+    else:
+        dm[0, nocc_full-nocc:nocc_full, nocc_full-nocc:nocc_full] += dm_oo1
+        dm[0, nocc_full-nocc:nocc_full, nocc_full-nocc:nocc_full] += dm_oo2
+        dm[0, nocc_full:nocc_full+nvir, nocc_full:nocc_full+nvir] += dm_vv1
+        dm[0, nocc_full:nocc_full+nvir, nocc_full:nocc_full+nvir] += dm_vv2
+
+    dm[0] = reduce(numpy.dot, (mo_coeff, dm[0], mo_coeff.T))
+    dm[1] = reduce(numpy.dot, (mo_coeff, dm[1], mo_coeff.T))
+
+    if full_return is False:
+        return dm
+    else:
+        dm1h = numpy.zeros(shape=[nmo_full, nmo_full], dtype=numpy.double)
+        dm1h[nocc_full-nocc:nocc_full, nocc_full-nocc:nocc_full] += dm_oo1
+        dm1h = reduce(numpy.dot, (mo_coeff, dm1h, mo_coeff.T))
+
+        dm1p = numpy.zeros(shape=[nmo_full, nmo_full], dtype=numpy.double)
+        dm1p[nocc_full:nocc_full+nvir, nocc_full:nocc_full+nvir] += dm_vv1
+        dm1p = reduce(numpy.dot, (mo_coeff, dm1p, mo_coeff.T))
+
+        dm2h = numpy.zeros(shape=[nmo_full, nmo_full], dtype=numpy.double)
+        dm2h[nocc_full-nocc:nocc_full, nocc_full-nocc:nocc_full] += dm_oo2
+        dm2h = reduce(numpy.dot, (mo_coeff, dm2h, mo_coeff.T))
+
+        dm2p = numpy.zeros(shape=[nmo_full, nmo_full], dtype=numpy.double)
+        dm2p[nocc_full:nocc_full+nvir, nocc_full:nocc_full+nvir] += dm_vv2
+        dm2p = reduce(numpy.dot, (mo_coeff, dm2p, mo_coeff.T))
+
+        return dm, dm1h, dm1p, dm2h, dm2p
