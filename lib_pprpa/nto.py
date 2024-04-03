@@ -38,8 +38,13 @@ def get_pprpa_nto(multi, state, xy, nocc, nvir, mo_coeff, nocc_full):
     is_singlet = 1 if multi == "s" else 0
     tril_row_o, tril_col_o = numpy.tril_indices(nocc, is_singlet-1)
     tril_row_v, tril_col_v = numpy.tril_indices(nvir, is_singlet-1)
-    triu_row_o, triu_col_o = numpy.triu_indices(nocc, 1-is_singlet)
-    triu_row_v, triu_col_v = numpy.triu_indices(nvir, 1-is_singlet)
+
+    #triu_row_o, triu_col_o = numpy.triu_indices(nocc, 1-is_singlet)
+    #triu_row_v, triu_col_v = numpy.triu_indices(nvir, 1-is_singlet)
+    #triu_row_o = list(reversed(triu_row_o))
+    #triu_col_o = list(reversed(triu_col_o))
+    #triu_row_v = list(reversed(triu_row_v))
+    #triu_col_v = list(reversed(triu_col_v))
 
     # 1. remove the index restrictions as equation 17 and 18 in doi.org/10.1039/C4CP04109G
     # 2. renormalize eigenvector as PySCF TDDFT NTO implementation:
@@ -48,13 +53,13 @@ def get_pprpa_nto(multi, state, xy, nocc, nvir, mo_coeff, nocc_full):
     if oo_dim > 0:
         y_full = numpy.zeros(shape=[nocc, nocc], dtype=numpy.double)
         y_full[tril_row_o, tril_col_o] = xy[state][:oo_dim]
-        y_full[triu_row_o, triu_col_o] = -y_full[tril_row_o, tril_col_o]
+        #y_full[triu_row_o, triu_col_o] = -y_full[tril_row_o, tril_col_o]
         norm -= numpy.sum(y_full**2)
 
     if vv_dim > 0:
         x_full = numpy.zeros(shape=[nvir, nvir], dtype=numpy.double)
         x_full[tril_row_v, tril_col_v] = xy[state][oo_dim:]
-        x_full[triu_row_v, triu_col_v] = -x_full[tril_row_v, tril_col_v]
+        #x_full[triu_row_v, triu_col_v] = -x_full[tril_row_v, tril_col_v]
         norm += numpy.sum(x_full**2)
     norm = numpy.sqrt(numpy.abs(norm))
 
@@ -86,6 +91,12 @@ def get_pprpa_nto(multi, state, xy, nocc, nvir, mo_coeff, nocc_full):
         nto_v1, wv, nto_v2T = numpy.linalg.svd(x_full)
         nto_v2 = nto_v2T.conj().T
         weight_v = wv**2
+
+        idx = numpy.argmax(abs(nto_v1.real), axis=0)
+        nto_v1[:, nto_v1[idx, numpy.arange(nvir)].real < 0] *= -1
+        idx = numpy.argmax(abs(nto_v2.real), axis=0)
+        nto_v2[:, nto_v2[idx, numpy.arange(nvir)].real < 0] *= -1
+
         nto_coeff_v1 = numpy.dot(orbv, nto_v1)
         nto_coeff_v2 = numpy.dot(orbv, nto_v2)
 
@@ -103,7 +114,6 @@ def get_pprpa_nto(multi, state, xy, nocc, nvir, mo_coeff, nocc_full):
             print("  particle 2:")
             for j in idx_v2:
                 print("  orb=%-4d percent=%.2f%%" % (nocc+j+1, numpy.square(nto_v2[j, i])*100))
-
 
     print("NTO analysis finished.\n")
 
@@ -149,8 +159,13 @@ def get_pprpa_dm(multi, state, xy, nocc, nvir, mo_coeff, nocc_full, full_return=
     is_singlet = 1 if multi == "s" else 0
     tril_row_o, tril_col_o = numpy.tril_indices(nocc, is_singlet-1)
     tril_row_v, tril_col_v = numpy.tril_indices(nvir, is_singlet-1)
-    triu_row_o, triu_col_o = numpy.triu_indices(nocc, 1-is_singlet)
-    triu_row_v, triu_col_v = numpy.triu_indices(nvir, 1-is_singlet)
+
+    #triu_row_o, triu_col_o = numpy.triu_indices(nocc, 1-is_singlet)
+    #triu_row_v, triu_col_v = numpy.triu_indices(nvir, 1-is_singlet)
+    #triu_row_o = list(reversed(triu_row_o))
+    #triu_col_o = list(reversed(triu_col_o))
+    #triu_row_v = list(reversed(triu_row_v))
+    #triu_col_v = list(reversed(triu_col_v))
 
     # 1. remove the index restrictions as equation 17 and 18 in doi.org/10.1039/C4CP04109G
     # 2. renormalize eigenvector as PySCF TDDFT NTO implementation:
@@ -159,13 +174,13 @@ def get_pprpa_dm(multi, state, xy, nocc, nvir, mo_coeff, nocc_full, full_return=
     if oo_dim > 0:
         y_full = numpy.zeros(shape=[nocc, nocc], dtype=numpy.double)
         y_full[tril_row_o, tril_col_o] = xy[state][:oo_dim]
-        y_full[triu_row_o, triu_col_o] = -y_full[tril_row_o, tril_col_o]
+        #y_full[triu_row_o, triu_col_o] = -y_full[tril_row_o, tril_col_o]
         norm -= numpy.sum(y_full**2)
 
     if vv_dim > 0:
         x_full = numpy.zeros(shape=[nvir, nvir], dtype=numpy.double)
         x_full[tril_row_v, tril_col_v] = xy[state][oo_dim:]
-        x_full[triu_row_v, triu_col_v] = -x_full[tril_row_v, tril_col_v]
+        #x_full[triu_row_v, triu_col_v] = -x_full[tril_row_v, tril_col_v]
         norm += numpy.sum(x_full**2)
     norm = numpy.sqrt(numpy.abs(norm))
 
@@ -193,8 +208,13 @@ def get_pprpa_dm(multi, state, xy, nocc, nvir, mo_coeff, nocc_full, full_return=
         dm[0, nocc_full:nocc_full+nvir, nocc_full:nocc_full+nvir] += dm_vv1
         dm[0, nocc_full:nocc_full+nvir, nocc_full:nocc_full+nvir] += dm_vv2
 
+    print("  trace of alpha dm = %.6f" % numpy.trace(dm[0]))
+    print("  trace of beta dm = %.6f" % numpy.trace(dm[1]))
+
     dm[0] = reduce(numpy.dot, (mo_coeff, dm[0], mo_coeff.T))
     dm[1] = reduce(numpy.dot, (mo_coeff, dm[1], mo_coeff.T))
+
+    print("density matrix generation finished.\n")
 
     if full_return is False:
         return dm

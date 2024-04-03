@@ -617,11 +617,11 @@ class ppRPA_Davidson():
         kernel(pprpa=self)
         stop_clock("ppRPA Davidson: %s" % multi)
         if self.multi == "s":
-            self.exci_s = self.exci
-            self.xy_s = self.xy
+            self.exci_s = self.exci.copy()
+            self.xy_s = self.xy.copy()
         else:
-            self.exci_t = self.exci
-            self.xy_t = self.xy
+            self.exci_t = self.exci.copy()
+            self.xy_t = self.xy.copy()
         self.exci = self.xy = None
         return
 
