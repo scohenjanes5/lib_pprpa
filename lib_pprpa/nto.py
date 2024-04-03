@@ -66,22 +66,20 @@ def get_pprpa_nto(multi, state, xy, nocc, nvir, mo_coeff, nocc_full):
         weight_o = wo**2
         nto_coeff_o1 = numpy.dot(orbo, nto_o1)
         nto_coeff_o2 = numpy.dot(orbo, nto_o2)
-        print("largest hole-hole NTO component")
+
+        # analyze hole-hole NTO
         idx_large_wt = numpy.where(weight_o > 0.1)[0]
+        if len(idx_large_wt) > 0:
+            print("largest hole-hole NTO component")
         for i in range(len(idx_large_wt)):
-            idx_o1 = numpy.where(abs(nto_o1[:,0]) > 0.3)[0]
-            idx_o2 = numpy.where(abs(nto_o2[:,0]) > 0.3)[0]
+            idx_o1 = numpy.where(abs(nto_o1[:, i]) > 0.3)[0]
+            idx_o2 = numpy.where(abs(nto_o2[:, i]) > 0.3)[0]
             print("weight: %-12.3f" % weight_o[i])
-            for j in range(len(idx_o1)):
-                if j == 0:
-                    print("  hole 1: orb=%-4d percent=%.2f%%" % (j+1, numpy.square(nto_o1[i, j])*100))
-                else:
-                    print("          orb=%-4d percent=%.2f%%" % (j+1, numpy.square(nto_o1[i, j])*100))
-            for j in range(len(idx_o2)):
-                if j == 0:
-                    print("  hole 2: orb=%-4d percent=%.2f%%" % (j+1, numpy.square(nto_o2[i, j])*100))
-                else:
-                    print("          orb=%-4d percent=%.2f%%" % (j+1, numpy.square(nto_o2[i, j])*100))
+            print("  hole 1:")
+            for j in idx_o1:
+                print("  orb=%-4d percent=%.2f%%" % (j+1, numpy.square(nto_o1[j, i])*100))
+            for j in idx_o2:
+                print("  orb=%-4d percent=%.2f%%" % (j+1, numpy.square(nto_o2[j, i])*100))
 
     if vv_dim > 0:
         x_full *= 1. / norm
@@ -90,24 +88,24 @@ def get_pprpa_nto(multi, state, xy, nocc, nvir, mo_coeff, nocc_full):
         weight_v = wv**2
         nto_coeff_v1 = numpy.dot(orbv, nto_v1)
         nto_coeff_v2 = numpy.dot(orbv, nto_v2)
-        print("largest particle-particle NTO component")
-        idx_large_wt = numpy.where(weight_v > 0.1)[0]
-        for i in range(len(idx_large_wt)):
-            idx_v1 = numpy.where(abs(nto_v1[:,0]) > 0.3)[0]
-            idx_v2 = numpy.where(abs(nto_v2[:,0]) > 0.3)[0]
-            print("weight: %-12.3f" % weight_v[i])
-            for j in range(len(idx_v1)):
-                if j == 0:
-                    print("  particle 1: orb=%-4d percent=%.2f%%" % (nocc+j+1, numpy.square(nto_v1[i, j])*100))
-                else:
-                    print("              orb=%-4d percent=%.2f%%" % (nocc+j+1, numpy.square(nto_v1[i, j])*100))
-            for j in range(len(idx_v2)):
-                if j == 0:
-                    print("  particle 2: orb=%-4d percent=%.2f%%" % (nocc+j+1, numpy.square(nto_v2[i, j])*100))
-                else:
-                    print("              orb=%-4d percent=%.2f%%" % (nocc+j+1, numpy.square(nto_v2[i, j])*100))
 
-    print("  NTO analysis finished.\n")
+        # analyze particle-particle NTO
+        idx_large_wt = numpy.where(weight_v > 0.1)[0]
+        if len(idx_large_wt) > 0:
+            print("largest particle-particle NTO component")
+        for i in idx_large_wt:
+            idx_v1 = numpy.where(abs(nto_v1[:, i]) > 0.3)[0]
+            idx_v2 = numpy.where(abs(nto_v2[:, i]) > 0.3)[0]
+            print("weight: %-12.3f" % weight_v[i])
+            print("  particle 1:")
+            for j in idx_v1:
+                print("  orb=%-4d percent=%.2f%%" % (nocc+j+1, numpy.square(nto_v1[j, i])*100))
+            print("  particle 2:")
+            for j in idx_v2:
+                print("  orb=%-4d percent=%.2f%%" % (nocc+j+1, numpy.square(nto_v2[j, i])*100))
+
+
+    print("NTO analysis finished.\n")
 
     if oo_dim > 0 and vv_dim > 0:
         return weight_o, nto_coeff_o1, nto_coeff_o2, weight_v, nto_coeff_v1, nto_coeff_v2
