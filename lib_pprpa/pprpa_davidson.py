@@ -34,25 +34,37 @@ def kernel(pprpa):
         v_tri = v_tri.T  # Fortran matrix to Python order
 
         if pprpa.channel == "pp":
+            # TODO: this sorting algorithm can be improved
             # sort eigenvalues and eigenvectors by ascending order
             v_tri = numpy.asarray(list(x for _, x in sorted(zip(e_tri, v_tri), reverse=False)))
             e_tri = numpy.sort(e_tri)
 
-            # get first pp state by the sign of the eigenvector, not by the sign of the excitation energy
+            # re-order all states by signs, first hh then pp
+            sig = numpy.zeros(shape=[ntri], dtype=int)
             for i in range(ntri):
-                sum = numpy.sum((v_tri[i] ** 2) * tri_vec_sig[:ntri])
-                if sum > 0:
-                    first_state = i
-                    break
+                sig[i] = 1 if numpy.sum((v_tri[i] ** 2) * tri_vec_sig[:ntri]) > 0 else -1
+
+            hh_index = numpy.where(sig < 0)[0]
+            pp_index = numpy.where(sig > 0)[0]
+            e_tri_hh = e_tri[hh_index]
+            e_tri_pp = e_tri[pp_index]
+            e_tri[:len(hh_index)] = e_tri_hh
+            e_tri[len(hh_index):] = e_tri_pp
+            v_tri_hh = v_tri[hh_index]
+            v_tri_pp = v_tri[pp_index]
+            v_tri[:len(hh_index)] = v_tri_hh
+            v_tri[len(hh_index):] = v_tri_pp
 
             # get only two-electron addition energy
-            pprpa.exci = e_tri[first_state:(first_state+pprpa.nroot)]
+            pprpa.exci = e_tri[len(hh_index):(len(hh_index)+pprpa.nroot)]
         else:
+            # TODO: this sorting algorithm can be improved
             # sort eigenvalues and eigenvectors by ascending order
             v_tri = numpy.asarray(list(x for _, x in sorted(zip(e_tri, v_tri), reverse=True)))
             e_tri = numpy.sort(e_tri)
             e_tri = e_tri[::-1]
 
+            # TODO: re-order all states by the signs
             # get first hh state by the sign of the eigenvector, not by the sign of the excitation energy
             for i in range(ntri):
                 sum = numpy.sum((v_tri[i] ** 2) * tri_vec_sig[:ntri])
@@ -373,6 +385,8 @@ def _pprpa_expand_space(pprpa, first_state, tri_vec, tri_vec_sig, mv_prod, v_tri
 def pprpa_orthonormalize_eigenvector(multi, nocc, exci, xy):
     """Orthonormalize ppRPA eigenvector.
     The eigenvector is normalized as Y^2 - X^2 = 1.
+    This function will rewrite input exci and xy, after calling this function,
+    exci and xy will be re-ordered as [hole-hole, particle-particle].
 
     Args:
         multi (string): multiplicity.
@@ -404,6 +418,18 @@ def pprpa_orthonormalize_eigenvector(multi, nocc, exci, xy):
         inp = inner_product(xy[i], xy[i], oo_dim)
         inp = numpy.sqrt(abs(inp))
         xy[i] /= inp
+
+    # re-order all states by signs, first hh then pp
+    hh_index = numpy.where(sig < 0)[0]
+    pp_index = numpy.where(sig > 0)[0]
+    exci_hh = exci[hh_index]
+    exci_pp = exci[pp_index]
+    exci[:len(hh_index)] = exci_hh
+    exci[len(hh_index):] = exci_pp
+    xy_hh = xy[hh_index]
+    xy_pp = xy[pp_index]
+    xy[:len(hh_index)] = xy_hh
+    xy[len(hh_index):] = xy_pp
 
     # change |X -Y> to |X Y>
     xy[:][:oo_dim] *= -1
