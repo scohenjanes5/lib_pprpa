@@ -58,7 +58,7 @@ def get_chemical_potential(nocc, mo_energy):
     nspin = None
     if isinstance(mo_energy, list):
         nspin = len(mo_energy)
-    elif isinstance(mo_energy, numpy.array):
+    elif isinstance(mo_energy, numpy.ndarray):
         nspin = mo_energy.ndim
 
     if nspin == 1:
