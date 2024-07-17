@@ -17,11 +17,11 @@ def get_pyscf_input_mol(
 
     if isinstance(mf, pyscf.scf.rohf.ROHF) or\
             isinstance(mf, pyscf.dft.roks.ROKS):
-        mf = mf.copy()
-        mf.mo_coeff = [mf.mo_coeff, mf.mo_coeff]
-        mf.mo_energy = [mf.mo_energy, mf.mo_energy]
+        mf_new = mf.copy()
+        mf_new.mo_coeff = [mf.mo_coeff, mf.mo_coeff]
+        mf_new.mo_energy = [mf.mo_energy, mf.mo_energy]
         return get_pyscf_input_mol_u(
-            mf, auxbasis=auxbasis, nocc_act=nocc_act, nvir_act=nvir_act,
+            mf_new, auxbasis=auxbasis, nocc_act=nocc_act, nvir_act=nvir_act,
             dump_file=dump_file)
 
     if isinstance(mf, pyscf.scf.rhf.RHF) or isinstance(mf, pyscf.dft.rks.RKS):
@@ -109,7 +109,7 @@ def get_pyscf_input_mol_u(
 
     Kwargs:
         auxbasis (str): name of the auxiliary basis set. Default to None.
-        nocc_act (tuple of int): number of active occupied orbitals, 
+        nocc_act (tuple of int): number of active occupied orbitals,
             (Nalpha, Nbeta). Default to None.
         nvir_act (tuple of int): number of active virtual orbitals,
             (Nalpha, Nbeta). Default to None.
@@ -136,10 +136,14 @@ def get_pyscf_input_mol_u(
     if nocc_act is None:
         nocc_act = nocc
     else:
+        if isinstance(nocc_act, int):
+            nocc_act = [nocc_act, nocc_act]
         nocc_act = (min(nocc[0], nocc_act[0]), min(nocc[1], nocc_act[1]))
     if nvir_act is None:
         nvir_act = nvir
     else:
+        if isinstance(nvir_act, int):
+            nvir_act = [nvir_act, nvir_act]
         nvir_act = (min(nvir[0], nvir_act[0]), min(nvir[1], nvir_act[1]))
     nmo_act = (nocc_act[0] + nvir_act[0], nocc_act[1] + nvir_act[1])
     mo_energy_act = [
