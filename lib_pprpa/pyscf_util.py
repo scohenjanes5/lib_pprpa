@@ -136,13 +136,13 @@ def get_pyscf_input_mol_u(
     if nocc_act is None:
         nocc_act = nocc
     else:
-        if isinstance(nocc_act, int):
+        if isinstance(nocc_act, (int, numpy.int64)):
             nocc_act = [nocc_act, nocc_act]
         nocc_act = (min(nocc[0], nocc_act[0]), min(nocc[1], nocc_act[1]))
     if nvir_act is None:
         nvir_act = nvir
     else:
-        if isinstance(nvir_act, int):
+        if isinstance(nvir_act, (int, numpy.int64)):
             nvir_act = [nvir_act, nvir_act]
         nvir_act = (min(nvir[0], nvir_act[0]), min(nvir[1], nvir_act[1]))
     nmo_act = (nocc_act[0] + nvir_act[0], nocc_act[1] + nvir_act[1])
