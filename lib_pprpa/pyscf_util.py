@@ -7,13 +7,14 @@ from lib_pprpa.pprpa_util import start_clock, stop_clock
 
 # get input from PySCF
 def get_pyscf_input_mol(
-        mf, auxbasis=None, nocc_act=None, nvir_act=None, dump_file=None):
+        mf, auxbasis=None, nocc_act=None, nvir_act=None, dump_file=None,
+        sort_mo=False):
     import pyscf
 
     if isinstance(mf, pyscf.scf.uhf.UHF) or isinstance(mf, pyscf.dft.uks.UKS):
         return get_pyscf_input_mol_u(
             mf, auxbasis=auxbasis, nocc_act=nocc_act, nvir_act=nvir_act,
-            dump_file=dump_file)
+            dump_file=dump_file, sort_mo=sort_mo)
 
     if isinstance(mf, pyscf.scf.rohf.ROHF) or\
             isinstance(mf, pyscf.dft.roks.ROKS):
@@ -22,16 +23,17 @@ def get_pyscf_input_mol(
         mf_new.mo_energy = [mf.mo_energy, mf.mo_energy]
         return get_pyscf_input_mol_u(
             mf_new, auxbasis=auxbasis, nocc_act=nocc_act, nvir_act=nvir_act,
-            dump_file=dump_file)
+            dump_file=dump_file, sort_mo=sort_mo)
 
     if isinstance(mf, pyscf.scf.rhf.RHF) or isinstance(mf, pyscf.dft.rks.RKS):
         return get_pyscf_input_mol_r(
             mf, auxbasis=auxbasis, nocc_act=nocc_act, nvir_act=nvir_act,
-            dump_file=dump_file)
+            dump_file=dump_file, sort_mo=sort_mo)
 
 
 def get_pyscf_input_mol_r(
-        mf, auxbasis=None, nocc_act=None, nvir_act=None, dump_file=None):
+        mf, auxbasis=None, nocc_act=None, nvir_act=None, dump_file=None,
+        sort_mo=False):
     """Get ppRPA input from a PySCF molecular SCF calculation.
 
     Args:
@@ -55,6 +57,22 @@ def get_pyscf_input_mol_r(
     nocc = mf.mol.nelectron // 2
     nvir = nmo - nocc
     mo_energy = numpy.array(mf.mo_energy)
+    mo_coeff = numpy.array(mf.mo_coeff)
+
+    if sort_mo is True:
+        occ_index = numpy.where(mf.mo_occ > 0.5)[0]
+        vir_index = numpy.where(mf.mo_occ < 0.5)[0]
+        print("sorting molecular orbitals")
+        print("occ index = ", occ_index)
+        print("vir index = ", vir_index)
+        if occ_index[-1] < vir_index[0]:
+            print("warning: no sorting is performed!")
+        mo_energy_occ = mo_energy[occ_index]
+        mo_energy_vir = mo_energy[vir_index]
+        mo_energy = numpy.concatenate((mo_energy_occ, mo_energy_vir))
+        mo_coeff_occ = mo_coeff[:, occ_index]
+        mo_coeff_vir = mo_coeff[:, vir_index]
+        mo_coeff = numpy.concatenate((mo_coeff_occ, mo_coeff_vir), axis=1)
 
     nocc_act = nocc if nocc_act is None else min(nocc, nocc_act)
     nvir_act = nvir if nvir_act is None else min(nvir, nvir_act)
@@ -75,10 +93,9 @@ def get_pyscf_input_mol_r(
         mf._keys.update(['with_df'])
 
     naux = mf.with_df.get_naoaux()
-    mo = numpy.asarray(mf.mo_coeff, order='F')
     ijslice = (nocc-nocc_act, nocc+nvir_act, nocc-nocc_act, nocc+nvir_act)
     Lpq = None
-    Lpq = _ao2mo.nr_e2(mf.with_df._cderi, mo, ijslice, aosym='s2', out=Lpq)
+    Lpq = _ao2mo.nr_e2(mf.with_df._cderi, mo_coeff, ijslice, aosym='s2', out=Lpq)
     Lpq = Lpq.reshape(naux, nmo_act, nmo_act)
 
     if dump_file is not None:
@@ -101,7 +118,8 @@ def get_pyscf_input_mol_r(
 
 
 def get_pyscf_input_mol_u(
-        mf, auxbasis=None, nocc_act=None, nvir_act=None, dump_file=None):
+        mf, auxbasis=None, nocc_act=None, nvir_act=None, dump_file=None,
+        sort_mo=False):
     """Get ppRPA input from a PySCF unrestricted calculation.
 
     Args:
@@ -131,7 +149,24 @@ def get_pyscf_input_mol_u(
     nmo = (len(mf.mo_energy[0]), len(mf.mo_energy[1]))
     nocc = mf.nelec
     nvir = (nmo[0] - nocc[0], nmo[1] - nocc[1])
-    mo_energy = numpy.asarray(mf.mo_energy)
+    mo_energy = numpy.array(mf.mo_energy)
+    mo_coeff = numpy.array(mf.mo_coeff)
+    if sort_mo is True:
+        for s in range(2):
+            occ_index = numpy.where(mf.mo_occ[s] > 0.5)[0]
+            vir_index = numpy.where(mf.mo_occ[s] < 0.5)[0]
+            spin = "alpha" if s == 0 else "beta"
+            print("sorting %s spin molecular orbitals" % spin)
+            print("occ index = ", occ_index)
+            print("vir index = ", vir_index)
+            if occ_index[-1] < vir_index[0]:
+                print("warning: no sorting is performed!")
+            mo_energy_occ = mo_energy[s][occ_index]
+            mo_energy_vir = mo_energy[s][vir_index]
+            mo_energy[s] = numpy.concatenate((mo_energy_occ, mo_energy_vir))
+            mo_coeff_occ = mo_coeff[s][:, occ_index]
+            mo_coeff_vir = mo_coeff[s][:, vir_index]
+            mo_coeff[s] = numpy.concatenate((mo_coeff_occ, mo_coeff_vir), axis=1)
 
     if nocc_act is None:
         nocc_act = nocc
@@ -164,7 +199,6 @@ def get_pyscf_input_mol_u(
         mf._keys.update(['with_df'])
 
     naux = mf.with_df.get_naoaux()
-    mo = mf.mo_coeff
     ijslice = [
         (
             nocc[0]-nocc_act[0], nocc[0]+nvir_act[0],
@@ -175,10 +209,10 @@ def get_pyscf_input_mol_u(
     ]
     Lpq_a = None
     Lpq_b = None
-    Lpq_a = _ao2mo.nr_e2(mf.with_df._cderi, mo[0], ijslice[0],
+    Lpq_a = _ao2mo.nr_e2(mf.with_df._cderi, mo_coeff[0], ijslice[0],
                          aosym='s2', out=Lpq_a)
     Lpq_a = Lpq_a.reshape(naux, nmo_act[0], nmo_act[0])
-    Lpq_b = _ao2mo.nr_e2(mf.with_df._cderi, mo[1], ijslice[1],
+    Lpq_b = _ao2mo.nr_e2(mf.with_df._cderi, mo_coeff[1], ijslice[1],
                          aosym='s2', out=Lpq_b)
     Lpq_b = Lpq_b.reshape(naux, nmo_act[1], nmo_act[1])
     Lpq = [Lpq_a, Lpq_b]
