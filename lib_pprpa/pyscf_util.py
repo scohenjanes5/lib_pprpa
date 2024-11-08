@@ -1,7 +1,7 @@
 import h5py
 import numpy
 
-from lib_pprpa.nto import get_pprpa_nto, get_pprpa_dm
+from lib_pprpa.analyze import get_pprpa_nto, get_pprpa_dm
 from lib_pprpa.pprpa_util import start_clock, stop_clock
 
 

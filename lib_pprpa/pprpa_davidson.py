@@ -4,6 +4,7 @@ import scipy
 
 from numpy import einsum
 
+from lib_pprpa.analyze import pprpa_print_a_pair
 from lib_pprpa.pprpa_util import ij2index, inner_product, start_clock, \
     stop_clock, print_citation, get_chemical_potential
 
@@ -453,6 +454,7 @@ def _pprpa_expand_space(
     return conv, ntri
 
 
+# TODO: move this function to orthonormalize.py
 def pprpa_orthonormalize_eigenvector(multi, nocc, exci, xy):
     """Orthonormalize ppRPA eigenvector.
     The eigenvector is normalized as Y^2 - X^2 = 1.
@@ -578,24 +580,6 @@ def _pprpa_print_eigenvector(
                         is_pp=True, p=a+nocc, q=b+nocc, percentage=full[a, b])
             print("")
 
-    return
-
-
-def pprpa_print_a_pair(is_pp, p, q, percentage):
-    """Print the percentage of a pair in the eigenvector.
-
-    Args:
-        is_pp (bool): the eigenvector is in particle-particle channel.
-        p (int): MO index of the first orbital.
-        q (int): MO index of the second orbital.
-        percentage (double): the percentage of this pair.
-    """
-    if is_pp:
-      print("    particle-particle pair: %5d %5d   %5.2f%%" %
-            (p + 1, q + 1, percentage * 100))
-    else:
-      print("    hole-hole pair:         %5d %5d   %5.2f%%" %
-            (p + 1, q + 1, percentage * 100))
     return
 
 

@@ -3,9 +3,27 @@ from functools import reduce
 import numpy
 from numpy import einsum
 
+# print eigenvector
+def pprpa_print_a_pair(is_pp, p, q, percentage):
+    """Print the percentage of a pair in the eigenvector.
 
+    Args:
+        is_pp (bool): the eigenvector is in particle-particle channel.
+        p (int): MO index of the first orbital.
+        q (int): MO index of the second orbital.
+        percentage (double): the percentage of this pair.
+    """
+    if is_pp:
+        pair = "    particle-particle pair:"
+    else:
+        pair = "    hole-hole pair:        "
+    print("%s %5d %5d   %5.2f%%" % (pair, p + 1, q + 1, percentage * 100))
+    return
+
+
+# natural transition orbital
 def get_pprpa_nto(multi, state, xy, nocc, nvir, mo_coeff, nocc_full):
-    """Get ppRPA natural transition orbital coefficient and weight.
+    """Get restricted ppRPA natural transition orbital coefficient and weight.
 
     Args:
         multi (char): multiplicity.
@@ -114,9 +132,10 @@ def get_pprpa_nto(multi, state, xy, nocc, nvir, mo_coeff, nocc_full):
         return weight_v, nto_coeff_v1, nto_coeff_v2
 
 
+# natural transition orbital
 def get_pprpa_dm(multi, state, xy, nocc, nvir, mo_coeff, nocc_full,
                  full_return=False):
-    """Get the ppRPA density matrix of the desired state.
+    """Get the restricted ppRPA density matrix of the desired state.
 
     Args:
         multi (char): multiplicity.
@@ -215,3 +234,56 @@ def get_pprpa_dm(multi, state, xy, nocc, nvir, mo_coeff, nocc_full,
             dm2p = reduce(numpy.dot, (mo_coeff, dm2p, mo_coeff.T))
 
         return dm, dm1h, dm1p, dm2h, dm2p
+
+
+# oscillator strength
+def get_pprpa_oscillator_strength(
+        nocc, nvir, mo_dip, channel, exci, exci0, xy, xy0):
+    """Compute oscillator strength from restricted pp-TDA or hh-TDA.
+    For restricted case, ground state and all singlets are closed-shell.
+    Thus, only alpha-beta-alpha-beta block is needed.
+    If oscillator strength is calculated in particle-particle channel,
+    only 1st, 4th and 6th terms in equation 47 in SI of Ref.1 are needed.
+
+    Reference:
+    [1] J. Chem. Phys. 139, 224105 (2013)
+    See Supplemental Information section I. D.
+
+    Args:
+        nocc (int): number of occupied orbitals.
+        nvir (int): number of virtual orbitals.
+        mo_dip (double ndarray): MO dipole integrals, <p|r|q>, (3, nmo, nmo).
+        channel (string): "pp" for particle-particle or "hh" for hole-hole.
+        exci (double): excited-state eigenvalue.
+        exci0 (double): ground-state eigenvalue.
+        xy (double array): excited-state eigenvector.
+        xy0 (double array): ground-state eigenvector.
+
+    Return:
+        f (double): oscillator strength.
+    """
+    oo_dim = nocc * nocc
+    if channel == 'pp':
+        full = xy[oo_dim:].reshape(nvir, nvir)
+        full0 = xy0[oo_dim:].reshape(nvir, nvir)
+
+        # calculate transition dipole <Psi_0|r|Psi_m>
+        trans_dip = numpy.zeros(shape=[3], dtype=numpy.double)
+        trans_dip += numpy.einsum(
+            'ab,ad,rdb->r', full0, full, mo_dip[:,nocc:,nocc:], optimize=True)
+        #trans_dip -= numpy.einsum(
+        # 'ab,ca,rcb->r', full0, full, mo_dip[:,nocc:,nocc:], optimize=True)
+        #trans_dip -= numpy.einsum(
+        # 'ab,bd,rda->r', full0, full, mo_dip[:,nocc:,nocc:], optimize=True)
+        trans_dip += numpy.einsum(
+            'ab,cb,rca->r', full0, full, mo_dip[:,nocc:,nocc:], optimize=True)
+        trans_dip += 2.0 * numpy.einsum(
+            'ab,ab,rmm->r', full0, full, mo_dip[:,:nocc,:nocc], optimize=True)
+        #trans_dip -= numpy.einsum(
+        # 'ab,ba,rmm->r', full0, full, mo_dip[:,:nocc,:nocc], optimize=True)
+
+        # |<Psi_0|r|Psi_m>|^2
+        f = 2.0 / 3.0 * (exci - exci0) * numpy.sum(trans_dip**2)
+    else:
+        raise NotImplementedError('hh-TDA oscillator strength not implemented.')
+    return f

@@ -4,11 +4,14 @@ Author: Jincheng Yu <pimetamon@gmail.com>
 import h5py
 import numpy
 import scipy
-from lib_pprpa.pprpa_davidson import pprpa_orthonormalize_eigenvector, pprpa_print_a_pair
+
+from lib_pprpa.analyze import pprpa_print_a_pair
+from lib_pprpa.pprpa_davidson import pprpa_orthonormalize_eigenvector
 from lib_pprpa.pprpa_util import get_chemical_potential, start_clock, stop_clock, print_citation, inner_product
 from lib_pprpa.pprpa_direct import diagonalize_pprpa_triplet
 
 
+# TODO: move this function to orthonormalize.py
 def upprpa_orthonormalize_eigenvector(subspace, nocc, exci, xy):
     """Orthonormalize U-ppRPA eigenvectors.
     The eigenvector is normalized as Y^2 - X^2 = 1.
@@ -339,7 +342,7 @@ class UppRPA_direct():
     Args:
         nocc (tuple): number of occupied orbitals, (nalpha, nbeta)
         mo_energy (list of double arrays): orbital energies, [alpha, beta]
-        Lpq (list of double ndarrays): 
+        Lpq (list of double ndarrays):
             three-center RI matrices in MO space, [alpha, beta]
 
     Kwargs:
@@ -505,20 +508,20 @@ class UppRPA_direct():
         f.close()
         return
 
-    def read_pprpa(self, fn, aaaa=True, bbbb=True, abab=True):
+    def read_pprpa(self, fn):
         if self.exci is None:
             self.exci = [None, None, None]
         if self.xy is None:
             self.xy = [None, None, None]
         print('\nread U-ppRPA results from %s.\n' % fn)
         f = h5py.File(fn, 'r')
-        if aaaa:
+        if "exci_aaaa" in f.keys():
             self.exci[0] = numpy.asarray(f['exci_aaaa'])
             self.xy[0] = numpy.asarray(f['xy_aaaa'])
-        if bbbb:
+        if "exci_bbbb" in f.keys():
             self.exci[1] = numpy.asarray(f['exci_bbbb'])
             self.xy[1] = numpy.asarray(f['xy_bbbb'])
-        if abab:
+        if "exci_abab" in f.keys():
             self.exci[2] = numpy.asarray(f['exci_abab'])
             self.xy[2] = numpy.asarray(f['xy_abab'])
         f.close()
