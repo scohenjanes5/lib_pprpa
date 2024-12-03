@@ -44,7 +44,7 @@ def get_chemical_potential(nocc, mo_energy):
 
     Args:
         nocc (int/int array): number of occupied orbitals.
-        mo_energy (double array/double ndarray/list of double array): 
+        mo_energy (double array/double ndarray/list of double array):
             orbital energy. double array for restricted calculation,
             double ndarray/list of double array for unrestricted
             calculation.
