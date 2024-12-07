@@ -267,7 +267,12 @@ def get_subspace_trial_vector(pprpa, ntri, channel, nocc_sub=40, nvir_sub=40):
 
     start, end = pprpa.nocc - nocc_sub, pprpa.nocc + nvir_sub
     mo_energy_sub = pprpa.mo_energy[start:end]
-    Lpq_sub = pprpa.Lpq[:, start:end, start:end]
+    if pprpa._use_Lov is True:
+        Lpq_sub = np.concatenate(
+            (pprpa.Lpi[:, :, start:], pprpa.Lpa[:, :, :nvir_sub]), axis=2)
+        Lpq_sub = Lpq_sub[:, start:end, :]
+    else:
+        Lpq_sub = pprpa.Lpq[:, start:end, start:end]
     if pprpa.multi == "s":
         xy_sub = diagonalize_pprpa_singlet(nocc_sub, mo_energy_sub, Lpq_sub)[1]
     else:
@@ -308,6 +313,8 @@ def _pprpa_contraction(pprpa, tri_vec):
     naux = pprpa.naux
     mo_energy = pprpa.mo_energy
     Lpq = pprpa.Lpq
+    Lpi = pprpa.Lpi
+    Lpa = pprpa.Lpa
 
     ntri = tri_vec.shape[0]
     mv_prod = np.zeros(shape=[ntri, pprpa.full_dim], dtype=np.double)
@@ -329,14 +336,24 @@ def _pprpa_contraction(pprpa, tri_vec):
 
         # Lpqz_{L,pr} = \sum_s Lpq_{L,ps} z_{rs}
         Lpq_z = np.zeros(shape=[naux * nmo, nmo], dtype=np.double)
-        Lpq_z[:, :nocc] = np.matmul(Lpq[:, :, :nocc].reshape(naux * nmo, nocc), z_oo)
-        Lpq_z[:, nocc:] = np.matmul(Lpq[:, :, nocc:].reshape(naux * nmo, nvir), z_vv)
+        if pprpa._use_Lov is True:
+            Lpq_z[:, :nocc] = np.matmul(Lpi.reshape(naux * nmo, nocc), z_oo)
+            Lpq_z[:, nocc:] = np.matmul(Lpa.reshape(naux * nmo, nvir), z_vv)
+        else:
+            Lpq_z[:, :nocc] = np.matmul(
+                Lpq[:, :, :nocc].reshape(naux * nmo, nocc), z_oo)
+            Lpq_z[:, nocc:] = np.matmul(
+                Lpq[:, :, nocc:].reshape(naux * nmo, nvir), z_vv)
 
         # transpose and reshape for faster multiplication
         Lpq_z = Lpq_z.reshape(naux, nmo, nmo).transpose(1, 0, 2)
         Lpq_z = Lpq_z.reshape(nmo, naux * nmo)
-        # NOTE: here assuming Lpq[L,p,q] = Lpq[L,q,p]
-        prod_oo = np.matmul(Lpq_z[:nocc], Lpq[:, :, :nocc].reshape(naux * nmo, nocc))
+        # NOTE: here assuming Lpq[L,p,q] = Lpq[L,q,p] for real orbitals
+        if pprpa._use_Lov is True:
+            prod_oo = np.matmul(Lpq_z[:nocc], Lpi.reshape(naux * nmo, nocc))
+        else:
+            prod_oo = np.matmul(
+                Lpq_z[:nocc], Lpq[:, :, :nocc].reshape(naux * nmo, nocc))
         if pprpa.multi == "s":
             prod_oo += prod_oo.T
         else:
@@ -345,7 +362,11 @@ def _pprpa_contraction(pprpa, tri_vec):
         prod_oo = prod_oo.T
         prod_oo[np.diag_indices(nocc)] *= 1.0 / np.sqrt(2)
 
-        prod_vv = np.matmul(Lpq_z[nocc:], Lpq[:, :, nocc:].reshape(naux * nmo, nvir))
+        if pprpa._use_Lov is True:
+            prod_vv = np.matmul(Lpq_z[nocc:], Lpa.reshape(naux * nmo, nvir))
+        else:
+            prod_vv = np.matmul(
+                Lpq_z[nocc:], Lpq[:, :, nocc:].reshape(naux * nmo, nvir))
         if pprpa.multi == "s":
             prod_vv += prod_vv.T
         else:
@@ -578,6 +599,9 @@ class ppRPA_Davidson():
         self.mo_energy = np.asarray(mo_energy)  # orbital energy
         # three-center density-fitting matrix in MO space
         self.Lpq = np.asarray(Lpq)
+        self._use_Lov = False  # use C-contiguous Lpq block for better performance
+        self.Lpi = None  # Lpi = Lpq[:, :, :nocc], C-contiguous
+        self.Lpa = None  # Lpa = Lpq[:, :, nocc:], C-contiguous
 
         # options
         self.channel = channel  # channel of desired states, particle-particle or hole-hole
@@ -614,8 +638,6 @@ class ppRPA_Davidson():
         return
 
     def check_parameter(self):
-        assert self.Lpq.shape[1] == self.Lpq.shape[2] == self.nmo
-
         assert self.channel in ["pp", "hh"]
 
         assert self.multi in ["s", "t"]
@@ -658,6 +680,8 @@ class ppRPA_Davidson():
             print("subspace nocc = %d nvir = %d" % (self.nocc_sub, self.nvir_sub))
         print('residue threshold = %.3e' % self.residue_thresh)
         print('print threshold = %.2f%%' % (self.print_thresh*100))
+        # experiment features
+        print("_use_Lov = %s" % self._use_Lov)
         print('')
         return
 
@@ -675,6 +699,13 @@ class ppRPA_Davidson():
     def kernel(self, multi):
         self.multi = multi
         self.check_parameter()
+
+        # TODO: directly take Lpi and Lpa in the future
+        if self._use_Lov is True and self.Lpq is not None:
+            self.Lpi = np.ascontiguousarray(self.Lpq[:, :, :self.nocc])
+            self.Lpa = np.ascontiguousarray(self.Lpq[:, :, self.nocc:])
+            self.Lpq = None
+
         self.dump_flags()
         self.check_memory()
         start_clock("ppRPA Davidson: %s" % multi)
