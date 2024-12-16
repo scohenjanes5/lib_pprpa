@@ -519,6 +519,14 @@ def create_frac_scf_object(mf, frac_spin, frac_orb, frac_occ):
 
 
 def get_fxc_r(mf):
+    """Calculate fxc matrix in orbital space.
+
+    Args:
+        mf (pyscf.dft.RKS): pyscf restricted KS-DFT object.
+    
+    Returns:
+        fxc_mat (numpy.ndarray): fxc matrix in orbital space.
+    """
     import pyscf
     dm0 = mf.make_rdm1(mf.mo_coeff, mf.mo_occ)
     ni = mf._numint
@@ -546,7 +554,6 @@ def get_fxc_r(mf):
             w_rho = numpy.einsum('rpq,r->rpq', rho_value, wfxc, optimize=True)
             w = numpy.einsum(
                 'rpq,rmn->pqmn', rho_value, w_rho, optimize=True) * 2
-            fxc_mat += w.transpose(0, 3, 1, 2)
 
     elif xctype == 'GGA':
         ao_deriv = 1
@@ -563,7 +570,6 @@ def get_fxc_r(mf):
             w_rho = numpy.einsum(
                 'xyr,xrpq->yrpq', wfxc, rho_value, optimize=True)
             w = numpy.einsum('xrpq,xrmn->pqmn', w_rho, rho_value, optimize=True)
-            fxc_mat += w.transpose(0, 3, 1, 2)
 
     elif xctype == 'MGGA':
         raise NotImplementedError
