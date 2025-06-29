@@ -8,6 +8,7 @@ from lib_pprpa.upprpa_direct import UppRPA_direct
 from lib_pprpa.pprpa_direct import pprpa_orthonormalize_eigenvector
 from lib_pprpa.upprpa_direct import upprpa_orthonormalize_eigenvector
 from lib_pprpa.pprpa_util import inner_product, get_chemical_potential, start_clock, stop_clock
+from lib_pprpa.gsc import mo_energy_gsc2
 
 
 def diagonalize_pprpa_subspace_same_spin(nocc, mo_energy, w_mat, mu=None):
@@ -25,6 +26,7 @@ def diagonalize_pprpa_subspace_same_spin(nocc, mo_energy, w_mat, mu=None):
         xy (double ndarray): ppRPA eigenvector.
         ec (double): triplet correlation energy.
     """
+    w_mat = w_mat.transpose(0,3,1,2)
     nmo = len(mo_energy)
     nvir = nmo - nocc
     if mu is None:
@@ -48,7 +50,8 @@ def diagonalize_pprpa_subspace_same_spin(nocc, mo_energy, w_mat, mu=None):
     trace_A = numpy.trace(A)
 
     # ===========================> B matrix <============================
-    B = w_mat[nocc:, nocc:, :nocc, :nocc]
+    B = w_mat[nocc:, nocc:, :nocc, :nocc] - \
+        w_mat[nocc:, nocc:, :nocc, :nocc].transpose(0,1,3,2)
     B = B[tri_row_v, tri_col_v, ...]
     B = B[..., tri_row_o, tri_col_o]
 
@@ -105,6 +108,7 @@ def diagonalize_pprpa_subspace_diff_spin(nocc, mo_energy, w_mat, mu=None):
         xy (double ndarray): ppRPA eigenvector.
         ec (double): correlation energy from one subspace.
     """
+    w_mat = w_mat.transpose(0,3,1,2)
     nmo = (len(mo_energy[0]), len(mo_energy[1]))
     nvir = (nmo[0]-nocc[0], nmo[1]-nocc[1])
     if mu is None:
@@ -160,7 +164,7 @@ def diagonalize_pprpa_subspace_diff_spin(nocc, mo_energy, w_mat, mu=None):
     return exci, xy, ec
 
 
-def get_K(fxc, Lpq, test=False):
+def get_K(fxc, Lpq, rpa=False):
     """Construct Hartree-exchange-correlation kernel matrix in MO basis.
 
     Args:
@@ -183,7 +187,7 @@ def get_K(fxc, Lpq, test=False):
     pqrs = numpy.einsum('Ppq,Psr->pqrs', Lpq[0], Lpq[1], optimize=True)
     kab_hxc = fxc[2] + pqrs
 
-    if test is True:
+    if rpa is True:
         kaa_hxc -= fxc[0]
         kbb_hxc -= fxc[1]
         kab_hxc -= fxc[2]
@@ -206,6 +210,8 @@ def get_M(k_hxc, mo_energy, nmo, nocc):
     Returns:
         m_mat (numpy.ndarray): M matrix.
     """
+    if isinstance(nmo, int):
+        nmo = (nmo, nmo)
     nvir = (nmo[0]-nocc[0], nmo[1]-nocc[1])
     k_iajb = [k_hxc[0][:nocc[0], nocc[0]:, :nocc[0], nocc[0]:], # aaaa
               k_hxc[1][:nocc[1], nocc[1]:, :nocc[1], nocc[1]:], # bbbb
@@ -213,20 +219,10 @@ def get_M(k_hxc, mo_energy, nmo, nocc):
               k_hxc[2][:nocc[0], nocc[0]:, \
                 :nocc[1], nocc[1]:].transpose(2,3,0,1) # bbaa
               ]
-    k_iajb[0] = k_iajb[0].reshape(nocc[0]*nvir[0], nocc[0]*nvir[0]) + \
-        k_iajb[0].transpose(0,1,3,2).reshape(nocc[0]*nvir[0], nocc[0]*nvir[0])
-    k_iajb[1] = k_iajb[1].reshape(nocc[1]*nvir[1], nocc[1]*nvir[1]) + \
-        k_iajb[1].transpose(0,1,3,2).reshape(nocc[1]*nvir[1], nocc[1]*nvir[1])
-    k_iajb[2] = k_iajb[2].reshape(nocc[0]*nvir[0], nocc[1]*nvir[1]) + \
-        k_iajb[2].transpose(0,1,3,2).reshape(nocc[0]*nvir[0], nocc[1]*nvir[1])
-    k_iajb[3] = k_iajb[3].reshape(nocc[1]*nvir[1], nocc[0]*nvir[0]) + \
-        k_iajb[3].transpose(0,1,3,2).reshape(nocc[1]*nvir[1], nocc[0]*nvir[0])
-
-#    k_iajb = [numpy.zeros_like(k_iajb[0]),
-#              numpy.zeros_like(k_iajb[1]),
-#              numpy.zeros_like(k_iajb[2]),
-#              numpy.zeros_like(k_iajb[3])
-#              ]
+    k_iajb[0] = k_iajb[0].reshape(nocc[0]*nvir[0], nocc[0]*nvir[0]) * 2
+    k_iajb[1] = k_iajb[1].reshape(nocc[1]*nvir[1], nocc[1]*nvir[1]) * 2
+    k_iajb[2] = k_iajb[2].reshape(nocc[0]*nvir[0], nocc[1]*nvir[1]) * 2
+    k_iajb[3] = k_iajb[3].reshape(nocc[1]*nvir[1], nocc[0]*nvir[0]) * 2
 
     for i in range(nocc[0]):
         for a in range(nvir[0]):
@@ -242,14 +238,10 @@ def get_M(k_hxc, mo_energy, nmo, nocc):
     m_lower = numpy.concatenate((k_iajb[3], k_iajb[1]), axis=1)
     m_mat = numpy.concatenate((m_upper, m_lower), axis=0)
 
-#    numpy.set_printoptions(threshold=100000000000)
-#    print('====> m_mat')
-#    print(m_mat)
-
     return m_mat
 
 
-def get_W(k_hxc, m_mat, nmo, nocc, test=False):
+def get_W(k_hxc, m_mat, nmo, nocc, no_screening=False):
     """Calculate W matrix as defined in 
     J. Phys. Chem. Lett. 2021, 12, 7236−7244, Equation (14).
 
@@ -264,20 +256,16 @@ def get_W(k_hxc, m_mat, nmo, nocc, test=False):
     Returns:
         w_mat (list of numpy.ndarray): W matrices, [aaaa, bbbb, aabb].
     """
+    if isinstance(nmo, int):
+        nmo = (nmo, nmo)
     nvir = (nmo[0]-nocc[0], nmo[1]-nocc[1])
     cond_number = numpy.linalg.cond(m_mat)
-    print(f"Condition number: {cond_number}")
+    print(f"M matrix Condition number: {cond_number}")
     if cond_number < 1e12:  # Threshold for well-conditioned matrix
         print("Matrix is well-conditioned.")
     else:
         print("Matrix is ill-conditioned.")
-    #sparse_matrix = csc_matrix(m_mat)
-    #identity_matrix = csc_matrix(numpy.eye(m_mat.shape[0]))
-    #m_inv = spsolve(sparse_matrix, identity_matrix).toarray()
     m_inv = numpy.linalg.inv(m_mat)
-#    numpy.set_printoptions(threshold=100000000000)
-#    print('====> m_inv')
-#    print(m_inv)
     k_pria = [k_hxc[0][:, :, :nocc[0], nocc[0]:], # aaaa
               k_hxc[1][:, :, :nocc[1], nocc[1]:], # bbbb
               k_hxc[2][:, :, :nocc[1], nocc[1]:], # aabb
@@ -291,34 +279,27 @@ def get_W(k_hxc, m_mat, nmo, nocc, test=False):
 
     K_upper = numpy.concatenate((
         k_pria[0].reshape(nmo[0]*nmo[0], nocc[0]*nvir[0]), 
-        k_pria[2].reshape(nmo[0]*nmo[0], nocc[1]*nvir[1])), axis=1)
-    K_upper += numpy.concatenate((
-        k_prai[0].reshape(nmo[0]*nmo[0], nocc[0]*nvir[0]), 
-        k_prai[2].reshape(nmo[0]*nmo[0], nocc[1]*nvir[1])), axis=1)
+        k_pria[2].reshape(nmo[0]*nmo[0], nocc[1]*nvir[1])), axis=1) * 2
+
     K_lower = numpy.concatenate((
         k_pria[3].reshape(nmo[1]*nmo[1], nocc[0]*nvir[0]), 
-        k_pria[1].reshape(nmo[1]*nmo[1], nocc[1]*nvir[1])), axis=1)
-    K_lower += numpy.concatenate((
-        k_prai[3].reshape(nmo[1]*nmo[1], nocc[0]*nvir[0]), 
-        k_prai[1].reshape(nmo[1]*nmo[1], nocc[1]*nvir[1])), axis=1)
-    K_mat1 = numpy.concatenate((K_upper, K_lower), axis=0)
+        k_pria[1].reshape(nmo[1]*nmo[1], nocc[1]*nvir[1])), axis=1) * 2
+
+    K_mat1 = numpy.concatenate((K_upper, K_lower), axis=0).copy()
 
     k_jbsq = []
     for mat in k_pria:
         k_jbsq.append(mat.transpose(2,3,0,1))
     K_upper = numpy.concatenate((
-        k_pria[0].reshape(nocc[0]*nvir[0], nmo[0]*nmo[0]), 
-        k_pria[2].reshape(nocc[1]*nvir[1], nmo[0]*nmo[0])), axis=1)
+        k_jbsq[0].reshape(nocc[0]*nvir[0], nmo[0]*nmo[0]), 
+        k_jbsq[2].reshape(nocc[1]*nvir[1], nmo[0]*nmo[0])), axis=0)
     K_lower = numpy.concatenate((
-        k_pria[3].reshape(nocc[0]*nvir[0], nmo[1]*nmo[1]), 
-        k_pria[1].reshape(nocc[1]*nvir[1], nmo[1]*nmo[1])), axis=1)
-    K_mat2 = numpy.concatenate((K_upper, K_lower), axis=0)
+        k_jbsq[3].reshape(nocc[0]*nvir[0], nmo[1]*nmo[1]), 
+        k_jbsq[1].reshape(nocc[1]*nvir[1], nmo[1]*nmo[1])), axis=0)
+    K_mat2 = numpy.concatenate((K_upper, K_lower), axis=1).copy()
 
     wm = numpy.dot(K_mat1, m_inv)
     wm = numpy.dot(wm, K_mat2)
-#    numpy.set_printoptions(threshold=100000000000)
-#    print('====> wm')
-#    print(wm)
 
     wm_list = []
     wm_list.append(wm[:nmo[0]*nmo[0], \
@@ -330,17 +311,10 @@ def get_W(k_hxc, m_mat, nmo, nocc, test=False):
 
     w_mat = []
     for i in range(3):
-        if test:
+        if no_screening:
             w_mat.append(k_hxc[i])
         else:
-#            print('===> khxc ', i)
-#            print(k_hxc[i])
-#            print('===> wm ', i)
-#            print(wm_list[i])
             w_mat.append(k_hxc[i] - wm_list[i])
-#            print('===> wmat ', i)
-#            print(w_mat[i])
-        w_mat[i] = w_mat[i].transpose(0,3,1,2)
 
     return w_mat
 
@@ -370,12 +344,26 @@ class UppRPAwDirect(UppRPA_direct):
         self.w_mat = get_W(self.kHxc, m_mat, self.nmo, self.nocc)
         return self.w_mat
 
-    def kernel(self, subspace=['aa', 'bb', 'ab']):
-        self.check_parameter()
-        self.dump_flags()
-        self.check_memory()
+    def get_GSC_mo_energy(self):
+        pass
+
+    def check_parameter(self, gsc2_e=True, mf=None):
+        assert 0.0 < self.print_thresh < 1.0
+        assert self.nelec in ["n-2", "n+2"]
+        if self.mu is None:
+            self.mu = get_chemical_potential(nocc=self.nocc,
+                                             mo_energy=self.mo_energy)
         if self.w_mat == None:
             self.w_mat = self.get_W()
+        if gsc2_e:
+            assert mf is not None
+            self.mo_energy = mo_energy_gsc2(mf, self.w_mat)
+        return
+
+    def kernel(self, subspace=['aa', 'bb', 'ab'], gsc2_e=False, mf=None):
+        self.check_parameter(gsc2_e=gsc2_e, mf=mf)
+        self.dump_flags()
+        self.check_memory()
 
         if 'aa' in subspace:
             start_clock("U-ppRPAw direct: (alpha alpha, alpha alpha)")
