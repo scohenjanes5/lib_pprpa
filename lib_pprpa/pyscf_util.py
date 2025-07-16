@@ -67,9 +67,6 @@ def get_pyscf_input_mol_r(
         mo_energy_act (double array): orbital energy in the active space.
         Lpq (double ndarray): three-center density-fitting matrix in active MO space.
     """
-    from pyscf import df
-    from pyscf.ao2mo import _ao2mo
-
     start_clock("getting input for molecule ppRPA from PySCF")
 
     nmo = len(mf.mo_energy)
@@ -97,7 +94,7 @@ def get_pyscf_input_mol_r(
     nvir_act = nvir if nvir_act is None else min(nvir, nvir_act)
     nmo_act = nocc_act + nvir_act
     mo_energy_act = numpy.array(mo_energy[(nocc - nocc_act) : (nocc + nvir_act)])
-    
+
     if with_dip:
         print("Computing dipole moment in MO space")
         from pyscf.tdscf.rhf import _charge_center
@@ -105,10 +102,7 @@ def get_pyscf_input_mol_r(
         with mf.mol.with_common_orig(_charge_center(mf.mol)):
             ao_dip = mf.mol.intor_symmetric("int1e_r", comp=3)
         mo_dip = mo_coeff.T @ ao_dip @ mo_coeff
-        # mo2 = numpy.einsum('xpq,pi,qj->xij', ao_dip.reshape(-1,nmo,nmo), mo_coeff, mo_coeff.conj())
-        # assert numpy.allclose(mo2, mo_dip)
-        mo_dip = mo_dip[:, (nocc - nocc_act) : (nocc + nvir_act), (nocc - nocc_act) : (nocc + nvir_act)]
-        print("Done calculating dip.")
+        mo_dip = mo_dip[:, nocc - nocc_act : nocc + nvir_act, nocc - nocc_act : nocc + nvir_act]
 
     if cholesky is False:
         if getattr(mf, 'with_df', None):
@@ -986,7 +980,7 @@ def get_fxc_r(mf):
 
     Args:
         mf (pyscf.dft.RKS): pyscf restricted KS-DFT object.
-    
+
     Returns:
         fxc_mat (numpy.ndarray): fxc matrix in orbital space.
     """
@@ -1109,7 +1103,7 @@ def get_fxc_u(mf, Lpq=None, nocc_act=None, nvir_act=None, add_frac_e=True):
     if xctype == 'LDA':
         ao_deriv = 0
         for ao, mask, weight, coords \
-                in ni.block_loop(mf.mol, mf.grids, nao, 
+                in ni.block_loop(mf.mol, mf.grids, nao,
                                  ao_deriv, max_memory//nao):
             rho0a = make_rho(0, ao, mask, xctype)
             rho0b = make_rho(1, ao, mask, xctype)
@@ -1151,15 +1145,15 @@ def get_fxc_u(mf, Lpq=None, nocc_act=None, nvir_act=None, add_frac_e=True):
                 # fractional electron in alpha channel
                 fxc1 = numpy.stack(
                     [ni.eval_xc_eff(
-                        mf.xc, (rho0a + small_rho * den_ar[:, a], rho0b), 
+                        mf.xc, (rho0a + small_rho * den_ar[:, a], rho0b),
                         deriv = 2, xctype=xctype)[2]\
-                              for a in range(nocc_act[0], nact[0])], 
+                              for a in range(nocc_act[0], nact[0])],
                     axis=0)
                 wfxc1 = fxc1[:, :, 0, :, 0] * weight
 
                 # aaaa
                 f_cd = numpy.einsum(
-                    'kcd,ck->kcd', rhoa_r[:, nocc_act[0]:, nocc_act[0]:], 
+                    'kcd,ck->kcd', rhoa_r[:, nocc_act[0]:, nocc_act[0]:],
                     wfxc1[:, 0, 0, :], optimize=True)
                 abcd = numpy.einsum(
                     'kab,kcd->abcd', rhoa_r[:, nocc_act[0]:, nocc_act[0]:],
@@ -1170,15 +1164,15 @@ def get_fxc_u(mf, Lpq=None, nocc_act=None, nvir_act=None, add_frac_e=True):
                 # fractional electron in beta channel
                 fxc1 = numpy.stack(
                     [ni.eval_xc_eff(
-                        mf.xc, (rho0a, rho0b + small_rho * den_br[:, a]), 
+                        mf.xc, (rho0a, rho0b + small_rho * den_br[:, a]),
                         deriv = 2, xctype=xctype)[2]\
-                              for a in range(nocc_act[1], nact[1])], 
+                              for a in range(nocc_act[1], nact[1])],
                     axis=0)
                 wfxc1 = fxc1[:, :, 0, :, 0] * weight
 
                 # aabb
                 f_cd = numpy.einsum(
-                    'kcd,ck->kcd', rhob_r[:, nocc_act[1]:, nocc_act[1]:], 
+                    'kcd,ck->kcd', rhob_r[:, nocc_act[1]:, nocc_act[1]:],
                     wfxc1[:, 0, 1, :], optimize=True)
                 abcd = numpy.einsum(
                     'kab,kcd->abcd', rhoa_r[:, nocc_act[0]:, nocc_act[0]:],
@@ -1188,7 +1182,7 @@ def get_fxc_u(mf, Lpq=None, nocc_act=None, nvir_act=None, add_frac_e=True):
 
                 # bbbb
                 f_cd = numpy.einsum(
-                    'kcd,ck->kcd', rhob_r[:, nocc_act[1]:, nocc_act[1]:], 
+                    'kcd,ck->kcd', rhob_r[:, nocc_act[1]:, nocc_act[1]:],
                     wfxc1[:, 1, 1, :], optimize=True)
                 abcd = numpy.einsum(
                     'kab,kcd->abcd', rhob_r[:, nocc_act[1]:, nocc_act[1]:],
@@ -1213,29 +1207,29 @@ def get_fxc_u(mf, Lpq=None, nocc_act=None, nvir_act=None, add_frac_e=True):
                 (nocc[0]-nocc_act[0]):(nocc[0]+nvir_act[0])], optimize=True)
             mob_r = numpy.einsum('xka,ap->xkp', ao, mob[:, \
                 (nocc[1]-nocc_act[1]):(nocc[1]+nvir_act[1])], optimize=True)
-            rhoa_r = numpy.einsum('xkp,kq->xkpq', moa_r, moa_r[0], 
+            rhoa_r = numpy.einsum('xkp,kq->xkpq', moa_r, moa_r[0],
                                   optimize=True)
-            rhob_r = numpy.einsum('xkp,kq->xkpq', mob_r, mob_r[0], 
+            rhob_r = numpy.einsum('xkp,kq->xkpq', mob_r, mob_r[0],
                                   optimize=True)
-            rhoa_r[1:4] += numpy.einsum('kp,xkq->xkpq', moa_r[0], moa_r[1:4], 
+            rhoa_r[1:4] += numpy.einsum('kp,xkq->xkpq', moa_r[0], moa_r[1:4],
                                         optimize=True)
-            rhob_r[1:4] += numpy.einsum('kp,xkq->xkpq', mob_r[0], mob_r[1:4], 
+            rhob_r[1:4] += numpy.einsum('kp,xkq->xkpq', mob_r[0], mob_r[1:4],
                                         optimize=True)
 
             # aaaa
-            f_rs = numpy.einsum('xyk,xkrs->ykrs', wfxc[0, :, 0], rhoa_r, 
+            f_rs = numpy.einsum('xyk,xkrs->ykrs', wfxc[0, :, 0], rhoa_r,
                                 optimize=True)
             pqrs = numpy.einsum('ykpq,ykrs->pqrs', rhoa_r, f_rs, optimize=True)
             fxcaa_mat += pqrs
 
             # aabb
-            f_rs = numpy.einsum('xyk,xkrs->ykrs', wfxc[0, :, 1], rhob_r, 
+            f_rs = numpy.einsum('xyk,xkrs->ykrs', wfxc[0, :, 1], rhob_r,
                                 optimize=True)
             pqrs = numpy.einsum('ykpq,ykrs->pqrs', rhoa_r, f_rs, optimize=True)
             fxcab_mat += pqrs
 
             # aabb
-            f_rs = numpy.einsum('xyk,xkrs->ykrs', wfxc[1, :, 1], rhob_r, 
+            f_rs = numpy.einsum('xyk,xkrs->ykrs', wfxc[1, :, 1], rhob_r,
                                 optimize=True)
             pqrs = numpy.einsum('ykpq,ykrs->pqrs', rhob_r, f_rs, optimize=True)
             fxcbb_mat += pqrs
@@ -1246,13 +1240,13 @@ def get_fxc_u(mf, Lpq=None, nocc_act=None, nvir_act=None, add_frac_e=True):
             ############################################################
             if add_frac_e:
                 fxcaa_mat[
-                    nocc_act[0]:, nocc_act[0]:, 
+                    nocc_act[0]:, nocc_act[0]:,
                     nocc_act[0]:, nocc_act[0]:] = 0.0
                 fxcab_mat[
-                    nocc_act[0]:, nocc_act[0]:, 
+                    nocc_act[0]:, nocc_act[0]:,
                     nocc_act[1]:, nocc_act[1]:] = 0.0
                 fxcbb_mat[
-                    nocc_act[1]:, nocc_act[1]:, 
+                    nocc_act[1]:, nocc_act[1]:,
                     nocc_act[1]:, nocc_act[1]:] = 0.0
 
                 small_rho = 3e-2
@@ -1262,56 +1256,56 @@ def get_fxc_u(mf, Lpq=None, nocc_act=None, nvir_act=None, add_frac_e=True):
                 # fractional electron in alpha channel
                 fxc1 = numpy.stack(
                     [ni.eval_xc_eff(
-                        mf.xc, (rho0a + small_rho * den_ar[:, :, a], rho0b), 
+                        mf.xc, (rho0a + small_rho * den_ar[:, :, a], rho0b),
                         deriv = 2, xctype=xctype)[2]\
-                              for a in range(nocc_act[0], nact[0])], 
+                              for a in range(nocc_act[0], nact[0])],
                     axis=0)
                 wfxc1 = fxc1 * weight
 
                 # aaaa
                 f_cd = numpy.einsum(
-                    'cxyk,xkcd->ykcd', wfxc1[:, 0, :, 0], 
+                    'cxyk,xkcd->ykcd', wfxc1[:, 0, :, 0],
                     rhoa_r[:, :, nocc_act[0]:, nocc_act[0]:], optimize=True)
                 abcd = numpy.einsum(
-                    'ykab,ykcd->abcd', rhoa_r[:, :, nocc_act[0]:, nocc_act[0]:], 
+                    'ykab,ykcd->abcd', rhoa_r[:, :, nocc_act[0]:, nocc_act[0]:],
                     f_cd, optimize=True)
                 fxcaa_mat[
-                    nocc_act[0]:, nocc_act[0]:, 
+                    nocc_act[0]:, nocc_act[0]:,
                     nocc_act[0]:, nocc_act[0]:] += abcd
 
                 # fractional electron in beta channel
                 fxc1 = numpy.stack(
                     [ni.eval_xc_eff(
-                        mf.xc, (rho0a, rho0b + small_rho * den_br[:, :, a]), 
+                        mf.xc, (rho0a, rho0b + small_rho * den_br[:, :, a]),
                         deriv = 2, xctype=xctype)[2]\
-                              for a in range(nocc_act[1], nact[1])], 
+                              for a in range(nocc_act[1], nact[1])],
                     axis=0)
                 wfxc1 = fxc1 * weight
 
                 # aabb
                 f_cd = numpy.einsum(
-                    'cxyk,xkcd->ykcd', wfxc1[:, 0, :, 1], 
+                    'cxyk,xkcd->ykcd', wfxc1[:, 0, :, 1],
                     rhob_r[:, :, nocc_act[1]:, nocc_act[1]:], optimize=True)
                 abcd = numpy.einsum(
-                    'ykab,ykcd->abcd', rhoa_r[:, :, nocc_act[0]:, nocc_act[0]:], 
+                    'ykab,ykcd->abcd', rhoa_r[:, :, nocc_act[0]:, nocc_act[0]:],
                     f_cd, optimize=True)
                 fxcab_mat[
-                    nocc_act[0]:, nocc_act[0]:, 
+                    nocc_act[0]:, nocc_act[0]:,
                     nocc_act[1]:, nocc_act[1]:] += abcd
 
                 # bbbb
                 f_cd = numpy.einsum(
-                    'cxyk,xkcd->ykcd', wfxc1[:, 1, :, 1], 
+                    'cxyk,xkcd->ykcd', wfxc1[:, 1, :, 1],
                     rhob_r[:, :, nocc_act[1]:, nocc_act[1]:], optimize=True)
                 abcd = numpy.einsum(
-                    'ykab,ykcd->abcd', rhob_r[:, :, nocc_act[1]:, nocc_act[1]:], 
+                    'ykab,ykcd->abcd', rhob_r[:, :, nocc_act[1]:, nocc_act[1]:],
                     f_cd, optimize=True)
                 fxcbb_mat[
-                    nocc_act[1]:, nocc_act[1]:, 
+                    nocc_act[1]:, nocc_act[1]:,
                     nocc_act[1]:, nocc_act[1]:] += abcd
     else:
         raise NotImplementedError
-    
+
     omega, alpha, hyb = ni.rsh_and_hybrid_coeff(mf.xc, mf.mol.spin)
     if hyb > 1e-10:
         add_hf_x_(fxcaa_mat, fxcab_mat, fxcbb_mat, Lpq=Lpq, hyb=hyb)

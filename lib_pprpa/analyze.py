@@ -3,6 +3,8 @@ from functools import reduce
 import numpy
 from numpy import einsum
 
+from lib_pprpa.grad.grad_utils import get_xy_full
+
 # print eigenvector
 def pprpa_print_a_pair(is_pp, p, q, percentage):
     """Print the percentage of a pair in the eigenvector.
@@ -238,12 +240,10 @@ def get_pprpa_dm(multi, state, xy, nocc, nvir, mo_coeff, nocc_full,
 
 # oscillator strength
 def get_pprpa_oscillator_strength(
-        nocc, nvir, mo_dip, channel, exci, exci0, xy, xy0, multi='ab', xy0_multi=None):
-    """Compute oscillator strength from restricted pp-TDA or hh-TDA.
-    For restricted case, ground state and all singlets are closed-shell.
-    Thus, only alpha-beta-alpha-beta block is needed.
-    If oscillator strength is calculated in particle-particle channel,
-    only 1st, 4th and 6th terms in equation 47 in SI of Ref.1 are needed.
+        nocc, mo_dip, channel, exci, exci0, xy, xy0, multi, xy0_multi):
+    """Compute oscillator strength from restricted ppRPA.
+    In pp channel, ppRPA is treated as ppTDA.
+    In hh channel, hhRPA is treated as hhTDA.
 
     Reference:
     [1] J. Chem. Phys. 139, 224105 (2013)
@@ -251,86 +251,44 @@ def get_pprpa_oscillator_strength(
 
     Args:
         nocc (int): number of occupied orbitals.
-        nvir (int): number of virtual orbitals.
         mo_dip (double ndarray): MO dipole integrals, <p|r|q>, (3, nmo, nmo).
         channel (string): "pp" for particle-particle or "hh" for hole-hole.
         exci (double): excited-state eigenvalue.
         exci0 (double): ground-state eigenvalue.
         xy (double array): excited-state eigenvector.
         xy0 (double array): ground-state eigenvector.
-        multi (char): multiplicity of the excited state. One of 's', 't' or 'ab'.
-        xy0_multi (char): multiplicity of the ground state.
+        multi (char): multiplicity of the excited state, 's' or 't'.
+        xy0_multi (char): multiplicity of the ground state, 's' or 't'.
 
 
     Return:
         f (double): oscillator strength.
     """
-    from lib_pprpa.grad.grad_utils import get_xy_full
-
-    if multi == 's':
+    if multi == "s":
         oo_dim = (nocc + 1) * nocc // 2
-    elif multi == 't':
+    elif multi == "t":
         oo_dim = (nocc - 1) * nocc // 2
-    else: # 'ab'
-        oo_dim = nocc * nocc
 
     xy0_multi = xy0_multi if xy0_multi is not None else multi
-    # disallowed transition. XY and XY0 have different dimensions when expanded
+    # S->T or T->S transition is spin-forbidden
     if xy0_multi != multi:
         return 0.0
 
-    ints_oo = mo_dip[:,:nocc,:nocc]
-    ints_vv = mo_dip[:,nocc:,nocc:]
+    ints_oo = mo_dip[:, :nocc, :nocc]
+    ints_vv = mo_dip[:, nocc:, nocc:]
 
-    if channel == 'pp':
-        if multi == 'ab':
-            vv_shape = (nvir, nvir)
-            full = xy[oo_dim:].reshape(vv_shape)
-            full0 = xy0[oo_dim:].reshape(vv_shape)
-            # calculate transition dipole <Psi_0|r|Psi_m>
-            trans_dip = numpy.zeros(shape=[3], dtype=numpy.double)
-            trans_dip += numpy.einsum(
-                'ab,ad,rdb->r', full0, full, ints_vv, optimize=True)
-            # trans_dip -= numpy.einsum(
-            # 'ab,ca,rcb->r', full0, full, ints_vv, optimize=True)
-            # trans_dip -= numpy.einsum(
-            # 'ab,bd,rda->r', full0, full, ints_vv, optimize=True)
-            trans_dip += numpy.einsum(
-                'ab,cb,rca->r', full0, full, ints_vv, optimize=True)
-            # trans_dip += 2.0 * numpy.einsum(
-            #     'ab,ab,rmm->r', full0, full, ints_oo, optimize=True)
-            trans_dip -= numpy.einsum(
-            'ab,ba,rmm->r', full0, full, ints_oo, optimize=True)
-        else:
-            _, full = get_xy_full(xy, oo_dim, mult=multi)
-            _, full0 = get_xy_full(xy0, oo_dim, mult=multi)
-
-            trans_dip = numpy.einsum("pa,qa,rpq->r", full0, full, ints_vv, optimize=True)
-    else: # hh
-        if multi == 'ab':
-            oo_shape = (nocc, nocc)
-            full = xy[:oo_dim].reshape(oo_shape)
-            full0 = xy0[:oo_dim].reshape(oo_shape)
-            # calculate transition dipole <Psi_0|r|Psi_m>
-            trans_dip = numpy.zeros(shape=[3], dtype=numpy.double)
-            trans_dip += numpy.einsum(
-                'ij,ij,rpp->r', full0, full, ints_oo, optimize=True)
-            # trans_dip -= numpy.einsum(
-            #     'ij,ji,rpp->r', full0, full, ints_oo, optimize=True)
-            # trans_dip -= numpy.einsum(
-            #     'ij,ip,rpj->r', full0, full, ints_oo, optimize=True)
-            trans_dip += numpy.einsum(
-                'ij,jp,rpi->r', full0, full, ints_oo, optimize=True)
-            # trans_dip += numpy.einsum(
-            #     'ij,pi,rpj->r', full0, full, ints_oo, optimize=True)
-            trans_dip -= numpy.einsum(
-                'ij,pj,rpi->r', full0, full, ints_oo, optimize=True)
-        else:
-            full, _ = get_xy_full(xy, oo_dim, mult=multi)
-            full0, _ = get_xy_full(xy0, oo_dim, mult=multi)
-
-            trans_dip = -numpy.einsum("pj,qj,rpq->r", full0, full, ints_oo, optimize=True)
+    if channel == "pp":
+        _, full = get_xy_full(xy, oo_dim, mult=multi)
+        _, full0 = get_xy_full(xy0, oo_dim, mult=multi)
+        trans_dip = numpy.einsum("pa,qa,rpq->r", full0, full, ints_vv, optimize=True)
+    elif channel == "hh":
+        full, _ = get_xy_full(xy, oo_dim, mult=multi)
+        full0, _ = get_xy_full(xy0, oo_dim, mult=multi)
+        trans_dip = -numpy.einsum("pj,qj,rpq->r", full0, full, ints_oo, optimize=True)
 
     # |<Psi_0|r|Psi_m>|^2
     f = 2.0 / 3.0 * (exci - exci0) * numpy.sum(trans_dip**2)
+    # (exci - exci0) in hh channel is de-excitation energy
+    if channel == "hh":
+        f *= -1.0
     return f
