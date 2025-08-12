@@ -42,11 +42,10 @@ def diagonalize_pprpa_triplet():
 class RppRPAwDirect(ppRPA_direct):
     def __init__(
             self, nocc, mo_energy, Lpq, fxc, hh_state=5, pp_state=5, nelec="n-2",
-            print_thresh=0.1, mo_dip=None, osc_channel="pp"):
+            print_thresh=0.1, mo_dip=None):
         super().__init__(
-            nocc, mo_energy, Lpq, hh_state=hh_state, pp_state=pp_state, 
-            nelec=nelec, print_thresh=print_thresh, mo_dip=mo_dip, 
-            osc_channel=osc_channel)
+            nocc, mo_energy, Lpq, hh_state=hh_state, pp_state=pp_state,
+            nelec=nelec, print_thresh=print_thresh, mo_dip=mo_dip)
         self.fxc = fxc
 
     def kernel(self, multi):
