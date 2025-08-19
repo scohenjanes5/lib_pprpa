@@ -29,9 +29,9 @@ pp_RPA_functions = [
 for ppRPA in pp_RPA_functions:
     print(f"Testing {ppRPA.__name__}...")
     try:
-        pprpa = ppRPA(nocc, mf.mo_energy, Lpq, mo_dip=mo_dip, hh_state=0)
+        pprpa = ppRPA(nocc, mf.mo_energy, Lpq, mo_dip=mo_dip, hh_state=0, spectrum="Direct")
     except TypeError:
-        pprpa = ppRPA(nocc, mf.mo_energy, Lpq, mo_dip=mo_dip)
+        pprpa = ppRPA(nocc, mf.mo_energy, Lpq, mo_dip=mo_dip, spectrum="Davidson")
     pprpa.kernel("s")
     pprpa.kernel("t")
     pprpa.analyze()

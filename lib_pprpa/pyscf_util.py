@@ -731,12 +731,14 @@ def get_pyscf_input_sc(
         nvir_act (int, optional): number of active virtual orbitals. Defaults to None.
         dump_file (str, optional): file name to dump matrix for lib_pprpa. Defaults to None.
         cholesky (bool, optional): use Cholesky decomposition. Defaults to False.
-        with_dip (bool, optional): save dipole moment. Defaults to False.
+        with_dip (bool, optional): Calculate dipole moment in MO space. Defaults to False.
 
     Returns:
         nocc_act (int): number of occupied orbitals in the active space.
         mo_energy_act (double array): orbital energy in the active space.
         Lpq (double ndarray): three-center density-fitting matrix in active MO space.
+        mo_dip (numpy.ndarray, upon request): Dipole moment in MO space.
+            Only returned if with_dip is True.
     """
     from pyscf import lib
     from pyscf.ao2mo import _ao2mo
