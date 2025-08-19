@@ -282,7 +282,7 @@ def pprpa_orthonormalize_eigenvector(multi, nocc, exci, xy):
 def _pprpa_print_eigenvector(
         multi, nocc, nvir, nocc_fro, thresh, hh_state, pp_state, exci0, exci, xy,
         # oscillator strength
-        mo_dip=None, xy0=None, xy0_multi=None):
+        mo_dip=None, xy0=None, xy0_multi=None, spectrum: bool | str = False):
     """Print dominant components of an eigenvector.
 
     Args:
@@ -301,6 +301,8 @@ def _pprpa_print_eigenvector(
         xy0 (double ndarray, optional): ground-state eigenvector. Defaults to None.
         xy0_multi (string, optional): multiplicity of the ground state eigenvector.
             Defaults to None.
+        spectrum (bool | str, optional): Boolean to save spectrum data, or filename for said data.
+            Default False for no saved spectrum data.
     """
     if multi == "s":
         oo_dim = int((nocc + 1) * nocc / 2)
@@ -317,15 +319,23 @@ def _pprpa_print_eigenvector(
     tri_row_v, tri_col_v = numpy.tril_indices(nvir, is_singlet-1)
 
     au2ev = 27.211386
+    f_vals = []
+    tdm_vals = []
+    vees = []
+
     for istate in range(min(hh_state, oo_dim)):
+        vee = exci[oo_dim-istate-1] - exci0
         print("#%-d %s de-excitation:  exci= %-12.6f  eV   2e=  %-12.6f  eV" %
-              (istate + 1, multi, (exci[oo_dim-istate-1] - exci0) * au2ev,
+              (istate + 1, multi, vee * au2ev,
                exci[oo_dim-istate-1] * au2ev))
         if mo_dip is not None:
-            f = get_pprpa_oscillator_strength(
+            f, tdm = get_pprpa_oscillator_strength(
                 nocc=nocc, mo_dip=mo_dip, channel="hh",
                 exci=exci[oo_dim-istate-1], exci0=exci0,
                 xy=xy[oo_dim-istate-1], xy0=xy0, multi=multi, xy0_multi=xy0_multi)
+            f_vals.append(f)
+            tdm_vals.append(tdm)
+            vees.append(vee)
             print("#    oscillator strength = %-12.6f  a.u." % f)
         full = numpy.zeros(shape=[nocc, nocc], dtype=numpy.double)
         full[tri_row_o, tri_col_o] = xy[oo_dim-istate-1][:oo_dim]
@@ -346,14 +356,18 @@ def _pprpa_print_eigenvector(
         print("")
 
     for istate in range(min(pp_state, vv_dim)):
+        vee = exci[oo_dim+istate] - exci0
         print("#%-d %s excitation:  exci= %-12.6f  eV   2e=  %-12.6f  eV" %
-              (istate + 1, multi, (exci[oo_dim+istate] - exci0) * au2ev,
+              (istate + 1, multi, vee * au2ev,
                exci[oo_dim+istate] * au2ev))
         if mo_dip is not None:
-            f = get_pprpa_oscillator_strength(
+            f, tdm = get_pprpa_oscillator_strength(
                 nocc=nocc, mo_dip=mo_dip, channel="pp",
                 exci=exci[oo_dim+istate], exci0=exci0,
                 xy=xy[oo_dim+istate], xy0=xy0, multi=multi, xy0_multi=xy0_multi)
+            f_vals.append(f)
+            tdm_vals.append(tdm)
+            vees.append(vee)
             print("#    oscillator strength = %-12.6f  a.u." % f)
         full = numpy.zeros(shape=[nocc, nocc], dtype=numpy.double)
         full[tri_row_o, tri_col_o] = xy[oo_dim+istate][:oo_dim]
@@ -373,12 +387,19 @@ def _pprpa_print_eigenvector(
 
         print("")
 
+    f_vals = numpy.array(f_vals)
+    tdm_vals = numpy.array(tdm_vals)
+    vees = numpy.array(vees) * au2ev
+    if len(f_vals) > 0 and numpy.sum(f_vals) > 0.0 and spectrum is not False:
+        from lib_pprpa.pprpa_util import generate_spectrum
+        generate_spectrum(vees, tdm_vals, save_to=spectrum)
+
     return
 
 
 def _analyze_pprpa_direct(
         exci_s, xy_s, exci_t, xy_t, nocc, nvir, nelec="n-2", print_thresh=0.1,
-        hh_state=5, pp_state=5, nocc_fro=0, mo_dip=None):
+        hh_state=5, pp_state=5, nocc_fro=0, mo_dip=None, spectrum: bool | str = False):
     print("\nanalyze ppRPA results.")
     oo_dim_s = int((nocc + 1) * nocc / 2)
     oo_dim_t = int((nocc - 1) * nocc / 2)
@@ -397,11 +418,11 @@ def _analyze_pprpa_direct(
         _pprpa_print_eigenvector(
             multi="s", nocc=nocc, nvir=nvir, nocc_fro=nocc_fro,
             thresh=print_thresh, hh_state=hh_state, pp_state=pp_state, exci0=exci0,
-            exci=exci_s, xy=xy_s, mo_dip=mo_dip, xy0=xy0, xy0_multi=xy0_multi)
+            exci=exci_s, xy=xy_s, mo_dip=mo_dip, xy0=xy0, xy0_multi=xy0_multi, spectrum=spectrum)
         _pprpa_print_eigenvector(
             multi="t", nocc=nocc, nvir=nvir, nocc_fro=nocc_fro,
             thresh=print_thresh, hh_state=hh_state, pp_state=pp_state, exci0=exci0,
-            exci=exci_t, xy=xy_t, mo_dip=mo_dip, xy0=xy0, xy0_multi=xy0_multi)
+            exci=exci_t, xy=xy_t, mo_dip=mo_dip, xy0=xy0, xy0_multi=xy0_multi, spectrum=spectrum)
     else:
         if exci_s is not None:
             print("only singlet results found.")
@@ -411,7 +432,7 @@ def _analyze_pprpa_direct(
                 multi="s", nocc=nocc, nvir=nvir, nocc_fro=nocc_fro,
                 thresh=print_thresh, hh_state=hh_state, pp_state=pp_state,
                 exci0=exci0, exci=exci_s, xy=xy_s, mo_dip=mo_dip,
-                xy0=xy0, xy0_multi="s")
+                xy0=xy0, xy0_multi="s", spectrum=spectrum)
         else:
             print("only triplet results found.")
             exci0 = exci_t[oo_dim_t] if nelec == "n-2" else exci_t[oo_dim_t-1]
@@ -420,14 +441,14 @@ def _analyze_pprpa_direct(
                 multi="t", nocc=nocc, nvir=nvir, nocc_fro=nocc_fro,
                 thresh=print_thresh, hh_state=hh_state, pp_state=pp_state,
                 exci0=exci0, exci=exci_t, xy=xy_t, mo_dip=mo_dip,
-                xy0=xy0, xy0_multi="t")
+                xy0=xy0, xy0_multi="t", spectrum=spectrum)
     return
 
 
 class ppRPA_direct():
     def __init__(
             self, nocc, mo_energy, Lpq, hh_state=5, pp_state=5, nelec="n-2",
-            print_thresh=0.1, mo_dip=None):
+            print_thresh=0.1, mo_dip=None, spectrum: bool | str = False):
         # necessary input
         self.nocc = nocc  # number of occupied orbitals
         self.mo_energy = numpy.asarray(mo_energy)  # orbital energy
@@ -439,6 +460,7 @@ class ppRPA_direct():
         self.nelec = nelec  # "n-2" or "n+2" for system is an N-2 or N+2 system
         self.print_thresh = print_thresh  # threshold to print component
         self.mo_dip = mo_dip  # vector dipole integrals in MO space
+        self.spectrum = spectrum # bool to trigger calculating spectrum, or filename for spectrum data
 
         # internal flags
         self.multi = None  # multiplicity
@@ -564,7 +586,7 @@ class ppRPA_direct():
             exci_s=self.exci_s, xy_s=self.xy_s, exci_t=self.exci_t,
             xy_t=self.xy_t, nocc=self.nocc, nvir=self.nvir, nelec=self.nelec,
             print_thresh=self.print_thresh, hh_state=self.hh_state,
-            pp_state=self.pp_state, nocc_fro=nocc_fro, mo_dip=self.mo_dip)
+            pp_state=self.pp_state, nocc_fro=nocc_fro, mo_dip=self.mo_dip, spectrum=self.spectrum)
         return
 
     def get_correlation(self):

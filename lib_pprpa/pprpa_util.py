@@ -1,5 +1,6 @@
 import numpy
 import time
+from typing import List, Tuple
 
 
 def ij2index(r, c, row, col):
@@ -338,3 +339,115 @@ def get_nocc_nvir_frac(mo_occ, thresh=1.0e-8, sort_mo=False, mo_energy=None,
                 (mo_coeff_int1, mo_coeff_frac, mo_coeff_int0))
 
     return nocc, nvir, frac_nocc
+
+def generate_spectrum(
+    vee: numpy.ndarray,
+    tdm: numpy.ndarray,
+    ipol: str = "XYZ",
+    energyRange: List[float] = [0.0, 10.0, 0.01],
+    sigma: float = 0.1,
+    nspin: int = 1,
+    save_to: bool | str = False
+) -> Tuple[numpy.ndarray, numpy.ndarray]:
+    """Generate absorption spectrum from excitation energies and transition dipole moments.
+    (Based on the BSEResult.plotSpectrum() method in the westpy package
+    Args:
+        vee (numpy.ndarray): Array of excitation energies in eV
+        tdm (numpy.ndarray): Array of transition dipole moments, shape (n_transitions, 3)
+        ipol (str): Polarization component ("XX", "YY", "ZZ", "XY", "XZ", "YX", "YZ", "ZX", "ZY", or "XYZ")
+        energyRange (List[float]): Energy range as [min, max, step] in eV
+        sigma (float): Broadening width in eV
+        nspin (int): Number of spin channels (1 or 2)
+        save_to (bool | str, optional): Filename to save spectrum data.
+            A default filename will be picked if True. No data saved if False.
+            Defaults to False.
+    Returns:
+        Tuple[numpy.ndarray, numpy.ndarray]: Energy axis (x) and absorption spectrum (y)
+    """
+
+    #import scipy.constants as sp
+    #eV=sp.e / sp.m_e / sp.e**4 * (8.0 * sp.epsilon_0**2 * sp.h**2) # 0.0734985857 Ry / eV
+    eV = 0.0734985857 # Ry / eV units
+
+    # Validate inputs
+    valid_ipols = ["XX", "XY", "XZ", "YX", "YY", "YZ", "ZX", "ZY", "ZZ", "XYZ"]
+    assert ipol in valid_ipols, f"ipol must be one of {valid_ipols}"
+    n_ipol = len(ipol)
+
+    xmin, xmax, dx = energyRange
+    assert xmax > xmin, "Maximum energy must be greater than minimum energy"
+    assert dx > 0.0, "Energy step must be positive"
+    assert sigma > 0.0, "Broadening width must be positive"
+    assert vee.shape[0] == tdm.shape[0], "Number of excitation energies must match transition dipole moments"
+    assert tdm.shape[1] == 3, "Transition dipole moments must have 3 components (x, y, z)"
+
+    # Sort arrays
+    idxs = numpy.argsort(vee)
+    vee = vee[idxs]
+    tdm = tdm[idxs]
+
+    # Convert energy range to Rydberg units and create energy axis
+    sigma_ev = sigma * eV
+    n_step = int((xmax - xmin) / dx) + 1
+    energyAxis = numpy.linspace(xmin, xmax, n_step, endpoint=True)
+    chiAxis = numpy.zeros(n_step, dtype=numpy.complex128)
+
+    # Convert excitation energies to Rydberg units
+    vee_ry = vee * eV
+
+    # Spin degeneracy factor
+    degspin = 2.0 / nspin
+
+    # Calculate susceptibility for each energy point
+    for ie, energy in enumerate(energyAxis):
+        freq_ev = energy * eV  # Convert to Rydberg units
+
+        # Calculate chi tensor components
+        chi = numpy.zeros((n_ipol, n_ipol), dtype=numpy.complex128)
+
+        for ip in range(n_ipol):  # requested Cartesian components
+            for ip2 in range(n_ipol):
+                num = tdm[:, ip] * tdm[:, ip2]
+                den = freq_ev - vee_ry - 1j * sigma_ev
+                tmp = numpy.sum(num / den)
+                chi[ip, ip2] = tmp * degspin
+
+        # Extract the requested polarization component
+        if ipol == "XX":
+            chiAxis[ie] = chi[0, 0]
+        elif ipol == "XY":
+            chiAxis[ie] = chi[0, 1]
+        elif ipol == "XZ":
+            chiAxis[ie] = chi[0, 2]
+        elif ipol == "YX":
+            chiAxis[ie] = chi[1, 0]
+        elif ipol == "YY":
+            chiAxis[ie] = chi[1, 1]
+        elif ipol == "YZ":
+            chiAxis[ie] = chi[1, 2]
+        elif ipol == "ZX":
+            chiAxis[ie] = chi[2, 0]
+        elif ipol == "ZY":
+            chiAxis[ie] = chi[2, 1]
+        elif ipol == "ZZ":
+            chiAxis[ie] = chi[2, 2]
+        elif ipol == "XYZ":
+            # Isotropic average with energy weighting
+            chiAxis[ie] = (chi[0, 0] + chi[1, 1] + chi[2, 2]) * energy / 3.0 / numpy.pi
+
+    if isinstance(save_to, str):
+        filename = save_to + ".npz" if ".npz" not in save_to else save_to
+    elif save_to:
+        filename = "save_to.npz"
+    else:
+        filename = None
+
+    if filename is not None:
+        message = f"Saving spectrum to {filename}"
+        numpy.savez(filename, x=energyAxis, y=chiAxis.imag, vee=vee, tdm=tdm)
+    else:
+        message = "Not saving spectrum data"
+
+    print(message)
+    # Return energy axis and imaginary part of susceptibility (absorption)
+    return energyAxis, chiAxis.imag

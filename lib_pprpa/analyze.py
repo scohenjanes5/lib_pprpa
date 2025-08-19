@@ -259,10 +259,9 @@ def get_pprpa_oscillator_strength(
         xy0 (double array): ground-state eigenvector.
         multi (char): multiplicity of the excited state, 's' or 't'.
         xy0_multi (char): multiplicity of the ground state, 's' or 't'.
-
-
     Return:
         f (double): oscillator strength.
+        trans_dip (numpy.ndarray): transition dipole moment.
     """
     if multi == "s":
         oo_dim = (nocc + 1) * nocc // 2
@@ -272,7 +271,7 @@ def get_pprpa_oscillator_strength(
     xy0_multi = xy0_multi if xy0_multi is not None else multi
     # S->T or T->S transition is spin-forbidden
     if xy0_multi != multi:
-        return 0.0
+        return 0.0, numpy.zeros((3))
 
     ints_oo = mo_dip[:, :nocc, :nocc]
     ints_vv = mo_dip[:, nocc:, nocc:]
@@ -291,4 +290,4 @@ def get_pprpa_oscillator_strength(
     # (exci - exci0) in hh channel is de-excitation energy
     if channel == "hh":
         f *= -1.0
-    return f
+    return f, trans_dip
