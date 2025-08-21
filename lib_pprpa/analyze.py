@@ -288,6 +288,4 @@ def get_pprpa_oscillator_strength(
     # |<Psi_0|r|Psi_m>|^2
     f = 2.0 / 3.0 * (exci - exci0) * numpy.sum(trans_dip**2)
     # (exci - exci0) in hh channel is de-excitation energy
-    if channel == "hh":
-        f *= -1.0
-    return f, trans_dip
+    return numpy.abs(f), trans_dip
