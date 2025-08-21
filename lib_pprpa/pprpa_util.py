@@ -366,8 +366,8 @@ def generate_spectrum(
     """
 
     #import scipy.constants as sp
-    #eV=sp.e / sp.m_e / sp.e**4 * (8.0 * sp.epsilon_0**2 * sp.h**2) # 0.0734985857 Ry / eV
-    eV = 0.0734985857 # Ry / eV units
+    #ev2ry=sp.e / sp.m_e / sp.e**4 * (8.0 * sp.epsilon_0**2 * sp.h**2) # 0.0734985857 Ry / eV
+    ev2ry = 0.0734985857 # Ry / eV units
 
     # Validate inputs
     valid_ipols = ["XX", "XY", "XZ", "YX", "YY", "YZ", "ZX", "ZY", "ZZ", "XYZ"]
@@ -382,25 +382,26 @@ def generate_spectrum(
     assert tdm.shape[1] == 3, "Transition dipole moments must have 3 components (x, y, z)"
 
     # Sort arrays
+    vee = numpy.abs(vee)
     idxs = numpy.argsort(vee)
     vee = vee[idxs]
     tdm = tdm[idxs]
 
     # Convert energy range to Rydberg units and create energy axis
-    sigma_ev = sigma * eV
+    sigma_ev = sigma * ev2ry
     n_step = int((xmax - xmin) / dx) + 1
     energyAxis = numpy.linspace(xmin, xmax, n_step, endpoint=True)
     chiAxis = numpy.zeros(n_step, dtype=numpy.complex128)
 
     # Convert excitation energies to Rydberg units
-    vee_ry = vee * eV
+    vee_ry = vee * ev2ry
 
     # Spin degeneracy factor
     degspin = 2.0 / nspin
 
     # Calculate susceptibility for each energy point
     for ie, energy in enumerate(energyAxis):
-        freq_ev = energy * eV  # Convert to Rydberg units
+        freq_ev = energy * ev2ry  # Convert to Rydberg units
 
         # Calculate chi tensor components
         chi = numpy.zeros((n_ipol, n_ipol), dtype=numpy.complex128)
