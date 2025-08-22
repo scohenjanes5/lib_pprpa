@@ -11,7 +11,8 @@ from lib_pprpa.pprpa_util import inner_product, get_chemical_potential, start_cl
 from lib_pprpa.gsc import mo_energy_gsc2
 
 
-def diagonalize_pprpa_subspace_same_spin(nocc, mo_energy, w_mat, mu=None):
+def diagonalize_pprpa_subspace_same_spin(nocc, mo_energy, w_mat, mu=None,
+                                         active=[None, None]):
     """Diagonalize ppRPA matrix in subspace (alpha alpha, alpha, alpha)
     or (beta beta, beta beta).
 
@@ -27,21 +28,36 @@ def diagonalize_pprpa_subspace_same_spin(nocc, mo_energy, w_mat, mu=None):
         ec (double): triplet correlation energy.
     """
     w_mat = w_mat.transpose(0,3,1,2)
+    # truncate w_mat and mo_energy
     nmo = len(mo_energy)
     nvir = nmo - nocc
+    nocc_act, nvir_act = active
+    if nocc_act is None:
+        nocc_act = nocc
+    else:
+        nocc_act = min(nocc, nocc_act)
+    if nvir_act is None:
+        nvir_act = nvir
+    else:
+        nvir_act = min(nvir, nvir_act)
+    
     if mu is None:
         mu = get_chemical_potential(nocc=nocc, mo_energy=mo_energy)
 
-    oo_dim = int((nocc - 1) * nocc / 2)
-    tri_row_o, tri_col_o = numpy.tril_indices(nocc, -1)
-    tri_row_v, tri_col_v = numpy.tril_indices(nvir, -1)
+    oo_dim = int((nocc_act - 1) * nocc_act / 2)
+    tri_row_o, tri_col_o = numpy.tril_indices(nocc_act, -1)
+    tri_row_v, tri_col_v = numpy.tril_indices(nvir_act, -1)
 
     # ===========================> A matrix <============================
-    A = w_mat[nocc:, nocc:, nocc:, nocc:] - \
-        w_mat[nocc:, nocc:, nocc:, nocc:].transpose(0,1,3,2)
-    A = A.reshape(nvir*nvir, nvir*nvir)
-    orb_sum = numpy.asarray(mo_energy[nocc:, None] \
-                            + mo_energy[None, nocc:]).reshape(-1)
+    A = w_mat[
+        nocc:(nocc+nvir_act), nocc:(nocc+nvir_act),\
+            nocc:(nocc+nvir_act), nocc:(nocc+nvir_act)] - \
+                w_mat[nocc:(nocc+nvir_act), nocc:(nocc+nvir_act),\
+                      nocc:(nocc+nvir_act),\
+                        nocc:(nocc+nvir_act)].transpose(0,1,3,2)
+    A = A.reshape(nvir_act*nvir_act, nvir_act*nvir_act)
+    orb_sum = numpy.asarray(mo_energy[nocc:(nocc+nvir_act), None] \
+                            + mo_energy[None, nocc:(nocc+nvir_act)]).reshape(-1)
     orb_sum -= 2.0 * mu
     numpy.fill_diagonal(A, A.diagonal() + orb_sum)
     A = A.reshape(nvir, nvir, nvir, nvir)
@@ -50,20 +66,25 @@ def diagonalize_pprpa_subspace_same_spin(nocc, mo_energy, w_mat, mu=None):
     trace_A = numpy.trace(A)
 
     # ===========================> B matrix <============================
-    B = w_mat[nocc:, nocc:, :nocc, :nocc] - \
-        w_mat[nocc:, nocc:, :nocc, :nocc].transpose(0,1,3,2)
+    B = w_mat[nocc:(nocc+nvir_act), nocc:(nocc+nvir_act),\
+              (nocc-nocc_act):nocc, (nocc-nocc_act):nocc] -\
+                w_mat[nocc:(nocc+nvir_act), nocc:(nocc+nvir_act),\
+                      (nocc-nocc_act):nocc,\
+                        (nocc-nocc_act):nocc].transpose(0,1,3,2)
     B = B[tri_row_v, tri_col_v, ...]
     B = B[..., tri_row_o, tri_col_o]
 
     # ===========================> C matrix <============================
-    C = w_mat[:nocc, :nocc, :nocc, :nocc] - \
-        w_mat[:nocc, :nocc, :nocc, :nocc].transpose(0,1,3,2)
-    C = C.reshape(nocc*nocc, nocc*nocc)
-    orb_sum = numpy.asarray(mo_energy[:nocc, None] \
-                            + mo_energy[None, :nocc]).reshape(-1)
+    C = w_mat[(nocc-nocc_act):nocc, (nocc-nocc_act):nocc, \
+              (nocc-nocc_act):nocc, (nocc-nocc_act):nocc] - \
+        w_mat[(nocc-nocc_act):nocc, (nocc-nocc_act):nocc, \
+              (nocc-nocc_act):nocc, (nocc-nocc_act):nocc].transpose(0,1,3,2)
+    C = C.reshape(nocc_act*nocc_act, nocc_act*nocc_act)
+    orb_sum = numpy.asarray(mo_energy[(nocc-nocc_act):nocc, None] \
+                            + mo_energy[None, (nocc-nocc_act):nocc]).reshape(-1)
     orb_sum -= 2.0 * mu
     numpy.fill_diagonal(C, C.diagonal() - orb_sum)
-    C = C.reshape(nocc, nocc, nocc, nocc)
+    C = C.reshape(nocc_act, nocc_act, nocc_act, nocc_act)
     C = C[tri_row_o, tri_col_o, ...]
     C = C[..., tri_row_o, tri_col_o]
 
@@ -92,7 +113,8 @@ def diagonalize_pprpa_subspace_same_spin(nocc, mo_energy, w_mat, mu=None):
     return exci, xy, ec
 
 
-def diagonalize_pprpa_subspace_diff_spin(nocc, mo_energy, w_mat, mu=None):
+def diagonalize_pprpa_subspace_diff_spin(nocc, mo_energy, w_mat, mu=None, 
+                                         active=[None, None]):
     """Diagonalize ppRPA matrix in subspace (alpha beta, alpha, beta).
 
     Args:
@@ -322,13 +344,14 @@ def get_W(k_hxc, m_mat, nmo, nocc, no_screening=False):
 class UppRPAwDirect(UppRPA_direct):
     def __init__(
             self, nocc, mo_energy, Lpq, fxc, hh_state=5, pp_state=5, 
-            nelec='n-2', print_thresh=0.1):
+            nelec='n-2', active=[None, None], print_thresh=0.1):
         super().__init__(
             nocc, mo_energy, Lpq, hh_state=hh_state, pp_state=pp_state,
             nelec=nelec, print_thresh=print_thresh)
         self.fxc = fxc
         self.kHxc = None
         self.w_mat = None
+        self.active = active
     
     def get_K(self):
         self.kHxc = get_K(self.fxc, self.Lpq)
@@ -368,7 +391,8 @@ class UppRPAwDirect(UppRPA_direct):
         if 'aa' in subspace:
             start_clock("U-ppRPAw direct: (alpha alpha, alpha alpha)")
             aa_exci, aa_xy, aa_ec = diagonalize_pprpa_subspace_same_spin(
-                self.nocc[0], self.mo_energy[0], self.w_mat[0], mu=self.mu
+                self.nocc[0], self.mo_energy[0], self.w_mat[0], mu=self.mu,
+                active=self.active
             )
             stop_clock("U-ppRPAw direct: (alpha alpha, alpha alpha)")
         else:
@@ -377,7 +401,8 @@ class UppRPAwDirect(UppRPA_direct):
         if 'bb' in subspace:
             start_clock("U-ppRPAw direct: (beta beta, beta beta)")
             bb_exci, bb_xy, bb_ec = diagonalize_pprpa_subspace_same_spin(
-                self.nocc[1], self.mo_energy[1], self.w_mat[1], mu=self.mu
+                self.nocc[1], self.mo_energy[1], self.w_mat[1], mu=self.mu,
+                active=self.active
             )
             stop_clock("U-ppRPAw direct: (beta beta, beta beta)")
         else:
@@ -386,7 +411,8 @@ class UppRPAwDirect(UppRPA_direct):
         if 'ab' in subspace:
             start_clock("U-ppRPAw direct: (alpha beta, alpha beta)")
             ab_exci, ab_xy, ab_ec = diagonalize_pprpa_subspace_diff_spin(
-                self.nocc, self.mo_energy, self.w_mat[2], mu=self.mu
+                self.nocc, self.mo_energy, self.w_mat[2], mu=self.mu,
+                active=self.active
             )
             stop_clock("U-ppRPAw direct: (alpha beta, alpha beta)")
         else:
