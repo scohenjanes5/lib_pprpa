@@ -453,32 +453,43 @@ def _analyze_upprpaw_direct(exci, xy, nocc, nvir, nelec='n-2', print_thresh=0.1,
 
 class UppRPAwDirect(UppRPA_direct):
     def __init__(
-            self, nocc, mo_energy, Lpq, fxc, hh_state=5, pp_state=5, 
-            nelec='n-2', active=[None, None], print_thresh=0.1):
+            self, nocc, mo_energy, Lpq, fxc=None, hh_state=5, pp_state=5, 
+            nelec='n-2', active=[None, None], print_thresh=0.1, use_gsc_e=True,
+            use_rpa4='none' # avail: 'response', 'all', 'none'
+            ):
         super().__init__(
             nocc, mo_energy, Lpq, hh_state=hh_state, pp_state=pp_state,
             nelec=nelec, print_thresh=print_thresh)
         self.fxc = fxc
-        self.kHxc = None
         self.w_mat = None
+        self.use_rpa4 = use_rpa4.lower()
         self.active = process_active_space(active)
 
-    def get_K(self):
-        self.kHxc = get_K(self.fxc, self.Lpq)
-        return self.kHxc
+    def get_K(self, use_rpa=False):
+        kHxc = get_K(self.fxc, self.Lpq, rpa=use_rpa)
+        return kHxc
 
-    def get_M(self):
-        if self.kHxc == None:
-            self.get_K()
-        return get_M(self.kHxc, self.mo_energy, self.nmo, self.nocc)
+    def get_M(self, kHxc=None, use_rpa=False):
+        if kHxc == None:
+            kHxc=self.get_K(use_rpa=use_rpa)
+        return get_M(kHxc, self.mo_energy, self.nmo, self.nocc)
     
     def get_W(self):
-        m_mat = self.get_M()
-        self.w_mat = get_W(self.kHxc, m_mat, self.nmo, self.nocc)
-        return self.w_mat
+        use_rpa4 = self.use_rpa4
+        if use_rpa4 == 'none':
+            kHxc = self.get_K(use_rpa=False)
+            m_mat = self.get_M(kHxc=kHxc, use_rpa=False)
+        elif use_rpa4 == 'all':
+            kHxc = self.get_K(use_rpa=True)
+            m_mat = self.get_M(kHxc=kHxc, use_rpa=True)
+        elif use_rpa4 == 'response':
+            kHxc = self.get_K(use_rpa=False)
+            m_mat = self.get_M(kHxc=None, use_rpa=True)
+        else:
+            raise NotImplementedError
 
-    def get_GSC_mo_energy(self):
-        pass
+        self.w_mat = get_W(kHxc, m_mat, self.nmo, self.nocc)
+        return self.w_mat
 
     def check_parameter(self, gsc2_e=True, mf=None):
         assert 0.0 < self.print_thresh < 1.0
@@ -542,4 +553,74 @@ class UppRPAwDirect(UppRPA_direct):
             print_thresh=self.print_thresh, hh_state=self.hh_state,
             pp_state=self.pp_state, nocc_fro=nocc_fro
         )
+
+    def dump_flags(self):
+        alpha_act, beta_act = self.active
+        nocc = [alpha_act[0], beta_act[0]]
+        nvir = [alpha_act[1], beta_act[1]]
+        nmo = [nocc[0] + nvir[0], nocc[1] + nvir[1]]
+        # ====================> calculate dimensions <===================
+        # (alpha, alpha) subspace
+        aavv_dim = int(nvir[0] * (nvir[0] + 1) / 2)
+        aaoo_dim = int(nocc[0] * (nocc[0] + 1) / 2)
+        # (alpha, beta) subspace
+        abvv_dim = int(nvir[0] * nvir[1])
+        aboo_dim = int(nocc[0] * nocc[1])
+        # (beta, beta) subspace
+        bbvv_dim = int(nvir[1] * (nvir[1] + 1) / 2)
+        bboo_dim = int(nocc[1] * (nocc[1] + 1) / 2)
+
+        print('\n******** %s ********' % self.__class__)
+        print('naux = %d' % self.naux)
+        print('nmo = %d (%d alpha, %d beta)'
+              % (nmo[0]+nmo[1], nmo[0], nmo[1]))
+        print('nocc = %d (%d alpha, %d beta), nvir = %d (%d alpha, %d beta)'
+              % (
+                  nocc[0] + nocc[1], nocc[0], nocc[1],
+                  nvir[0] + nvir[1], nvir[0], nvir[1]))
+        print('for (alpha alpha, alpha alpha) subspace:')
+        print('  occ-occ dimension = %d vir-vir dimension = %d' %
+              (aaoo_dim, aavv_dim))
+        print('for (beta beta, beta beta) subspace:')
+        print('  occ-occ dimension = %d vir-vir dimension = %d' %
+              (bboo_dim, bbvv_dim))
+        print('for (alpha beta, alpha beta) subspace:')
+        print('  occ-occ dimension = %d vir-vir dimension = %d' %
+              (aboo_dim, abvv_dim))
+        print('interested hh state = %d' % self.hh_state)
+        print('interested pp state = %d' % self.pp_state)
+        print('ground state = %s' % self.nelec)
+        print('print threshold = %.2f%%' % (self.print_thresh*100))
+        print('')
+        return
+
+    def check_memory(self):
+        alpha_act, beta_act = self.active
+        nocc = [alpha_act[0], beta_act[0]]
+        nvir = [alpha_act[1], beta_act[1]]
+        nmo = [nocc[0] + nvir[0], nocc[1] + nvir[1]]
+        # ====================> calculate dimensions <===================
+        # (alpha, alpha) subspace
+        aavv_dim = int(nvir[0] * (nvir[0] + 1) / 2)
+        aaoo_dim = int(nocc[0] * (nocc[0] + 1) / 2)
+        aafull_dim = aavv_dim + aaoo_dim
+        # (alpha, beta) subspace
+        abvv_dim = int(nvir[0] * nvir[1])
+        aboo_dim = int(nocc[0] * nocc[1])
+        abfull_dim = abvv_dim + aboo_dim
+        # (beta, beta) subspace
+        bbvv_dim = int(nvir[1] * (nvir[1] + 1) / 2)
+        bboo_dim = int(nocc[1] * (nocc[1] + 1) / 2)
+        bbfull_dim = bbvv_dim + bboo_dim
+
+        full_dim = max(aafull_dim, abfull_dim, bbfull_dim)
+
+        mem = (3 * full_dim * full_dim) * 8 / 1.0e6
+        if mem < 1000:
+            print("U-ppRPAW needs at least %.1f MB memory." % mem)
+        else:
+            print("U-ppRPAW needs at least %.1f GB memory." % (mem / 1.0e3))
+        return
+
+
 
