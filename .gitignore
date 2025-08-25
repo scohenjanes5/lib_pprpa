@@ -140,3 +140,4 @@ dmypy.json
 tmp/
 gs_mps/
 cps_mps/
+*.npz
