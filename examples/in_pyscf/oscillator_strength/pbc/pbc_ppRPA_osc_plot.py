@@ -112,7 +112,10 @@ if os.path.isfile(chkfname):
     data = chkfile.load(chkfname, "scf")
     kmf.__dict__.update(data)
 else:
-    raise FileNotFoundError("Unable to find the checkpoint file")
+    kmf.kernel() # run SCF and create checkpoint file
+    # An OOM error is expected from current PySCF
+    # Therefore you will need to run this script again
+    # after the error in order to reach the end.
 
 dump_file = "NV-dump.h5"
 dump_file = os.path.join(scratch, dump_file) if os.path.exists(scratch) else dump_file
