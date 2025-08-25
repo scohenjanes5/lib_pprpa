@@ -614,7 +614,7 @@ def _pprpa_compact_space(pprpa, first_state, tri_vec, tri_vec_sig, mv_prod, v_tr
 def _pprpa_print_eigenvector(
         multi, nocc, nvir, thresh, channel, exci0, exci, xy,
         # oscillator strength
-        mo_dip=None, xy0=None, xy0_multi=None, spectrum: bool | str = False):
+        mo_dip=None, xy0=None, xy0_multi=None):
     """Print dominant components of an eigenvector.
 
     Args:
@@ -631,8 +631,6 @@ def _pprpa_print_eigenvector(
         xy0 (double ndarray, optional): eigenvector of the ground state.
         xy0_multi (string, optional): multiplicity of the ground state eigenvector.
             Defaults to None.
-        spectrum (bool | str, optional): Boolean to save spectrum data, or filename for said data.
-            Default False for no saved spectrum data.
     """
     if multi == "s":
         oo_dim = int((nocc + 1) * nocc / 2)
@@ -719,15 +717,14 @@ def _pprpa_print_eigenvector(
     f_vals = np.array(f_vals)
     tdm_vals = np.array(tdm_vals)
     vees = np.array(vees) * au2ev
-    if len(f_vals) > 0 and np.sum(f_vals) > 0.0 and spectrum is not False:
-        from lib_pprpa.pprpa_util import generate_spectrum
-        generate_spectrum(vees, tdm_vals, save_to=spectrum)
-
-    return
+    if len(f_vals) > 0 and np.sum(f_vals) > 0.0:
+        return tdm_vals, vees
+    else:
+        return None
 
 
 def _analyze_pprpa_davidson(
-        exci_s, xy_s, exci_t, xy_t, nocc, nvir, print_thresh=0.1, channel="pp", mo_dip=None, spectrum: bool | str = False):
+        exci_s, xy_s, exci_t, xy_t, nocc, nvir, print_thresh=0.1, channel="pp", mo_dip=None):
     print("\nanalyze ppRPA results.")
 
     if exci_s is not None and exci_t is not None:
@@ -741,35 +738,38 @@ def _analyze_pprpa_davidson(
             xy0 = xy_s[0] if exci_s[0] > exci_t[0] else xy_t[0]
             xy0_multi = "s" if exci_s[0] > exci_t[0] else "t"
 
-        _pprpa_print_eigenvector(
+        res_s = _pprpa_print_eigenvector(
             multi="s", nocc=nocc, nvir=nvir, thresh=print_thresh,
             channel=channel, exci0=exci0, exci=exci_s, xy=xy_s,
-            mo_dip=mo_dip, xy0=xy0, xy0_multi=xy0_multi, spectrum=spectrum)
-        _pprpa_print_eigenvector(
+            mo_dip=mo_dip, xy0=xy0, xy0_multi=xy0_multi)
+        res_t = _pprpa_print_eigenvector(
             multi="t", nocc=nocc, nvir=nvir, thresh=print_thresh,
             channel=channel, exci0=exci0, exci=exci_t, xy=xy_t,
-            mo_dip=mo_dip, xy0=xy0, xy0_multi=xy0_multi, spectrum=spectrum)
+            mo_dip=mo_dip, xy0=xy0, xy0_multi=xy0_multi)
+
+        res = res_s if res_s is not None else res_t if res_t is not None else None
     else:
         if exci_s is not None:
             print("only singlet results found.")
-            _pprpa_print_eigenvector(
+            res = _pprpa_print_eigenvector(
                 multi="s", nocc=nocc, nvir=nvir, thresh=print_thresh,
                 channel=channel, exci0=exci_s[0], exci=exci_s, xy=xy_s,
-                mo_dip=mo_dip, xy0=xy_s[0], xy0_multi="s", spectrum=spectrum)
+                mo_dip=mo_dip, xy0=xy_s[0], xy0_multi="s")
         else:
             print("only triplet results found.")
-            _pprpa_print_eigenvector(
+            res = _pprpa_print_eigenvector(
                 multi="t", nocc=nocc, nvir=nvir, thresh=print_thresh,
                 channel=channel, exci0=exci_t[0], exci=exci_t, xy=xy_t,
-                mo_dip=mo_dip, xy0=xy_t[0], xy0_multi="t", spectrum=spectrum)
-    return
+                mo_dip=mo_dip, xy0=xy_t[0], xy0_multi="t")
+
+    return res # either None or (tdm, vee)
 
 
 class ppRPA_Davidson():
     def __init__(
             self, nocc, mo_energy, Lpq, channel="pp", nroot=5, max_vec=500,
             max_iter=100, trial="identity", residue_thresh=1.0e-7,
-            print_thresh=0.1, mo_dip=None, spectrum: bool | str = False):
+            print_thresh=0.1, mo_dip=None):
         # necessary input
         self.nocc = nocc  # number of occupied orbitals
         self.mo_energy = np.asarray(mo_energy)  # orbital energy
@@ -791,7 +791,6 @@ class ppRPA_Davidson():
         self.print_thresh = print_thresh  # threshold to print component
         self._compact_subspace = False  # compact large subspace
         self.mo_dip = mo_dip # vector dipole integrals in MO space
-        self.spectrum = spectrum # bool to trigger calculating spectrum, or filename for spectrum data
 
         # internal flags
         self.multi = None  # multiplicity
@@ -811,6 +810,8 @@ class ppRPA_Davidson():
         self.xy_s = None  # singlet two-electron addition eigenvector
         self.exci_t = None  # triplet two-electron addition energy
         self.xy_t = None  # triplet two-electron addition eigenvector
+        self.tdm = None  # transition dipole moments
+        self.vee = None  # vertical excitation energies
         print_citation()
 
         return
@@ -858,7 +859,6 @@ class ppRPA_Davidson():
             print("subspace nocc = %d nvir = %d" % (self.nocc_sub, self.nvir_sub))
         print('residue threshold = %.3e' % self.residue_thresh)
         print('print threshold = %.2f%%' % (self.print_thresh*100))
-        print('spectrum calculation = %s' % self.spectrum)
         # experiment features
         print("_use_Lov = %s" % self._use_Lov)
         print("_compact_subspace = %s" % self._compact_subspace)
@@ -912,26 +912,37 @@ class ppRPA_Davidson():
         if self.exci_t is not None:
             f["exci_t"] = np.asarray(self.exci_t)
             f["xy_t"] = np.asarray(self.xy_t)
+        if self.tdm is not None:
+            f["tdm"] = np.asarray(self.tdm)
+            f["vee"] = np.asarray(self.vee)
         f.close()
         return
 
-    def read_pprpa(self, fn, singlet=True, triplet=True):
-        print("\nread pprpa results from %s.\n" % fn)
+    def read_pprpa(self, fn):
+        print("\nread ppRPA results from %s.\n" % fn)
         f = h5py.File(fn, "r")
-        if singlet is True:
+        self.nocc = int(np.asarray(f["nocc"]))
+        self.nvir = int(np.asarray(f["nvir"]))
+        if "exci_s" in f:
             self.exci_s = np.asarray(f["exci_s"])
             self.xy_s = np.asarray(f["xy_s"])
-        if triplet is True:
+        if "exci_t" in f:
             self.exci_t = np.asarray(f["exci_t"])
             self.xy_t = np.asarray(f["xy_t"])
+        if "vee" in f:
+            self.vee = np.asarray(f["vee"])
+            self.tdm = np.asarray(f["tdm"])
         f.close()
         return
 
     def analyze(self):
-        _analyze_pprpa_davidson(
+        results = _analyze_pprpa_davidson(
             exci_s=self.exci_s, xy_s=self.xy_s, exci_t=self.exci_t,
             xy_t=self.xy_t, nocc=self.nocc, nvir=self.nvir,
-            print_thresh=self.print_thresh, channel=self.channel, mo_dip=self.mo_dip, spectrum=self.spectrum)
+            print_thresh=self.print_thresh, channel=self.channel, mo_dip=self.mo_dip)
+        
+        if results is not None:
+            self.tdm, self.vee = results
         return
 
     def contraction(self, tri_vec):

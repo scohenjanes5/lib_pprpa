@@ -282,7 +282,7 @@ def pprpa_orthonormalize_eigenvector(multi, nocc, exci, xy):
 def _pprpa_print_eigenvector(
         multi, nocc, nvir, nocc_fro, thresh, hh_state, pp_state, exci0, exci, xy,
         # oscillator strength
-        mo_dip=None, xy0=None, xy0_multi=None, spectrum: bool | str = False):
+        mo_dip=None, xy0=None, xy0_multi=None):
     """Print dominant components of an eigenvector.
 
     Args:
@@ -301,8 +301,6 @@ def _pprpa_print_eigenvector(
         xy0 (double ndarray, optional): ground-state eigenvector. Defaults to None.
         xy0_multi (string, optional): multiplicity of the ground state eigenvector.
             Defaults to None.
-        spectrum (bool | str, optional): Boolean to save spectrum data, or filename for said data.
-            Default False for no saved spectrum data.
     """
     if multi == "s":
         oo_dim = int((nocc + 1) * nocc / 2)
@@ -390,16 +388,15 @@ def _pprpa_print_eigenvector(
     f_vals = numpy.array(f_vals)
     tdm_vals = numpy.array(tdm_vals)
     vees = numpy.array(vees) * au2ev
-    if len(f_vals) > 0 and numpy.sum(f_vals) > 0.0 and spectrum is not False:
-        from lib_pprpa.pprpa_util import generate_spectrum
-        generate_spectrum(vees, tdm_vals, save_to=spectrum)
-
-    return
+    if len(f_vals) > 0 and numpy.sum(f_vals) > 0.0:
+        return tdm_vals, vees
+    else:
+        return None
 
 
 def _analyze_pprpa_direct(
         exci_s, xy_s, exci_t, xy_t, nocc, nvir, nelec="n-2", print_thresh=0.1,
-        hh_state=5, pp_state=5, nocc_fro=0, mo_dip=None, spectrum: bool | str = False):
+        hh_state=5, pp_state=5, nocc_fro=0, mo_dip=None):
     print("\nanalyze ppRPA results.")
     oo_dim_s = int((nocc + 1) * nocc / 2)
     oo_dim_t = int((nocc - 1) * nocc / 2)
@@ -415,40 +412,43 @@ def _analyze_pprpa_direct(
             xy0 = xy_s[oo_dim_s - 1] if exci_s[oo_dim_s - 1] > exci_t[oo_dim_t - 1] else xy_t[oo_dim_t - 1]
             xy0_multi = "s" if exci_s[oo_dim_s - 1] > exci_t[oo_dim_t - 1] else "t"
 
-        _pprpa_print_eigenvector(
+        res_s = _pprpa_print_eigenvector(
             multi="s", nocc=nocc, nvir=nvir, nocc_fro=nocc_fro,
             thresh=print_thresh, hh_state=hh_state, pp_state=pp_state, exci0=exci0,
-            exci=exci_s, xy=xy_s, mo_dip=mo_dip, xy0=xy0, xy0_multi=xy0_multi, spectrum=spectrum)
-        _pprpa_print_eigenvector(
+            exci=exci_s, xy=xy_s, mo_dip=mo_dip, xy0=xy0, xy0_multi=xy0_multi)
+        res_t = _pprpa_print_eigenvector(
             multi="t", nocc=nocc, nvir=nvir, nocc_fro=nocc_fro,
             thresh=print_thresh, hh_state=hh_state, pp_state=pp_state, exci0=exci0,
-            exci=exci_t, xy=xy_t, mo_dip=mo_dip, xy0=xy0, xy0_multi=xy0_multi, spectrum=spectrum)
+            exci=exci_t, xy=xy_t, mo_dip=mo_dip, xy0=xy0, xy0_multi=xy0_multi)
+
+        res = res_s if res_s is not None else res_t if res_t is not None else None
     else:
         if exci_s is not None:
             print("only singlet results found.")
             exci0 = exci_s[oo_dim_s] if nelec == "n-2" else exci_s[oo_dim_s-1]
             xy0 = xy_s[oo_dim_s] if nelec == "n-2" else xy_s[oo_dim_s-1]
-            _pprpa_print_eigenvector(
+            res = _pprpa_print_eigenvector(
                 multi="s", nocc=nocc, nvir=nvir, nocc_fro=nocc_fro,
                 thresh=print_thresh, hh_state=hh_state, pp_state=pp_state,
                 exci0=exci0, exci=exci_s, xy=xy_s, mo_dip=mo_dip,
-                xy0=xy0, xy0_multi="s", spectrum=spectrum)
+                xy0=xy0, xy0_multi="s")
         else:
             print("only triplet results found.")
             exci0 = exci_t[oo_dim_t] if nelec == "n-2" else exci_t[oo_dim_t-1]
             xy0 = xy_t[oo_dim_t] if nelec == "n-2" else xy_t[oo_dim_t-1]
-            _pprpa_print_eigenvector(
+            res = _pprpa_print_eigenvector(
                 multi="t", nocc=nocc, nvir=nvir, nocc_fro=nocc_fro,
                 thresh=print_thresh, hh_state=hh_state, pp_state=pp_state,
                 exci0=exci0, exci=exci_t, xy=xy_t, mo_dip=mo_dip,
-                xy0=xy0, xy0_multi="t", spectrum=spectrum)
-    return
+                xy0=xy0, xy0_multi="t")
+
+    return res # either None or (tdm, vee)
 
 
 class ppRPA_direct():
     def __init__(
             self, nocc, mo_energy, Lpq, hh_state=5, pp_state=5, nelec="n-2",
-            print_thresh=0.1, mo_dip=None, spectrum: bool | str = False):
+            print_thresh=0.1, mo_dip=None):
         # necessary input
         self.nocc = nocc  # number of occupied orbitals
         self.mo_energy = numpy.asarray(mo_energy)  # orbital energy
@@ -460,7 +460,6 @@ class ppRPA_direct():
         self.nelec = nelec  # "n-2" or "n+2" for system is an N-2 or N+2 system
         self.print_thresh = print_thresh  # threshold to print component
         self.mo_dip = mo_dip  # vector dipole integrals in MO space
-        self.spectrum = spectrum # bool to trigger calculating spectrum, or filename for spectrum data
 
         # internal flags
         self.multi = None  # multiplicity
@@ -479,6 +478,8 @@ class ppRPA_direct():
         self.xy_s = None  # singlet eigenvector
         self.exci_t = None  # triplet excitation energy
         self.xy_t = None  # triplet eigenvector
+        self.tdm = None  # transition dipole moments
+        self.vee = None  # vertical excitation energies
 
         print_citation()
 
@@ -566,27 +567,38 @@ class ppRPA_direct():
         if self.exci_t is not None:
             f["exci_t"] = numpy.asarray(self.exci_t)
             f["xy_t"] = numpy.asarray(self.xy_t)
+        if self.tdm is not None:
+            f["tdm"] = numpy.asarray(self.tdm)
+            f["vee"] = numpy.asarray(self.vee)
         f.close()
         return
 
     def read_pprpa(self, fn):
         print("\nread pprpa results from %s.\n" % fn)
         f = h5py.File(fn, "r")
-        if "exci_s" in f.keys():
+        self.nocc = int(numpy.asarray(f["nocc"]))
+        self.nvir = int(numpy.asarray(f["nvir"]))
+        if "exci_s" in f:
             self.exci_s = numpy.asarray(f["exci_s"])
             self.xy_s = numpy.asarray(f["xy_s"])
-        if "exci_t" in f.keys():
+        if "exci_t" in f:
             self.exci_t = numpy.asarray(f["exci_t"])
             self.xy_t = numpy.asarray(f["xy_t"])
+        if "tdm" in f:
+            self.tdm = numpy.asarray(f["tdm"])
+            self.vee = numpy.asarray(f["vee"])
         f.close()
         return
 
     def analyze(self, nocc_fro=0):
-        _analyze_pprpa_direct(
+        results = _analyze_pprpa_direct(
             exci_s=self.exci_s, xy_s=self.xy_s, exci_t=self.exci_t,
             xy_t=self.xy_t, nocc=self.nocc, nvir=self.nvir, nelec=self.nelec,
             print_thresh=self.print_thresh, hh_state=self.hh_state,
-            pp_state=self.pp_state, nocc_fro=nocc_fro, mo_dip=self.mo_dip, spectrum=self.spectrum)
+            pp_state=self.pp_state, nocc_fro=nocc_fro, mo_dip=self.mo_dip)
+        
+        if results is not None:
+            self.tdm, self.vee = results
         return
 
     def get_correlation(self):

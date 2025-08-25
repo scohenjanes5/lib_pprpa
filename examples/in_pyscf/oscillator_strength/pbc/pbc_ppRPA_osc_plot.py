@@ -129,17 +129,15 @@ else:
     nocc_act, mo_energy_act, Lpq, mo_dip = get_pyscf_input_sc(kmf, nocc_act=300, nvir_act=300, dump_file=dump_file, with_dip=True)
 
 # for hh-RPA use channel = "hh", and rename the spectrum file to something more appropriate
-pprpa = ppRPA_Davidson(nocc_act, mo_energy_act, Lpq, nroot=20, trial="subspace", channel="pp", max_vec=1000, mo_dip=mo_dip, spectrum="pp")
+pprpa = ppRPA_Davidson(nocc_act, mo_energy_act, Lpq, nroot=20, trial="subspace", channel="pp", max_vec=1000, mo_dip=mo_dip)
 pprpa._use_Lov = True
 pprpa.kernel("s")
 pprpa.kernel("t")
 pprpa.analyze()
 
 # Plot spectrum
-# This filename comes from the "spectrum" kwarg of the pprpa object
-data = np.load("pp.npz")
-energies = np.abs(data["vee"])
-tdms = data["tdm"]
+energies = pprpa.vee # in eV
+tdms = pprpa.tdm
 spectrum = generate_spectrum(energies, tdm=tdms, save_to="pp_spectrum.npz")
 
 # You can plot if running interactively,
