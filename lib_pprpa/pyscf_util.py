@@ -96,13 +96,7 @@ def get_pyscf_input_mol_r(
     mo_energy_act = numpy.array(mo_energy[(nocc - nocc_act) : (nocc + nvir_act)])
 
     if with_dip:
-        print("Computing dipole moment in MO space")
-        from pyscf.tdscf.rhf import _charge_center
-        # Same formulation as in the TDDFT module
-        with mf.mol.with_common_orig(_charge_center(mf.mol)):
-            ao_dip = mf.mol.intor_symmetric("int1e_r", comp=3)
-        mo_dip = mo_coeff.T @ ao_dip @ mo_coeff
-        mo_dip = mo_dip[:, nocc - nocc_act : nocc + nvir_act, nocc - nocc_act : nocc + nvir_act]
+        mo_dip = calculate_dipole_moment_MO(mf, nocc_act=nocc_act, nvir_act=nvir_act)
 
     if cholesky is False:
         if getattr(mf, 'with_df', None):
@@ -346,7 +340,7 @@ class Cholesky:
 
         Returns
         -------
-        np.ndarray
+        numpy.ndarray
             (naux, norb, norb) array containing CDERI
         """
 
@@ -728,7 +722,7 @@ def get_pyscf_input_mol_frac(
 
 
 def get_pyscf_input_sc(
-        kmf, nocc_act=None, nvir_act=None, dump_file=None, cholesky=False):
+        kmf, nocc_act=None, nvir_act=None, dump_file=None, cholesky=False, with_dip=False):
     """Get ppRPA input from a PySCF supercell SCF calculation.
 
     Args:
@@ -737,11 +731,14 @@ def get_pyscf_input_sc(
         nvir_act (int, optional): number of active virtual orbitals. Defaults to None.
         dump_file (str, optional): file name to dump matrix for lib_pprpa. Defaults to None.
         cholesky (bool, optional): use Cholesky decomposition. Defaults to False.
+        with_dip (bool, optional): Calculate dipole moment in MO space. Defaults to False.
 
     Returns:
         nocc_act (int): number of occupied orbitals in the active space.
         mo_energy_act (double array): orbital energy in the active space.
         Lpq (double ndarray): three-center density-fitting matrix in active MO space.
+        mo_dip (numpy.ndarray, upon request): Dipole moment in MO space.
+            Only returned if with_dip is True.
     """
     from pyscf import lib
     from pyscf.ao2mo import _ao2mo
@@ -769,6 +766,10 @@ def get_pyscf_input_sc(
     ijslice = (nocc-nocc_act, nocc+nvir_act, nocc-nocc_act, nocc+nvir_act)
 
     kptijkl = _format_kpts(kpts)
+
+    if with_dip:
+        mo_dip = calculate_dipole_moment_MO(kmf, nocc_act=nocc_act, nvir_act=nvir_act)
+
     if cholesky is False:
         Lpq = []
         for LpqR, _, _ in kmf.with_df.sr_loop(
@@ -793,6 +794,8 @@ def get_pyscf_input_sc(
         f["nocc"] = numpy.asarray(nocc_act)
         f["mo_energy"] = numpy.asarray(mo_energy_act)
         f["Lpq"] = numpy.asarray(Lpq)
+        if with_dip:
+            f["mo_dipole"] = numpy.asarray(mo_dip)
         f.close()
 
     print("\nget input for lib_pprpa from PySCF (supercell)")
@@ -804,7 +807,10 @@ def get_pyscf_input_sc(
 
     stop_clock("getting input for supercell ppRPA from PySCF")
 
-    return nocc_act, mo_energy_act, Lpq
+    if with_dip:
+        return nocc_act, mo_energy_act, Lpq, mo_dip
+    else:
+        return nocc_act, mo_energy_act, Lpq
 
 
 def get_pyscf_input_sc_g(kmf, nocc_act=None, nvir_act=None, dump_file=None):
@@ -891,6 +897,31 @@ def get_pyscf_input_sc_g(kmf, nocc_act=None, nvir_act=None, dump_file=None):
 
     return nocc_act, mo_energy_act, Lpq
 
+def calculate_dipole_moment_MO(mf, nocc_act=None, nvir_act=None):
+    """Calculate the dipole moment in MO space
+    Args:
+        mf (PySCF mean-field object): PySCF mean-field object (Can be for molecule or PBC).
+    Kwargs:
+        nocc_act (int): active space size for occupied orbitals. Leave None for full space calculation
+        nvir_act (int): active space size for virtual orbitals. Leave None for full space calculation
+
+    Returns:
+        mo_dip (numpy.ndarray): shape (nmo, 3)
+    """
+    nmo = len(mf.mo_energy)
+    nocc = int(numpy.sum(mf.mo_occ) / 2)
+    nvir = nmo - nocc
+    nocc_act = nocc if nocc_act is None else min(nocc, nocc_act)
+    nvir_act = nvir if nvir_act is None else min(nvir, nvir_act)
+    mo_coeff = numpy.asarray(mf.mo_coeff)
+    print("Computing dipole moment in MO space")
+    from pyscf.tdscf.rhf import _charge_center
+    # Same formulation as in the TDDFT module
+    with mf.mol.with_common_orig(_charge_center(mf.mol)):
+        ao_dip = mf.mol.intor_symmetric("int1e_r", comp=3)
+    mo_dip = mo_coeff.T @ ao_dip @ mo_coeff
+    mo_dip = mo_dip[:, nocc - nocc_act : nocc + nvir_act, nocc - nocc_act : nocc + nvir_act]
+    return mo_dip
 
 # natural transition orbital
 def get_pprpa_nto_pyscf(mf, multi, state, xy, nocc, nvir):

@@ -646,17 +646,25 @@ def _pprpa_print_eigenvector(
 
     nroot = len(exci)
     au2ev = 27.211386
+    f_vals = []
+    tdm_vals = []
+    vees = []
+
     if channel == "pp":
         for iroot in range(nroot):
+            vee = exci[iroot] - exci0
             print("#%-d %s excitation:  exci= %-12.6f  eV   2e=  %-12.6f  eV" %
                   (iroot + 1, multi,
-                   (exci[iroot] - exci0) * au2ev, exci[iroot] * au2ev))
+                   vee * au2ev, exci[iroot] * au2ev))
             if mo_dip is not None:
-                f = get_pprpa_oscillator_strength(
+                f, tdm = get_pprpa_oscillator_strength(
                     nocc=nocc, mo_dip=mo_dip, channel=channel,
                     exci=exci[iroot], exci0=exci0, xy=xy[iroot], xy0=xy0,
                     multi=multi, xy0_multi=xy0_multi)
                 print("#    oscillator strength = %-12.6f  a.u." % f)
+                f_vals.append(f)
+                tdm_vals.append(tdm)
+                vees.append(vee)
             if nocc > 0:
                 full = np.zeros(shape=[nocc, nocc], dtype=np.double)
                 full[tri_row_o, tri_col_o] = xy[iroot][:oo_dim]
@@ -676,14 +684,18 @@ def _pprpa_print_eigenvector(
             print("")
     else:
         for iroot in range(nroot):
+            vee = exci[iroot] - exci0
             print("#%-d %s de-excitation:  exci= %-12.6f  eV   2e=  %-12.6f  eV" %
                   (iroot + 1, multi,
-                   (exci[iroot] - exci0) * au2ev, exci[iroot] * au2ev))
+                   vee * au2ev, exci[iroot] * au2ev))
             if mo_dip is not None:
-                f = get_pprpa_oscillator_strength(
+                f, tdm = get_pprpa_oscillator_strength(
                     nocc=nocc, mo_dip=mo_dip, channel=channel,
                     exci=exci[iroot], exci0=exci0,
                     xy=xy[iroot], xy0=xy0, multi=multi, xy0_multi=xy0_multi)
+                f_vals.append(f)
+                tdm_vals.append(tdm)
+                vees.append(vee)
                 print("#    oscillator strength = %-12.6f  a.u." % f)
             full = np.zeros(shape=[nocc, nocc], dtype=np.double)
             full[tri_row_o, tri_col_o] = xy[iroot][:oo_dim]
@@ -702,7 +714,13 @@ def _pprpa_print_eigenvector(
                         is_pp=True, p=a+nocc, q=b+nocc, percentage=full[a, b])
             print("")
 
-    return
+    f_vals = np.array(f_vals)
+    tdm_vals = np.array(tdm_vals)
+    vees = np.array(vees) * au2ev
+    if len(f_vals) > 0 and np.sum(f_vals) > 0.0:
+        return tdm_vals, vees
+    else:
+        return None
 
 
 def _analyze_pprpa_davidson(
@@ -720,28 +738,31 @@ def _analyze_pprpa_davidson(
             xy0 = xy_s[0] if exci_s[0] > exci_t[0] else xy_t[0]
             xy0_multi = "s" if exci_s[0] > exci_t[0] else "t"
 
-        _pprpa_print_eigenvector(
+        res_s = _pprpa_print_eigenvector(
             multi="s", nocc=nocc, nvir=nvir, thresh=print_thresh,
             channel=channel, exci0=exci0, exci=exci_s, xy=xy_s,
             mo_dip=mo_dip, xy0=xy0, xy0_multi=xy0_multi)
-        _pprpa_print_eigenvector(
+        res_t = _pprpa_print_eigenvector(
             multi="t", nocc=nocc, nvir=nvir, thresh=print_thresh,
             channel=channel, exci0=exci0, exci=exci_t, xy=xy_t,
             mo_dip=mo_dip, xy0=xy0, xy0_multi=xy0_multi)
+
+        res = res_s if res_s is not None else res_t if res_t is not None else None
     else:
         if exci_s is not None:
             print("only singlet results found.")
-            _pprpa_print_eigenvector(
+            res = _pprpa_print_eigenvector(
                 multi="s", nocc=nocc, nvir=nvir, thresh=print_thresh,
                 channel=channel, exci0=exci_s[0], exci=exci_s, xy=xy_s,
                 mo_dip=mo_dip, xy0=xy_s[0], xy0_multi="s")
         else:
             print("only triplet results found.")
-            _pprpa_print_eigenvector(
+            res = _pprpa_print_eigenvector(
                 multi="t", nocc=nocc, nvir=nvir, thresh=print_thresh,
                 channel=channel, exci0=exci_t[0], exci=exci_t, xy=xy_t,
                 mo_dip=mo_dip, xy0=xy_t[0], xy0_multi="t")
-    return
+
+    return res # either None or (tdm, vee)
 
 
 class ppRPA_Davidson():
@@ -789,7 +810,8 @@ class ppRPA_Davidson():
         self.xy_s = None  # singlet two-electron addition eigenvector
         self.exci_t = None  # triplet two-electron addition energy
         self.xy_t = None  # triplet two-electron addition eigenvector
-
+        self.tdm = None  # transition dipole moments
+        self.vee = None  # vertical excitation energies
         print_citation()
 
         return
@@ -890,26 +912,37 @@ class ppRPA_Davidson():
         if self.exci_t is not None:
             f["exci_t"] = np.asarray(self.exci_t)
             f["xy_t"] = np.asarray(self.xy_t)
+        if self.tdm is not None:
+            f["tdm"] = np.asarray(self.tdm)
+            f["vee"] = np.asarray(self.vee)
         f.close()
         return
 
-    def read_pprpa(self, fn, singlet=True, triplet=True):
-        print("\nread pprpa results from %s.\n" % fn)
+    def read_pprpa(self, fn):
+        print("\nread ppRPA results from %s.\n" % fn)
         f = h5py.File(fn, "r")
-        if singlet is True:
+        self.nocc = int(np.asarray(f["nocc"]))
+        self.nvir = int(np.asarray(f["nvir"]))
+        if "exci_s" in f:
             self.exci_s = np.asarray(f["exci_s"])
             self.xy_s = np.asarray(f["xy_s"])
-        if triplet is True:
+        if "exci_t" in f:
             self.exci_t = np.asarray(f["exci_t"])
             self.xy_t = np.asarray(f["xy_t"])
+        if "vee" in f:
+            self.vee = np.asarray(f["vee"])
+            self.tdm = np.asarray(f["tdm"])
         f.close()
         return
 
     def analyze(self):
-        _analyze_pprpa_davidson(
+        results = _analyze_pprpa_davidson(
             exci_s=self.exci_s, xy_s=self.xy_s, exci_t=self.exci_t,
             xy_t=self.xy_t, nocc=self.nocc, nvir=self.nvir,
             print_thresh=self.print_thresh, channel=self.channel, mo_dip=self.mo_dip)
+        
+        if results is not None:
+            self.tdm, self.vee = results
         return
 
     def contraction(self, tri_vec):
