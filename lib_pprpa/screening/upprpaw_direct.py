@@ -2,11 +2,13 @@ import numpy
 import scipy
 import scipy.linalg
 
+from pyscf import lib
+
 from lib_pprpa.upprpa_direct import UppRPA_direct
 from lib_pprpa.pprpa_direct import pprpa_orthonormalize_eigenvector
 from lib_pprpa.upprpa_direct import upprpa_orthonormalize_eigenvector, _pprpa_print_eigenvector
 from lib_pprpa.pprpa_util import get_chemical_potential, start_clock, stop_clock
-from lib_pprpa.gsc import mo_energy_gsc2
+from lib_pprpa.pyscf_util import get_pyscf_input_mol_u
 
 
 def diagonalize_pprpa_subspace_same_spin(nocc, mo_energy, w_mat, mu=None,
@@ -137,10 +139,10 @@ def diagonalize_pprpa_subspace_diff_spin(nocc, mo_energy, w_mat, mu=None,
     act_alpha, act_beta = active
     nocc_act = [act_alpha[0], act_beta[0]]
     nvir_act = [act_alpha[1], act_beta[1]]
-    nocc_act[0] = nocc[0] if nocc_act[0] == None else min(nocc_act[0], nocc[0])
-    nocc_act[1] = nocc[1] if nocc_act[1] == None else min(nocc_act[1], nocc[1])
-    nvir_act[0] = nvir[0] if nvir_act[0] == None else min(nvir_act[0], nvir[0])
-    nvir_act[1] = nvir[1] if nvir_act[1] == None else min(nvir_act[1], nvir[1])
+    nocc_act[0] = nocc[0] if nocc_act[0] is None else min(nocc_act[0], nocc[0])
+    nocc_act[1] = nocc[1] if nocc_act[1] is None else min(nocc_act[1], nocc[1])
+    nvir_act[0] = nvir[0] if nvir_act[0] is None else min(nvir_act[0], nvir[0])
+    nvir_act[1] = nvir[1] if nvir_act[1] is None else min(nvir_act[1], nvir[1])
 
     # ===========================> A matrix <============================
     A = w_mat[nocc[0]:(nocc[0]+nvir_act[0]), nocc[1]:(nocc[1]+nvir_act[1]),\
@@ -162,6 +164,103 @@ def diagonalize_pprpa_subspace_diff_spin(nocc, mo_energy, w_mat, mu=None,
     # ===========================> C matrix <============================
     C = w_mat[(nocc[0]-nocc_act[0]):nocc[0], (nocc[1]-nocc_act[1]):nocc[1],\
               (nocc[0]-nocc_act[0]):nocc[0], (nocc[1]-nocc_act[1]):nocc[1]]
+    C = C.reshape(nocc_act[0]*nocc_act[1], nocc_act[0]*nocc_act[1])
+    orb_sum = numpy.asarray(
+        mo_energy[0][(nocc[0]-nocc_act[0]):nocc[0], None] +\
+            mo_energy[1][None, (nocc[1]-nocc_act[1]):nocc[1]]
+    ).reshape(-1)
+    orb_sum -= 2.0 * mu
+    numpy.fill_diagonal(C, C.diagonal() - orb_sum)
+
+    # ==================> whole matrix in the subspace<==================
+    # C    B^T
+    # B     A
+    M_upper = numpy.concatenate((C, B.T), axis=1)
+    M_lower = numpy.concatenate((B, A), axis=1)
+    M = numpy.concatenate((M_upper, M_lower), axis=0)
+    del A, B, C
+    # M to WM, where W is the metric matrix [[-I, 0], [0, I]]
+    M[:nocc_act[0]*nocc_act[1]][:] *= -1.0
+
+    # =====================> solve for eigenpairs <======================
+    exci, xy = scipy.linalg.eig(M)
+    exci = exci.real
+    xy = xy.T  # Fortran to Python order
+
+    # sort eigenpairs
+    idx = exci.argsort()
+    exci = exci[idx]
+    xy = xy[idx, :]
+    upprpa_orthonormalize_eigenvector('abab', nocc, exci, xy)
+
+    sum_exci = numpy.sum(exci[nocc_act[0]*nocc_act[1]:])
+    ec = sum_exci - trace_A
+
+    return exci, xy, ec
+
+
+def diagonalize_pprpa_subspace_singlet_pf(nocc, mo_energy, w_mat_aa,
+                                          w_mat_ab, mu=None,
+                                         active=[(None,None),(None,None)]):
+    """Diagonalize ppRPA matrix in subspace (alpha beta, alpha, beta).
+
+    Args:
+        nocc(tuple of int): number of occupied orbitals, (nalpha, nbeta).
+        mo_energy (list of double array): orbital energies.
+        w_mat (list of double ndarray): W matrices in MO space.
+
+    Kwarg:
+        mu (double): chemical potential.
+
+    Returns:
+        exci (double array): ppRPA eigenvalue.
+        xy (double ndarray): ppRPA eigenvector.
+        ec (double): correlation energy from one subspace.
+    """
+    w_mat_aa = w_mat_aa.transpose(0,3,1,2)
+    w_mat_ab = w_mat_ab.transpose(0,3,1,2)
+    nmo = (len(mo_energy[0]), len(mo_energy[1]))
+    nvir = (nmo[0]-nocc[0], nmo[1]-nocc[1])
+    if mu is None:
+        mu = get_chemical_potential(nocc, mo_energy)
+
+    act_alpha, act_beta = active
+    nocc_act = [act_alpha[0], act_beta[0]]
+    nvir_act = [act_alpha[1], act_beta[1]]
+    nocc_act[0] = nocc[0] if nocc_act[0] is None else min(nocc_act[0], nocc[0])
+    nocc_act[1] = nocc[1] if nocc_act[1] is None else min(nocc_act[1], nocc[1])
+    nvir_act[0] = nvir[0] if nvir_act[0] is None else min(nvir_act[0], nvir[0])
+    nvir_act[1] = nvir[1] if nvir_act[1] is None else min(nvir_act[1], nvir[1])
+
+    # ===========================> A matrix <============================
+    A = w_mat_ab[nocc[0]:(nocc[0]+nvir_act[0]), nocc[1]:(nocc[1]+nvir_act[1]),\
+              nocc[0]:(nocc[0]+nvir_act[0]), nocc[1]:(nocc[1]+nvir_act[1])] * 2
+    A -= w_mat_aa[nocc[0]:(nocc[0]+nvir_act[0]), nocc[0]:(nocc[0]+nvir_act[0]),\
+              nocc[0]:(nocc[0]+nvir_act[0]), nocc[0]:(nocc[0]+nvir_act[0])]
+    A -= w_mat_aa[nocc[0]:(nocc[0]+nvir_act[0]), nocc[1]:(nocc[1]+nvir_act[1]),\
+              nocc[0]:(nocc[0]+nvir_act[0]), nocc[1]:(nocc[1]+nvir_act[1])].transpose(0,3,1,2)
+    A = A.reshape(nvir_act[0]*nvir_act[1], nvir_act[0]*nvir_act[1])
+    orb_sum = numpy.asarray(
+        mo_energy[0][nocc[0]:(nocc[0]+nvir_act[0]), None] +\
+            mo_energy[1][None, nocc[1]:(nocc[1]+nvir_act[1])]
+    ).reshape(-1)
+    orb_sum -= 2.0 * mu
+    numpy.fill_diagonal(A, A.diagonal() + orb_sum)
+    trace_A = numpy.trace(A)
+
+    # ===========================> B matrix <============================
+    # NOTE: no purification in B
+    B = w_mat_ab[nocc[0]:(nocc[0]+nvir_act[0]), nocc[1]:(nocc[1]+nvir_act[1]),\
+              (nocc[0]-nocc_act[0]):nocc[0], (nocc[1]-nocc_act[1]):nocc[1]] * 2
+    B = B.reshape(nvir_act[0]*nvir_act[1], nocc_act[0]*nocc_act[1])
+
+    # ===========================> C matrix <============================
+    C = w_mat_ab[(nocc[0]-nocc_act[0]):nocc[0], (nocc[1]-nocc_act[1]):nocc[1],\
+              (nocc[0]-nocc_act[0]):nocc[0], (nocc[1]-nocc_act[1]):nocc[1]] * 2.0
+    C -= w_mat_aa[(nocc[0]-nocc_act[0]):nocc[0], (nocc[0]-nocc_act[0]):nocc[0],\
+              (nocc[0]-nocc_act[0]):nocc[0], (nocc[0]-nocc_act[0]):nocc[0]]
+    C -= w_mat_aa[(nocc[0]-nocc_act[0]):nocc[0], (nocc[0]-nocc_act[0]):nocc[0],\
+              (nocc[0]-nocc_act[0]):nocc[0], (nocc[0]-nocc_act[0]):nocc[0]].transpose(0,3,1,2)
     C = C.reshape(nocc_act[0]*nocc_act[1], nocc_act[0]*nocc_act[1])
     orb_sum = numpy.asarray(
         mo_energy[0][(nocc[0]-nocc_act[0]):nocc[0], None] +\
@@ -347,6 +446,381 @@ def get_W(k_hxc, m_mat, nmo, nocc, no_screening=False):
     return w_mat
 
 
+def mo_energy_gsc2(mf, w_mat, nocc_act=None, nvir_act=None, rpa=False):
+    """Add GSC2 correction to original DFA eigenvalues.
+
+    Args:
+        mf (pyscf.dft.UKS): molecular mean-field object.
+
+    Kwargs:
+        w_mat (list of numpy.ndarray): W matrices, [aaaa, bbbb, aabb].
+    """
+    mo_occ = mf.mo_occ
+    mo_energy = mf.mo_energy
+
+    nmo = len(mo_energy[0])
+    nocc = mf.nelec
+    nvir = (nmo - nocc[0], nmo - nocc[1])
+
+    if nocc_act is None:
+        nocc_act = nocc
+    elif isinstance(nocc_act, (int, numpy.int64)):
+        nocc_act = [nocc_act, nocc_act]
+        nocc_act = (min(nocc[0], nocc_act[0]), min(nocc[1], nocc_act[1]))
+    else:
+        nocc_act = (min(nocc[0], nocc_act[0]), min(nocc[1], nocc_act[1]))
+
+    if nvir_act is None:
+        nvir_act = nvir
+    elif isinstance(nvir_act, (int, numpy.int64)):
+        nvir_act = [nvir_act, nvir_act]
+        nvir_act = (min(nvir[0], nvir_act[0]), min(nvir[1], nvir_act[1]))
+    else:
+        nvir_act = (min(nvir[0], nvir_act[0]), min(nvir[1], nvir_act[1]))
+
+    mo_energy_act = [
+        mo_energy[0, (nocc[0]-nocc_act[0]):(nocc[0]+nvir_act[0])],
+        mo_energy[1, (nocc[1]-nocc_act[1]):(nocc[1]+nvir_act[1])]]
+
+    mo_occ_act = [
+        mo_occ[0, (nocc[0]-nocc_act[0]):(nocc[0]+nvir_act[0])],
+        mo_occ[1, (nocc[1]-nocc_act[1]):(nocc[1]+nvir_act[1])]]
+
+    kappa = []
+    for i in range(2):
+        mat = numpy.einsum('ppqq->pq', w_mat[i])
+        kappa.append(mat)
+
+    mo_occ_act = [0.5 - mo_occ_act[0], 0.5 - mo_occ_act[1]]
+    delta_mo_ea = numpy.einsum(
+        'pp,p->p', kappa[0], mo_occ_act[0], optimize=True)
+    delta_mo_eb = numpy.einsum(
+        'pp,p->p', kappa[1], mo_occ_act[1], optimize=True)
+
+    mo_energy_act = [mo_energy_act[0] + delta_mo_ea,
+                     mo_energy_act[1] + delta_mo_eb]
+
+    return mo_energy_act
+
+
+def get_fxc_u(mf, Lpq=None, nocc_act=None, nvir_act=None, add_frac_e=True):
+    """Calculate fxc matrices in orbital space.
+
+    Args:
+        mf (pyscf.dft.UKS): pyscf unrestricted KS-DFT object.
+        Lpq (list of double ndarray): three-center density fitting matrix
+            in the active MO space.
+        nocc_act (tuple of int): number of active occupied orbitals,
+            (Nalpha, Nbeta). Default to None.
+        nvir_act (tuple of int): number of active virtual orbitals,
+            (Nalpha, Nbeta). Default to None.
+        add_frac_e (bool): whether to add fractional electrons to
+            virtual orbitals to solve the negative curvature problem.
+
+    Returns:
+        fxc_mat (list of numpy.ndarray): fxc matrices in orbital space,
+            (aaaa, bbbb, aabb). bbaa = aabb.transpose(2, 3, 0, 1).
+    """
+    start_clock("getting fxc for molecule UppRPAw from PySCF")
+    mo = mf.mo_coeff
+    moa = mo[0]
+    mob = mo[1]
+    nao, nmo = mo[0].shape
+    nocc = mf.nelec
+    nvir = (nmo - nocc[0], nmo - nocc[1])
+    mo_occ = mf.mo_occ
+    if nocc_act is None:
+        nocc_act = nocc
+    elif isinstance(nocc_act, (int, numpy.int64)):
+        nocc_act = [nocc_act, nocc_act]
+        nocc_act = (min(nocc[0], nocc_act[0]), min(nocc[1], nocc_act[1]))
+    else:
+        nocc_act = (min(nocc[0], nocc_act[0]), min(nocc[1], nocc_act[1]))
+
+    if nvir_act is None:
+        nvir_act = nvir
+    elif isinstance(nvir_act, (int, numpy.int64)):
+        nvir_act = [nvir_act, nvir_act]
+        nvir_act = (min(nvir[0], nvir_act[0]), min(nvir[1], nvir_act[1]))
+    else:
+        nvir_act = (min(nvir[0], nvir_act[0]), min(nvir[1], nvir_act[1]))
+
+    nact = (nocc_act[0] + nvir_act[0], nocc_act[1] + nvir_act[1])
+
+    def add_hf_x_(fxcaa, fxcab, fxcbb, Lpq=None, hyb=1):
+        if Lpq is None:
+            Lpq = get_pyscf_input_mol_u(
+                mf, nocc_act=nocc_act, nvir_act=nvir_act)[2]
+        fxcaa -=numpy.einsum('Lad,Lbc->abcd', Lpq[0], Lpq[0]) * hyb
+        fxcab -=numpy.einsum('Lad,Lbc->abcd', Lpq[0], Lpq[1]) * hyb
+        fxcbb -=numpy.einsum('Lad,Lbc->abcd', Lpq[1], Lpq[1]) * hyb
+
+    dm0 = mf.make_rdm1(mo, mo_occ)
+    ni = mf._numint
+    make_rho = ni._gen_rho_evaluator(mf.mol, dm0, hermi=1, with_lapl=False)[0]
+    mem_now = lib.current_memory()[0]
+    max_memory = max(2000, mf.max_memory*.8-mem_now)
+    xctype = ni._xc_type(mf.xc)
+
+    fxcaa_mat = numpy.zeros((nact[0], nact[0], nact[0], nact[0]))
+    fxcab_mat = numpy.zeros((nact[0], nact[0], nact[1], nact[1]))
+    fxcbb_mat = numpy.zeros((nact[1], nact[1], nact[1], nact[1]))
+    if xctype == 'LDA':
+        ao_deriv = 0
+        for ao, mask, weight, coords \
+                in ni.block_loop(mf.mol, mf.grids, nao,
+                                 ao_deriv, max_memory//nao):
+            rho0a = make_rho(0, ao, mask, xctype)
+            rho0b = make_rho(1, ao, mask, xctype)
+            rho = (rho0a, rho0b)
+            fxc = ni.eval_xc_eff(mf.xc, rho, deriv=2, xctype=xctype)[2]
+            wfxc = fxc[:, 0, :, 0] * weight
+
+            moa_r = numpy.einsum('ka,ap->kp', ao, moa[:, \
+                (nocc[0]-nocc_act[0]):(nocc[0]+nvir_act[0])], optimize=True)
+            mob_r = numpy.einsum('ka,ap->kp', ao, mob[:, \
+                (nocc[1]-nocc_act[1]):(nocc[1]+nvir_act[1])], optimize=True)
+            rhoa_r = numpy.einsum('kp,kq->kpq', moa_r, moa_r, optimize=True)
+            rhob_r = numpy.einsum('kp,kq->kpq', mob_r, mob_r, optimize=True)
+
+            # aaaa
+            f_rs = numpy.einsum('krs,k->krs', rhoa_r, wfxc[0, 0], optimize=True)
+            pqrs = numpy.einsum('kpq,krs->pqrs', rhoa_r, f_rs, optimize=True)
+            fxcaa_mat += pqrs
+
+            # aabb
+            f_rs = numpy.einsum('krs,k->krs', rhob_r, wfxc[0, 1], optimize=True)
+            pqrs = numpy.einsum('kpq,krs->pqrs', rhoa_r, f_rs, optimize=True)
+            fxcab_mat += pqrs
+
+            # bbbb
+            f_rs = numpy.einsum('krs,k->krs', rhob_r, wfxc[1, 1], optimize=True)
+            pqrs = numpy.einsum('kpq,krs->pqrs', rhob_r, f_rs, optimize=True)
+            fxcbb_mat += pqrs
+
+            ############################################################
+            #     add a small fractional charge to virtual orbitals    #
+            #                    to avoid singularity                  #
+            ############################################################
+            if add_frac_e:
+                small_rho = 3e-2
+                den_ar = moa_r ** 2
+                den_br = mob_r ** 2
+
+                # fractional electron in alpha channel
+                fxc1 = numpy.stack(
+                    [ni.eval_xc_eff(
+                        mf.xc, (rho0a + small_rho * den_ar[:, a], rho0b),
+                        deriv = 2, xctype=xctype)[2]\
+                              for a in range(nocc_act[0], nact[0])],
+                    axis=0)
+                wfxc1 = fxc1[:, :, 0, :, 0] * weight
+
+                # aaaa
+                f_cd = numpy.einsum(
+                    'kcd,ck->kcd', rhoa_r[:, nocc_act[0]:, nocc_act[0]:],
+                    wfxc1[:, 0, 0, :], optimize=True)
+                abcd = numpy.einsum(
+                    'kab,kcd->abcd', rhoa_r[:, nocc_act[0]:, nocc_act[0]:],
+                    f_cd, optimize=True)
+                fxcaa_mat[nocc_act[0]:, nocc_act[0]:, nocc_act[0]:, nocc_act[0]:] \
+                    += abcd
+
+                # fractional electron in beta channel
+                fxc1 = numpy.stack(
+                    [ni.eval_xc_eff(
+                        mf.xc, (rho0a, rho0b + small_rho * den_br[:, a]),
+                        deriv = 2, xctype=xctype)[2]\
+                              for a in range(nocc_act[1], nact[1])],
+                    axis=0)
+                wfxc1 = fxc1[:, :, 0, :, 0] * weight
+
+                # aabb
+                f_cd = numpy.einsum(
+                    'kcd,ck->kcd', rhob_r[:, nocc_act[1]:, nocc_act[1]:],
+                    wfxc1[:, 0, 1, :], optimize=True)
+                abcd = numpy.einsum(
+                    'kab,kcd->abcd', rhoa_r[:, nocc_act[0]:, nocc_act[0]:],
+                    f_cd, optimize=True)
+                fxcab_mat[nocc_act[0]:, nocc_act[0]:, nocc_act[1]:, nocc_act[1]:] \
+                    += abcd
+
+                # bbbb
+                f_cd = numpy.einsum(
+                    'kcd,ck->kcd', rhob_r[:, nocc_act[1]:, nocc_act[1]:],
+                    wfxc1[:, 1, 1, :], optimize=True)
+                abcd = numpy.einsum(
+                    'kab,kcd->abcd', rhob_r[:, nocc_act[1]:, nocc_act[1]:],
+                    f_cd, optimize=True)
+                fxcaa_mat[nocc_act[1]:, nocc_act[1]:, nocc_act[1]:, nocc_act[1]:] \
+                    += abcd
+
+
+
+    elif xctype == 'GGA':
+        ao_deriv = 1
+        for ao, mask, weight, coords \
+                in ni.block_loop(
+                    mf.mol, mf.grids, nao, ao_deriv, max_memory//nao):
+            rho0a = make_rho(0, ao, mask, xctype)
+            rho0b = make_rho(1, ao, mask, xctype)
+            rho = (rho0a, rho0b)
+            fxc = ni.eval_xc_eff(mf.xc, rho, deriv=2, xctype=xctype)[2]
+            wfxc = fxc * weight
+
+            moa_r = numpy.einsum('xka,ap->xkp', ao, moa[:, \
+                (nocc[0]-nocc_act[0]):(nocc[0]+nvir_act[0])], optimize=True)
+            mob_r = numpy.einsum('xka,ap->xkp', ao, mob[:, \
+                (nocc[1]-nocc_act[1]):(nocc[1]+nvir_act[1])], optimize=True)
+            rhoa_r = numpy.einsum('xkp,kq->xkpq', moa_r, moa_r[0],
+                                  optimize=True)
+            rhob_r = numpy.einsum('xkp,kq->xkpq', mob_r, mob_r[0],
+                                  optimize=True)
+            rhoa_r[1:4] += numpy.einsum('kp,xkq->xkpq', moa_r[0], moa_r[1:4],
+                                        optimize=True)
+            rhob_r[1:4] += numpy.einsum('kp,xkq->xkpq', mob_r[0], mob_r[1:4],
+                                        optimize=True)
+
+            # aaaa
+            f_rs = numpy.einsum('xyk,xkrs->ykrs', wfxc[0, :, 0], rhoa_r,
+                                optimize=True)
+            pqrs = numpy.einsum('ykpq,ykrs->pqrs', rhoa_r, f_rs, optimize=True)
+            fxcaa_mat += pqrs
+
+            # aabb
+            f_rs = numpy.einsum('xyk,xkrs->ykrs', wfxc[0, :, 1], rhob_r,
+                                optimize=True)
+            pqrs = numpy.einsum('ykpq,ykrs->pqrs', rhoa_r, f_rs, optimize=True)
+            fxcab_mat += pqrs
+
+            # aabb
+            f_rs = numpy.einsum('xyk,xkrs->ykrs', wfxc[1, :, 1], rhob_r,
+                                optimize=True)
+            pqrs = numpy.einsum('ykpq,ykrs->pqrs', rhob_r, f_rs, optimize=True)
+            fxcbb_mat += pqrs
+
+            ############################################################
+            #     add a small fractional charge to virtual orbitals    #
+            #                    to avoid singularity                  #
+            ############################################################
+            if add_frac_e:
+                fxcaa_mat[
+                    nocc_act[0]:, nocc_act[0]:,
+                    nocc_act[0]:, nocc_act[0]:] = 0.0
+                fxcab_mat[
+                    nocc_act[0]:, nocc_act[0]:,
+                    nocc_act[1]:, nocc_act[1]:] = 0.0
+                fxcbb_mat[
+                    nocc_act[1]:, nocc_act[1]:,
+                    nocc_act[1]:, nocc_act[1]:] = 0.0
+
+                small_rho = 3e-2
+                den_ar = moa_r ** 2
+                den_br = mob_r ** 2
+
+                # fractional electron in alpha channel
+                fxc1 = numpy.stack(
+                    [ni.eval_xc_eff(
+                        mf.xc, (rho0a + small_rho * den_ar[:, :, a], rho0b),
+                        deriv = 2, xctype=xctype)[2]\
+                              for a in range(nocc_act[0], nact[0])],
+                    axis=0)
+                wfxc1 = fxc1 * weight
+
+                # aaaa
+                f_cd = numpy.einsum(
+                    'cxyk,xkcd->ykcd', wfxc1[:, 0, :, 0],
+                    rhoa_r[:, :, nocc_act[0]:, nocc_act[0]:], optimize=True)
+                abcd = numpy.einsum(
+                    'ykab,ykcd->abcd', rhoa_r[:, :, nocc_act[0]:, nocc_act[0]:],
+                    f_cd, optimize=True)
+                fxcaa_mat[
+                    nocc_act[0]:, nocc_act[0]:,
+                    nocc_act[0]:, nocc_act[0]:] += abcd
+
+                # fractional electron in beta channel
+                fxc1 = numpy.stack(
+                    [ni.eval_xc_eff(
+                        mf.xc, (rho0a, rho0b + small_rho * den_br[:, :, a]),
+                        deriv = 2, xctype=xctype)[2]\
+                              for a in range(nocc_act[1], nact[1])],
+                    axis=0)
+                wfxc1 = fxc1 * weight
+
+                # aabb
+                f_cd = numpy.einsum(
+                    'cxyk,xkcd->ykcd', wfxc1[:, 0, :, 1],
+                    rhob_r[:, :, nocc_act[1]:, nocc_act[1]:], optimize=True)
+                abcd = numpy.einsum(
+                    'ykab,ykcd->abcd', rhoa_r[:, :, nocc_act[0]:, nocc_act[0]:],
+                    f_cd, optimize=True)
+                fxcab_mat[
+                    nocc_act[0]:, nocc_act[0]:,
+                    nocc_act[1]:, nocc_act[1]:] += abcd
+
+                # bbbb
+                f_cd = numpy.einsum(
+                    'cxyk,xkcd->ykcd', wfxc1[:, 1, :, 1],
+                    rhob_r[:, :, nocc_act[1]:, nocc_act[1]:], optimize=True)
+                abcd = numpy.einsum(
+                    'ykab,ykcd->abcd', rhob_r[:, :, nocc_act[1]:, nocc_act[1]:],
+                    f_cd, optimize=True)
+                fxcbb_mat[
+                    nocc_act[1]:, nocc_act[1]:,
+                    nocc_act[1]:, nocc_act[1]:] += abcd
+    elif xctype == 'MGGA':
+        ao_deriv = 1
+        for ao, mask, weight, coords \
+                in ni.block_loop(mf.mol, mf.grids, nao, ao_deriv, max_memory):
+            rho0a = make_rho(0, ao, mask, xctype)
+            rho0b = make_rho(1, ao, mask, xctype)
+            rho = (rho0a, rho0b)
+            fxc = ni.eval_xc_eff(mf.xc, rho, deriv=2, xctype=xctype)[2]
+            wfxc = fxc * weight
+
+            moa_r = numpy.einsum('xka,ap->xkp', ao, moa[:, \
+                nocc[0]-nocc_act[0]:nocc[0]+nvir_act[0]], optimize=True)
+            mob_r = numpy.einsum('xka,ap->xkp', ao, mob[:, \
+                nocc[1]-nocc_act[1]:nocc[1]+nvir_act[1]], optimize=True)
+            rhoa_r = numpy.einsum(
+                "xkp,kq->xkpq", moa_r, moa_r[0], optimize=True)
+            rhob_r = numpy.einsum(
+                "xkp,kq->xkpq", mob_r, mob_r[0], optimize=True)
+            rhoa_r[1:4] += numpy.einsum(
+                'rp,xrq->xrpq', moa_r[0], moa_r[1:4], optimize=True)
+            rhob_r[1:4] += numpy.einsum(
+                'rp,xrq->xrpq', mob_r[0], mob_r[1:4], optimize=True)
+            tau_a = numpy.einsum(
+                'xrp,xrq->rpq', moa_r[1:4], moa_r[1:4], optimize=True) * .5
+            tau_b = numpy.einsum(
+                'xrp,xrq->rpq', mob_r[1:4], mob_r[1:4], optimize=True) * .5
+            rhoa_r = numpy.vstack([rhoa_r, tau_a[numpy.newaxis]], optimize=True)
+            rhob_r = numpy.vstack([rhob_r, tau_b[numpy.newaxis]], optimize=True)
+            w_aa = numpy.einsum(
+                'xyr,xrpq->yrpq', wfxc[0,:,0], rhoa_r, optimized=True)
+            w_ab = numpy.einsum(
+                'xyr,xrpq->yrpq', wfxc[0,:,1], rhoa_r, optimized=True)
+            w_bb = numpy.einsum(
+                'xyr,xrpq->yrpq', wfxc[1,:,1], rhob_r, optimized=True)
+
+            fxcaa_mat += numpy.einsum(
+                'xrpq,xrmn->pqmn', w_aa, rhoa_r, optimized=True)
+
+            fxcbb_mat += numpy.einsum(
+                'xrpq,xrmn->pqmn', w_bb, rhob_r, optimized=True)
+
+            fxcab_mat += numpy.einsum(
+                'xrpq,xrmn->pqmn', w_ab, rhob_r, optimized=True)
+
+
+    omega, alpha, hyb = ni.rsh_and_hybrid_coeff(mf.xc, mf.mol.spin)
+    if hyb > 1e-10:
+        add_hf_x_(fxcaa_mat, fxcab_mat, fxcbb_mat, Lpq=Lpq, hyb=hyb)
+
+    stop_clock("getting fxc for molecule UppRPAw from PySCF")
+    return fxcaa_mat, fxcbb_mat, fxcab_mat
+
+
 def _is_int_or_none(x):
     # Accept plain ints (not bools) or None
     return x is None or (isinstance(x, int) and not isinstance(x, bool))
@@ -456,18 +930,20 @@ class UppRPAwDirect(UppRPA_direct):
         super().__init__(
             nocc, mo_energy, Lpq, hh_state=hh_state, pp_state=pp_state,
             nelec=nelec, print_thresh=print_thresh)
+        self.pf = False  # do spin-purification
         self.fxc = fxc
         self.w_mat = None
         self.use_rpa4 = use_rpa4.lower()
         self.with_screening = with_screening
         self.active = process_active_space(active)
+        return
 
     def get_K(self, use_rpa=False):
         kHxc = get_K(self.Lpq, fxc=self.fxc, rpa=use_rpa)
         return kHxc
 
     def get_M(self, kHxc=None, use_rpa=False):
-        if kHxc == None:
+        if kHxc is None:
             kHxc=self.get_K(use_rpa=use_rpa)
         return get_M(kHxc, self.mo_energy, self.nmo, self.nocc)
 
@@ -490,13 +966,22 @@ class UppRPAwDirect(UppRPA_direct):
                            no_screening=no_screening)
         return self.w_mat
 
+    def get_gsc2_mo_energy(self, mf, nocc_act, nvir_act):
+        if self.mu is None:
+            self.mu = get_chemical_potential(self.nocc, self.mo_energy)
+        if self.w_mat is None:
+            self.w_mat = self.get_W()
+        mo_energy = mo_energy_gsc2(mf, self.w_mat, nocc_act=nocc_act, nvir_act=nvir_act)
+        self.mo_energy = mo_energy
+        return mo_energy
+
     def check_parameter(self, gsc2_e=True, mf=None):
         assert 0.0 < self.print_thresh < 1.0
         assert self.nelec in ["n-2", "n+2"]
         if self.mu is None:
             self.mu = get_chemical_potential(nocc=self.nocc,
                                              mo_energy=self.mo_energy)
-        if self.w_mat == None:
+        if self.w_mat is None:
             self.w_mat = self.get_W()
         if gsc2_e:
             assert mf is not None
@@ -508,32 +993,53 @@ class UppRPAwDirect(UppRPA_direct):
         self.dump_flags()
         self.check_memory()
 
+        if self.pf is True:
+            kHxc = self.get_K()
+
         if 'aa' in subspace:
             start_clock("U-ppRPAw direct: (alpha alpha, alpha alpha)")
-            aa_exci, aa_xy, aa_ec = diagonalize_pprpa_subspace_same_spin(
-                self.nocc[0], self.mo_energy[0], self.w_mat[0], mu=self.mu,
-                active=self.active[0]
-            )
+            if self.pf is False:
+                aa_exci, aa_xy, aa_ec = diagonalize_pprpa_subspace_same_spin(
+                    self.nocc[0], self.mo_energy[0], self.w_mat[0], mu=self.mu,
+                    active=self.active[0]
+                )
+            else:
+                aa_exci, aa_xy, aa_ec = diagonalize_pprpa_subspace_same_spin(
+                    self.nocc[0], self.mo_energy[0], self.w_mat[0] - kHxc[0],
+                    mu=self.mu, active=self.active[0]
+                )
             stop_clock("U-ppRPAw direct: (alpha alpha, alpha alpha)")
         else:
             aa_exci = aa_xy = aa_ec = None
 
         if 'bb' in subspace:
             start_clock("U-ppRPAw direct: (beta beta, beta beta)")
-            bb_exci, bb_xy, bb_ec = diagonalize_pprpa_subspace_same_spin(
-                self.nocc[1], self.mo_energy[1], self.w_mat[1], mu=self.mu,
-                active=self.active[1]
-            )
+            if self.pf is False:
+                bb_exci, bb_xy, bb_ec = diagonalize_pprpa_subspace_same_spin(
+                    self.nocc[1], self.mo_energy[1], self.w_mat[1], mu=self.mu,
+                    active=self.active[1]
+                )
+            else:
+                bb_exci, bb_xy, bb_ec = diagonalize_pprpa_subspace_same_spin(
+                    self.nocc[1], self.mo_energy[1], self.w_mat[1] - kHxc[1],
+                    mu=self.mu, active=self.active[1]
+                )
             stop_clock("U-ppRPAw direct: (beta beta, beta beta)")
         else:
             bb_exci = bb_xy = bb_ec = None
 
         if 'ab' in subspace:
             start_clock("U-ppRPAw direct: (alpha beta, alpha beta)")
-            ab_exci, ab_xy, ab_ec = diagonalize_pprpa_subspace_diff_spin(
-                self.nocc, self.mo_energy, self.w_mat[2], mu=self.mu,
-                active=self.active
-            )
+            if self.pf is False:
+                ab_exci, ab_xy, ab_ec = diagonalize_pprpa_subspace_diff_spin(
+                    self.nocc, self.mo_energy, self.w_mat[2], mu=self.mu,
+                    active=self.active
+                )
+            else:
+                ab_exci, ab_xy, ab_ec = diagonalize_pprpa_subspace_singlet_pf(
+                    self.nocc, self.mo_energy, self.w_mat[0] - kHxc[0],
+                    self.w_mat[2] - kHxc[1], mu=self.mu,active=self.active
+                )
             stop_clock("U-ppRPAw direct: (alpha beta, alpha beta)")
         else:
             ab_exci = ab_xy = ab_ec = None
@@ -551,10 +1057,10 @@ class UppRPAwDirect(UppRPA_direct):
         act_alpha, act_beta = self.active
         nocc_act = [act_alpha[0], act_beta[0]]
         nvir_act = [act_alpha[1], act_beta[1]]
-        nocc_act[0] = nocc[0] if nocc_act[0] == None else min(nocc_act[0], nocc[0])
-        nocc_act[1] = nocc[1] if nocc_act[1] == None else min(nocc_act[1], nocc[1])
-        nvir_act[0] = nvir[0] if nvir_act[0] == None else min(nvir_act[0], nvir[0])
-        nvir_act[1] = nvir[1] if nvir_act[1] == None else min(nvir_act[1], nvir[1])
+        nocc_act[0] = nocc[0] if nocc_act[0] is None else min(nocc_act[0], nocc[0])
+        nocc_act[1] = nocc[1] if nocc_act[1] is None else min(nocc_act[1], nocc[1])
+        nvir_act[0] = nvir[0] if nvir_act[0] is None else min(nvir_act[0], nvir[0])
+        nvir_act[1] = nvir[1] if nvir_act[1] is None else min(nvir_act[1], nvir[1])
         nocc = nocc_act
         nvir = nvir_act
         nmo = [nocc[0] + nvir[0], nocc[1] + nvir[1]]
@@ -572,10 +1078,10 @@ class UppRPAwDirect(UppRPA_direct):
         act_alpha, act_beta = self.active
         nocc_act = [act_alpha[0], act_beta[0]]
         nvir_act = [act_alpha[1], act_beta[1]]
-        nocc_act[0] = nocc[0] if nocc_act[0] == None else min(nocc_act[0], nocc[0])
-        nocc_act[1] = nocc[1] if nocc_act[1] == None else min(nocc_act[1], nocc[1])
-        nvir_act[0] = nvir[0] if nvir_act[0] == None else min(nvir_act[0], nvir[0])
-        nvir_act[1] = nvir[1] if nvir_act[1] == None else min(nvir_act[1], nvir[1])
+        nocc_act[0] = nocc[0] if nocc_act[0] is None else min(nocc_act[0], nocc[0])
+        nocc_act[1] = nocc[1] if nocc_act[1] is None else min(nocc_act[1], nocc[1])
+        nvir_act[0] = nvir[0] if nvir_act[0] is None else min(nvir_act[0], nvir[0])
+        nvir_act[1] = nvir[1] if nvir_act[1] is None else min(nvir_act[1], nvir[1])
         nocc = nocc_act
         nvir = nvir_act
         nmo = [nocc[0] + nvir[0], nocc[1] + nvir[1]]
@@ -621,10 +1127,10 @@ class UppRPAwDirect(UppRPA_direct):
         act_alpha, act_beta = self.active
         nocc_act = [act_alpha[0], act_beta[0]]
         nvir_act = [act_alpha[1], act_beta[1]]
-        nocc_act[0] = nocc[0] if nocc_act[0] == None else min(nocc_act[0], nocc[0])
-        nocc_act[1] = nocc[1] if nocc_act[1] == None else min(nocc_act[1], nocc[1])
-        nvir_act[0] = nvir[0] if nvir_act[0] == None else min(nvir_act[0], nvir[0])
-        nvir_act[1] = nvir[1] if nvir_act[1] == None else min(nvir_act[1], nvir[1])
+        nocc_act[0] = nocc[0] if nocc_act[0] is None else min(nocc_act[0], nocc[0])
+        nocc_act[1] = nocc[1] if nocc_act[1] is None else min(nocc_act[1], nocc[1])
+        nvir_act[0] = nvir[0] if nvir_act[0] is None else min(nvir_act[0], nvir[0])
+        nvir_act[1] = nvir[1] if nvir_act[1] is None else min(nvir_act[1], nvir[1])
         nocc = nocc_act
         nvir = nvir_act
         # ====================> calculate dimensions <===================
