@@ -790,7 +790,8 @@ def get_pyscf_input_sc(
         naux = Lpq.shape[0]
 
     if dump_file is not None:
-        f = h5py.File(name="%s.h5" % dump_file, mode="w")
+        dump_file += ".h5" if not dump_file.endswith(".h5") else ""
+        f = h5py.File(name=dump_file, mode="w")
         f["nocc"] = numpy.asarray(nocc_act)
         f["mo_energy"] = numpy.asarray(mo_energy_act)
         f["Lpq"] = numpy.asarray(Lpq)
