@@ -717,7 +717,7 @@ def _pprpa_print_eigenvector(
     f_vals = np.array(f_vals)
     tdm_vals = np.array(tdm_vals)
     vees = np.array(vees) * au2ev
-    if len(f_vals) > 0 and np.sum(f_vals) > 0.0:
+    if (len(f_vals) > 1 and np.sum(f_vals) > 0.0) or (len(f_vals) == 1 and xy0_multi == multi):
         return tdm_vals, vees
     else:
         return None
