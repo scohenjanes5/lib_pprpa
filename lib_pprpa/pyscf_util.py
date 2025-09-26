@@ -97,6 +97,8 @@ def get_pyscf_input_mol_r(
 
     if with_dip:
         mo_dip = calculate_dipole_moment_MO(mf, nocc_act=nocc_act, nvir_act=nvir_act)
+    else:
+        mo_dip = None
 
     if cholesky is False:
         if getattr(mf, 'with_df', None):
@@ -150,13 +152,7 @@ def get_pyscf_input_mol_r(
         naux = Lpq.shape[0]
 
     if dump_file is not None:
-        f = h5py.File(name="%s.h5" % dump_file, mode="w")
-        f["nocc"] = numpy.asarray(nocc_act)
-        f["mo_energy"] = numpy.asarray(mo_energy_act)
-        f["Lpq"] = numpy.asarray(Lpq)
-        if with_dip:
-            f["mo_dipole"] = numpy.asarray(mo_dip)
-        f.close()
+        _write_dump_file(dump_file, nocc_act, mo_energy_act, Lpq, mo_dip=mo_dip)
 
     print("\nget input for lib_pprpa from PySCF (molecule)")
     print("nmo = %-d, nocc= %-d, nvir = %-d" % (nmo, nocc, nvir))
@@ -273,11 +269,7 @@ def get_pyscf_input_mol_u(
     Lpq = [Lpq_a, Lpq_b]
 
     if dump_file is not None:
-        f = h5py.File(name="%s.h5" % dump_file, mode="w")
-        f["nocc"] = numpy.asarray(nocc_act)
-        f["mo_energy"] = numpy.asarray(mo_energy_act)
-        f["Lpq"] = numpy.asarray(Lpq)
-        f.close()
+        _write_dump_file(dump_file, nocc_act, mo_energy_act, Lpq)
 
     print("\nget input for lib_pprpa from PySCF (molecule)")
     print("nmo = %-d (%-d alpha, %-d beta)" %
@@ -583,11 +575,7 @@ def get_pyscf_input_mol_g(
     Lpq = get_Lmo_ghf(mf, naux=naux, mo_coeff=mo_coeff, nocc_act=nocc_act, nvir_act=nvir_act)
 
     if dump_file is not None:
-        f = h5py.File(name='%s.h5' % dump_file, mode='w')
-        f['nocc'] = numpy.asarray(nocc_act)
-        f['mo_energy'] = numpy.asarray(mo_energy_act)
-        f['Lpq'] = numpy.asarray(Lpq)
-        f.close()
+        _write_dump_file(dump_file, nocc_act, mo_energy_act, Lpq)
 
     print('\nget input for lib_pprpa from PySCF (molecule)')
     print('nmo = %-d, nocc= %-d, nvir = %-d' % (nmo, nocc, nvir))
@@ -694,11 +682,7 @@ def get_pyscf_input_mol_frac(
     Lpq = [Lpq_a, Lpq_b]
 
     if dump_file is not None:
-        f = h5py.File(name="%s.h5" % dump_file, mode="w")
-        f["nocc"] = numpy.asarray(nocc_act)
-        f["mo_energy"] = numpy.asarray(mo_energy_act)
-        f["Lpq"] = numpy.asarray(Lpq)
-        f.close()
+        _write_dump_file(dump_file, nocc_act, mo_energy_act, Lpq)
 
     print("\nget input for lib_pprpa from PySCF (molecule)")
     print("nmo = %-d (%-d alpha, %-d beta)" %
@@ -769,6 +753,8 @@ def get_pyscf_input_sc(
 
     if with_dip:
         mo_dip = calculate_dipole_moment_MO(kmf, nocc_act=nocc_act, nvir_act=nvir_act)
+    else:
+        mo_dip = None
 
     if cholesky is False:
         Lpq = []
@@ -790,13 +776,7 @@ def get_pyscf_input_sc(
         naux = Lpq.shape[0]
 
     if dump_file is not None:
-        f = h5py.File(name="%s.h5" % dump_file, mode="w")
-        f["nocc"] = numpy.asarray(nocc_act)
-        f["mo_energy"] = numpy.asarray(mo_energy_act)
-        f["Lpq"] = numpy.asarray(Lpq)
-        if with_dip:
-            f["mo_dipole"] = numpy.asarray(mo_dip)
-        f.close()
+        _write_dump_file(dump_file, nocc_act, mo_energy_act, Lpq, mo_dip=mo_dip)
 
     print("\nget input for lib_pprpa from PySCF (supercell)")
     print("nmo = %-d, nocc= %-d, nvir = %-d" % (nmo, nocc, nvir))
@@ -1004,3 +984,16 @@ def create_frac_scf_object(mf, frac_spin, frac_orb, frac_occ):
         pyscf.scf.uhf.UHF.get_occ = get_occ
 
     return frac_mf
+
+def _write_dump_file(filename, nocc, mo_energy, Lpq, mo_dip=None):
+    """Write ppRPA inputs to a file.
+    see get_pyscf_input_mol_r for details about the inputs.
+    """
+    filename += ".h5" if not filename.endswith(".h5") else ""
+    with h5py.File(name=filename, mode="w") as f:
+        f["nocc"] = numpy.asarray(nocc)
+        f["mo_energy"] = numpy.asarray(mo_energy)
+        f["Lpq"] = numpy.asarray(Lpq)
+        if mo_dip is not None:
+            f["mo_dipole"] = numpy.asarray(mo_dip)
+    print("Saved h5py file = %-s" % filename)
