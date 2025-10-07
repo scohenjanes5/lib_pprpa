@@ -1,4 +1,4 @@
-from pyscf import gto, scf, dft
+from pyscf import gto, dft
 import numpy, pandas
 from lib_pprpa.pyscf_util import get_pyscf_input_mol
 from lib_pprpa.pprpa_davidson import ppRPA_Davidson
@@ -44,11 +44,11 @@ molecules = {
         ("H", [-16.817542056521784, -0.5072024918332626, -1.0869326723273323]),
         ("H", [-17.899107906655352, 1.8884978025840944, 1.1065102349778262]),
     ],
-    "NO2": [
-        ("N", [0.0, 0.0, 0.0]),
-        ("O", [-2.55727187806767, 0.0, 0.0]),
-        ("O", [2.55727187806767, 0.0, 0.0]),
-    ],
+    # "NO2": [
+    #     ("N", [0.0, 0.0, 0.0]),
+    #     ("O", [-2.55727187806767, 0.0, 0.0]),
+    #     ("O", [2.55727187806767, 0.0, 0.0]),
+    # ],
     "acetic_acid": [
         ("C", [0.06619710614351411, 0.13927281538044506, 0.09645162139780077]),
         ("C", [-2.6319160599879896, -0.7945353490733802, 0.019747638001704895]),
@@ -72,30 +72,53 @@ molecules = {
         ("H", [-3.5659698888380085, -0.9129266907773813, -1.6573276057660506]),
     ],
 }
-basis = "ccpvdz"
+basis = "631g*"
 
+
+def run_dft(geometry, charge=0):
+    spins = [0, 3]
+    energies = []
+    mfs = []
+    for spin in spins:
+        mol = gto.Mole()
+        mol.verbose = 0
+
+        mol.atom = geometry
+        mol.basis = basis
+        mol.charge = charge
+        try:
+            mol.spin = spin
+            mol.build()
+        except RuntimeError:
+            energies.append(numpy.inf)
+            mfs.append(None)
+            continue
+        
+        mf = dft.RKS(mol)
+        mf.xc = "B3LYP"
+        mf.kernel()
+        energies.append(mf.e_tot)
+        mfs.append(mf)
+
+    index_min = numpy.argmin(energies)
+    mf = mfs[index_min]
+    assert mf is not None
+    return mf
 
 def run_calc(geometry, channel="pp"):
-    mol = gto.Mole()
-    mol.verbose = 0
-
-    mol.atom = geometry
-
-    mol.basis = basis
+    
     if channel == "hh":
-        mol.charge = -2  # start from the N+2 electron system
+        charge = -2  # start from the N+2 electron system
     else:
-        mol.charge = 2  # start from the N-2 electron system
-    mol.build()
-    mf = dft.RKS(mol)
-    mf.xc = "B3LYP"
-    mf.kernel()
+        charge = 2  # start from the N-2 electron system
+    mf = run_dft(geometry, charge=charge)
 
     nocc, mo_energy, Lpq, mo_dip = get_pyscf_input_mol(mf, with_dip=True)
 
     pprpa = ppRPA_Davidson(
-        nocc, mf.mo_energy, Lpq, mo_dip=mo_dip, channel=channel, nroot=1
+        nocc, mo_energy, Lpq, mo_dip=mo_dip, channel=channel, nroot=1, trial="subspace"
     )
+    pprpa._use_Lov = True
     pprpa.kernel("s")
     pprpa.kernel("t")
     pprpa.analyze()
@@ -107,20 +130,13 @@ def run_calc(geometry, channel="pp"):
 
 
 def get_dips(key="water"):
-    mol = gto.Mole()
-    mol.verbose = 0
     geometry = molecules[key]
-    mol.atom = geometry
-    mol.basis = basis
-    mol.build()
-    mf = dft.RKS(mol)
-    mf.kernel()
-    dip = mf.dip_moment()
-    ref = numpy.linalg.norm(dip)
-
     dipolepp = run_calc(geometry, channel="pp")
     dipolehh = run_calc(geometry, channel="hh")
+    gs_mf = run_dft(geometry)
+    dip = gs_mf.dip_moment()
 
+    ref = numpy.linalg.norm(dip)
     pp = numpy.linalg.norm(dipolepp)
     hh = numpy.linalg.norm(dipolehh)
 
@@ -132,6 +148,7 @@ pps = []
 hhs = []
 names = []
 for k in molecules.keys():
+    print(f"*****Processing {k}*****")
     r, p, h = get_dips(k)
     refs.append(r)
     pps.append(p)
