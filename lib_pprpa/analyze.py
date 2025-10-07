@@ -286,7 +286,7 @@ def get_pprpa_oscillator_strength(
         trans_dip = -numpy.einsum("pj,qj,rpq->r", full0, full, ints_oo, optimize=True)
 
     if exci == exci0: # ground state
-        trans_dip += numpy.einsum("xy,xy,rpq->r", full0, full, ints_oo, optimize=True)
+        trans_dip += numpy.einsum("xy,xy,rpp->r", full0, full, ints_oo, optimize=True)
 
     # |<Psi_0|r|Psi_m>|^2
     f = 2.0 / 3.0 * (exci - exci0) * numpy.sum(trans_dip**2)
