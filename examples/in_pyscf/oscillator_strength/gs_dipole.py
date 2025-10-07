@@ -34,7 +34,7 @@ def run_calc(geometry, channel="pp"):
 
     nocc, mo_energy, Lpq, mo_dip = get_pyscf_input_mol(mf, with_dip=True)
 
-    pprpa = ppRPA_Davidson(nocc, mf.mo_energy, Lpq, mo_dip=mo_dip, channel=channel)
+    pprpa = ppRPA_Davidson(nocc, mf.mo_energy, Lpq, mo_dip=mo_dip, channel=channel, nroot=1)
     pprpa.kernel("s")
     pprpa.kernel("t")
     pprpa.analyze()
