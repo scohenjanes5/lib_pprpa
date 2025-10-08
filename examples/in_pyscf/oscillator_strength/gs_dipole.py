@@ -1,8 +1,8 @@
 from pyscf import gto, dft
-import numpy, pandas
-from lib_pprpa.pyscf_util import get_pyscf_input_mol
+import numpy, pandas, os
+from lib_pprpa.pyscf_util import get_pyscf_input_mol, read_dump_file
 from lib_pprpa.pprpa_davidson import ppRPA_Davidson
-
+from pyscf.lib import chkfile
 
 molecules = {
     "water": [
@@ -66,12 +66,17 @@ molecules = {
         ("H", [-3.5148716944297695, -0.7546810251063031, 1.69738979960683]),
         ("H", [-3.5659698888380085, -0.9129266907773813, -1.6573276057660506]),
     ],
+    "O2": [
+        ("O", [-1.3511541790640191, 0.0, 0.0]),
+        ("O", [1.3511541790640191, 0.0, 0.0]),
+    ],
 }
 basis = "631g*"
 
 
-def run_dft(geometry, charge=0):
-    spins = [0, 3]
+def run_dft(key, charge=0):
+    geometry = molecules[key]
+    spins = [0, 2]
     energies = []
     mfs = []
     for spin in spins:
@@ -87,28 +92,51 @@ def run_dft(geometry, charge=0):
         except RuntimeError:
             energies.append(numpy.inf)
             mfs.append(None)
+            print(
+                f"Failed to build molecule {key} with charge {charge} and spin {spin}"
+            )
             continue
-        
+
         mf = dft.RKS(mol)
         mf.xc = "B3LYP"
-        mf.kernel()
+        mf.chkfile = f"{key}_c{charge}_s{spin}.chk"
+        if os.path.isfile(mf.chkfile):
+            print(f"loading checkpoint data from {mf.chkfile}")
+            data = chkfile.load(mf.chkfile, "scf")
+            mf.__dict__.update(data)
+        else:
+            mf.kernel()
         energies.append(mf.e_tot)
         mfs.append(mf)
 
     index_min = numpy.argmin(energies)
     mf = mfs[index_min]
-    assert mf is not None
-    return mf
+    print(f"Gs spin of {key} with charge {charge} is {mf.mol.spin}")
+    if mf.mol.spin != 0 and charge != 0:
+        print(
+            f"Warning: The ground state of {key} is not a singlet, but a triplet state."
+        )
+        return None
+    return mfs[index_min]
 
-def run_calc(geometry, channel="pp"):
-    
+
+def run_calc(key, channel="pp"):
     if channel == "hh":
         charge = -2  # start from the N+2 electron system
     else:
         charge = 2  # start from the N-2 electron system
-    mf = run_dft(geometry, charge=charge)
+    mf = run_dft(key, charge=charge)
+    if mf is None:
+        return None, None
 
-    nocc, mo_energy, Lpq, mo_dip = get_pyscf_input_mol(mf, with_dip=True)
+    h5_file = f"{key}.h5"
+
+    if os.path.exists(h5_file):
+        nocc, mo_energy, Lpq, mo_dip = read_dump_file(h5_file, with_dip=True)
+    else:
+        nocc, mo_energy, Lpq, mo_dip = get_pyscf_input_mol(
+            mf, with_dip=True, dump_file=key
+        )
 
     pprpa = ppRPA_Davidson(
         nocc, mo_energy, Lpq, mo_dip=mo_dip, channel=channel, nroot=1, trial="subspace"
@@ -121,34 +149,50 @@ def run_calc(geometry, channel="pp"):
     tdms = pprpa.tdm
 
     dipole = tdms[0]
-    return dipole
+    return dipole, mf.mol.spin
 
 
 def get_dips(key="water"):
-    geometry = molecules[key]
-    dipolepp = run_calc(geometry, channel="pp")
-    dipolehh = run_calc(geometry, channel="hh")
-    gs_mf = run_dft(geometry)
-    dip = gs_mf.dip_moment()
+    dipolepp, spinpp = run_calc(key, channel="pp")
+    dipolehh, spinhh = run_calc(key, channel="hh")
+    mf_N = run_dft(key)
+    spin_gs = mf_N.mol.spin
 
-    ref = numpy.linalg.norm(dip)
-    pp = numpy.linalg.norm(dipolepp)
-    hh = numpy.linalg.norm(dipolehh)
+    dip = mf_N.dip_moment()
+    ref = numpy.linalg.norm(dip) if dip is not None else numpy.nan
+    pp = numpy.linalg.norm(dipolepp) if dipolepp is not None else numpy.nan
+    hh = numpy.linalg.norm(dipolehh) if dipolehh is not None else numpy.nan
 
-    return ref, pp, hh
+    return ref, spin_gs, pp, spinpp, hh, spinhh
 
 
 refs = []
 pps = []
 hhs = []
 names = []
+spin_Ns = []
+spin_Np2s = []
+spin_Nm2s = []
 for k in molecules.keys():
     print(f"*****Processing {k}*****")
-    r, p, h = get_dips(k)
+    r, N, p, Nm2, h, Np2 = get_dips(k)
     refs.append(r)
     pps.append(p)
     hhs.append(h)
+    spin_Ns.append(N)
+    spin_Nm2s.append(Nm2)
+    spin_Np2s.append(Np2)
 
-df = pandas.DataFrame({"Mol": molecules.keys(), "Ref": refs, "pp": pps, "hh": hhs})
+df = pandas.DataFrame(
+    {
+        "Mol": molecules.keys(),
+        "Ref": refs,
+        "pp": pps,
+        "hh": hhs,
+        "spin_N": spin_Ns,
+        "spin_Np2": spin_Np2s,
+        "spin_Nm2": spin_Nm2s,
+    }
+)
 print(df)
 df.to_csv("dip_results.csv")
