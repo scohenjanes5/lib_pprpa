@@ -95,8 +95,10 @@ def run_dft(key, charge=0):
     for spin in spins:
         mol = gto.Mole()
         mol.verbose = 0
-
+        # The geoms were obtained in dict form from ._atom of loaded xyz files.
+        # So coords are in Bohr
         mol.atom = geometry
+        mol.unit = "Bohr"
         mol.basis = basis
         mol.charge = charge
         try:
