@@ -182,31 +182,33 @@ def get_dips(key="water"):
 
 
 refs = []
-pps = []
-hhs = []
-names = []
+xxRPA = []
 spin_Ns = []
 spin_Np2s = []
 spin_Nm2s = []
+channels = []
 for k in molecules.keys():
     print(f"*****Processing {k}*****")
     r, N, p, Nm2, h, Np2 = get_dips(k)
     refs.append(r)
-    pps.append(p)
-    hhs.append(h)
-    spin_Ns.append(N)
-    spin_Nm2s.append(Nm2)
-    spin_Np2s.append(Np2)
+    xx_modes = {"pp": p, "hh": h}
+    xx_data = [v.round(4) for v in xx_modes.values() if v is not numpy.nan]
+    modes = [k for k, v in xx_modes.items() if v is not numpy.nan]
+    xxRPA.append(xx_data if len(xx_data) > 1 else xx_data[0])
+    channels.append(modes if len(modes) > 1 else modes[0])
+    # spin_Ns.append(N)
+    # spin_Nm2s.append(Nm2)
+    # spin_Np2s.append(Np2)
 
 df = pandas.DataFrame(
     {
         "Mol": molecules.keys(),
         "Ref": refs,
-        "pp": pps,
-        "hh": hhs,
-        "spin_N": spin_Ns,
-        "spin_Np2": spin_Np2s,
-        "spin_Nm2": spin_Nm2s,
+        "xxRPA": xxRPA,
+        "Channel": channels,
+        # "spin_N": spin_Ns,
+        # "spin_Np2": spin_Np2s,
+        # "spin_Nm2": spin_Nm2s,
     }
 )
 print(df.round(4))
