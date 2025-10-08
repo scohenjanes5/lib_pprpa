@@ -209,5 +209,5 @@ df = pandas.DataFrame(
         "spin_Nm2": spin_Nm2s,
     }
 )
-print(df)
+print(df.round(4))
 df.to_csv("dip_results.csv")
