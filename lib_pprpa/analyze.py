@@ -284,6 +284,8 @@ def get_pprpa_oscillator_strength(
         full, _ = get_xy_full(xy, oo_dim, mult=multi)
         full0, _ = get_xy_full(xy0, oo_dim, mult=multi)
         trans_dip = -numpy.einsum("pj,qj,rpq->r", full0, full, ints_oo, optimize=True)
+    else:
+        raise RuntimeError("channel must be pp or hh")
 
     if exci == exci0: # ground state
         trans_dip += numpy.einsum("xy,xy,rpp->r", full0, full, ints_oo, optimize=True)
