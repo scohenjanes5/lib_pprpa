@@ -1,4 +1,4 @@
-from pyscf import gto, dft
+from pyscf import gto, dft, scf
 import numpy, pandas, os
 from lib_pprpa.pyscf_util import get_pyscf_input_mol, read_dump_file
 from lib_pprpa.pprpa_davidson import ppRPA_Davidson
@@ -170,7 +170,7 @@ def run_calc(key, channel="pp"):
         charge = 2  # start from the N-2 electron system
     mf = run_dft(key, charge=charge)
     if mf is None:
-        return None, None
+        return None
 
     h5_file = f"{key}.h5"
 
@@ -190,53 +190,74 @@ def run_calc(key, channel="pp"):
     pprpa.analyze()
 
     tdms = pprpa.tdm
-
     dipole = tdms[0]
-    return dipole, mf.mol.spin
+    return dipole
+
+
+def run_HF(key, spin=0):
+    geometry = molecules[key]
+    mol = gto.Mole()
+    mol.verbose = 0
+    # The geoms were obtained in dict form from ._atom of loaded xyz files.
+    # So coords are in Bohr
+    mol.atom = geometry
+    mol.unit = "Bohr"
+    mol.basis = basis
+    mol.charge = 0
+    mol.spin = spin
+    mol.build()
+
+    mf = scf.RHF(mol)
+    mf.xc = "HF"
+    mf.chkfile = f"{key}_HF_s{spin}.chk"
+    if os.path.isfile(mf.chkfile):
+        print(f"loading checkpoint data from {mf.chkfile}")
+        data = chkfile.load(mf.chkfile, "scf")
+        mf.__dict__.update(data)
+    else:
+        mf.kernel()
+    print(f"HF spin of {key} is {mf.mol.spin}")
+    return mf.dip_moment(unit="AU")
 
 
 def get_dips(key="water"):
-    dipolepp, spinpp = run_calc(key, channel="pp")
-    dipolehh, spinhh = run_calc(key, channel="hh")
+    dipolepp = run_calc(key, channel="pp")
+    dipolehh = run_calc(key, channel="hh")
     mf_N = run_dft(key)
     spin_gs = mf_N.mol.spin
+    hf_dip = run_HF(key, spin=spin_gs)
 
     dip = mf_N.dip_moment(unit="AU")
     ref = numpy.linalg.norm(dip) if dip is not None else numpy.nan
     pp = numpy.linalg.norm(dipolepp) if dipolepp is not None else numpy.nan
     hh = numpy.linalg.norm(dipolehh) if dipolehh is not None else numpy.nan
+    hf = numpy.linalg.norm(hf_dip) if hf_dip is not None else numpy.nan
 
-    return ref, spin_gs, pp, spinpp, hh, spinhh
+    return ref, pp, hh, hf
 
 
 refs = []
+hf_results = []
 xxRPA = []
-spin_Ns = []
-spin_Np2s = []
-spin_Nm2s = []
 channels = []
 for k in molecules.keys():
     print(f"*****Processing {k}*****")
-    r, N, p, Nm2, h, Np2 = get_dips(k)
+    r, p, h, hf = get_dips(k)
     refs.append(r)
     xx_modes = {"pp": p, "hh": h}
     xx_data = [v.round(4) for v in xx_modes.values() if v is not numpy.nan]
     modes = [k for k, v in xx_modes.items() if v is not numpy.nan]
     xxRPA.append(xx_data if len(xx_data) > 1 else xx_data[0])
     channels.append(modes if len(modes) > 1 else modes[0])
-    # spin_Ns.append(N)
-    # spin_Nm2s.append(Nm2)
-    # spin_Np2s.append(Np2)
+    hf_results.append(hf)
 
 df = pandas.DataFrame(
     {
         "Mol": molecules.keys(),
-        "Ref": refs,
+        "B3LYP": refs,
+        "HF": hf_results,
         "xxRPA": xxRPA,
         "Channel": channels,
-        # "spin_N": spin_Ns,
-        # "spin_Np2": spin_Np2s,
-        # "spin_Nm2": spin_Nm2s,
     }
 )
 print(df.round(4))
