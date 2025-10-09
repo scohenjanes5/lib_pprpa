@@ -201,7 +201,7 @@ def get_dips(key="water"):
     mf_N = run_dft(key)
     spin_gs = mf_N.mol.spin
 
-    dip = mf_N.dip_moment()
+    dip = mf_N.dip_moment(unit="AU")
     ref = numpy.linalg.norm(dip) if dip is not None else numpy.nan
     pp = numpy.linalg.norm(dipolepp) if dipolepp is not None else numpy.nan
     hh = numpy.linalg.norm(dipolehh) if dipolehh is not None else numpy.nan
