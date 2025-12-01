@@ -102,7 +102,7 @@ def get_identity_trial_vector(pprpa, ntri):
         def __init__(self):
             self.p = -1
             self.q = -1
-            self.eig_sum = max_orb_sum
+            self.eig_sum = max_orb_sum if pprpa.channel == "pp" else -max_orb_sum
 
     pairs = []
     for r in range(ntri):
@@ -148,7 +148,7 @@ def get_identity_trial_vector(pprpa, ntri):
             tri_vec[r, pprpa.oo_dim + pq] = 1.0
             tri_vec_sig[r] = 1.0
     else:
-        # find hole-hole pairs with lowest orbital energy summation
+        # find hole-hole pairs with highest orbital energy summation
         for r in range(ntri):
             for p in range(pprpa.nocc-1, -1, -1):
                 for q in range(pprpa.nocc-1, p - is_singlet, -1):
@@ -158,7 +158,7 @@ def get_identity_trial_vector(pprpa, ntri):
                             valid = False
                             break
                     if (valid is True
-                        and (mo_energy[p] + mo_energy[q]) < pairs[r].eig_sum):
+                        and (mo_energy[p] + mo_energy[q]) > pairs[r].eig_sum):
                         pairs[r].p, pairs[r].q = q, p
                         pairs[r].eig_sum = mo_energy[p] + mo_energy[q]
 
