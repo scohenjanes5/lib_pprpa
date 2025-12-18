@@ -68,57 +68,60 @@ def pprpaobj(mf, channel, nocc=None, nvir=None, mo_eri=False):
     pprpa.mu = 0.0
     return pprpa
 
-def pprpa_energy(cell, xc, channel, mult, istate):
-    nroot = istate + 1
-    mf = cell.RKS(xc=xc)
+def pprpa_energy(cell):
+    mf = cell.RKS(xc="pbe")
     mf.exxdiv = None
     mf.conv_tol = 1e-12
     mf.kernel()
     e = mf.e_tot
 
-    mp = pprpaobj(mf, channel)
+    istate = 0
+    mult = 't'
+    nroot = 3
+    mp = pprpaobj(mf, "pp")
     mp.nroot = nroot
     mp.kernel(mult)
     mp.analyze()
     e_pprpa = mp.exci_s[istate] if mult == 's' else mp.exci_t[istate]
-    e = e + e_pprpa if channel == "pp" else e - e_pprpa
+    e = e + e_pprpa if mp.channel == "pp" else e - e_pprpa
     return e
 
-def pprpa_grad(cell, xc, channel, mult, istate):
-    from lib_pprpa.grad import pprpa_gamma
-    nroot = max(istate, 3)
-    mf = cell.RKS(xc=xc)
+def pprpa_grad(cell):
+    mf = cell.RKS(xc="pbe")
     mf.exxdiv = None
     mf.conv_tol = 1e-12
     mf.kernel()
     e = mf.e_tot
-    mp = pprpaobj(mf, channel)
+
+    istate = 0
+    mult = 't'
+    nroot = 3
+    mp = pprpaobj(mf, "pp")
     mp.nroot = nroot
     mp.kernel(mult)
     mp.analyze()
     e_pprpa = mp.exci_s[istate] if mult == 's' else mp.exci_t[istate]
-    e = e + e_pprpa if channel == "pp" else e - e_pprpa
+    e = e + e_pprpa if mp.channel == "pp" else e - e_pprpa
+    from lib_pprpa.grad import pprpa_gamma
     mpg = mp.Gradients(mf, mult, istate)
     mpg.kernel()
     return e, mpg.de
 
 
-class ppRPA(Calculator):
+class ASE_calculator(Calculator):
     implemented_properties = ['energy', 'forces']
 
     default_parameters = {}
 
-    def __init__(self, cell, xc, channel, mult, state, restart=None, label='ppRPA', atoms=None, directory='.',
+    def __init__(self, cell, grad_func, ene_func=None, restart=None, label='ase_tils', atoms=None, directory='.',
                  **kwargs):
-        """Construct ppRPA-calculator object.
+        """Construct calculator object.
         """
         Calculator.__init__(self, restart, label=label, atoms=atoms,
                             directory=directory, **kwargs)
         self.cell = cell
-        self.mult = mult
-        self.state = state
-        self.xc = xc
-        self.channel = channel
+        self.grad_func = grad_func
+        self.ene_func = ene_func
 
     def set(self, **kwargs):
         changed_parameters = Calculator.set(self, **kwargs)
@@ -143,20 +146,20 @@ class ppRPA(Calculator):
         with_energy = with_grad or 'energy' in properties
 
         if with_energy and with_grad:
-            e_tot, grad = pprpa_grad(self.cell, self.xc, self.channel, self.mult, self.state)
+            e_tot, grad = self.grad_func(self.cell)
             self.results['energy'] = e_tot * HARTREE2EV
             self.results['forces'] = -grad * (HARTREE2EV / BOHR)
         elif with_energy:
-            e_tot = pprpa_energy(self.cell, self.xc, self.channel, self.mult, self.state)
+            e_tot = self.ene_func(self.cell)
             self.results['energy'] = e_tot * HARTREE2EV
         else:
             raise NotImplementedError("Only energy and forces are implemented for ppRPA calculator.")
         
-def kernel(cell, xc, channel, mult, state, logfile=None, fmax=0.05, max_steps=100):
+def kernel(cell, grad_func, ene_func=None, logfile=None, fmax=0.05, max_steps=100):
     '''Optimize the geometry using ASE.
     '''
     atoms = pyscf_to_ase_atoms(cell)
-    atoms.calc = ppRPA(cell, xc, channel, mult, state)
+    atoms.calc = ASE_calculator(cell, grad_func=grad_func, ene_func=ene_func)
     if logfile is None:
         logfile = '-' # stdout
 
