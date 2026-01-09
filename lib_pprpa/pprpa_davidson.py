@@ -9,7 +9,8 @@ from lib_pprpa.pprpa_direct import pprpa_orthonormalize_eigenvector, \
 
 from lib_pprpa.pprpa_util import ij2index, inner_product, start_clock, \
     stop_clock, print_citation, get_chemical_potential, PPRPAIntermediates, \
-    verify_checkpoint_compatibility
+    verify_checkpoint_compatibility, int2ordinal
+
 
 def kernel(pprpa):
     # initialize trial vector and product matrix
@@ -57,8 +58,8 @@ def kernel(pprpa):
     iter = 0
     while iter < pprpa.max_iter:
         print(
-            "\nppRPA Davidson %d-th iteration, ntri= %d , nprod= %d ." %
-            (iter + 1, ntri, nprod), flush=True)
+            "\nppRPA Davidson %s iteration, ntri= %d , nprod= %d ." %
+            (int2ordinal(iter + 1), ntri, nprod), flush=True)
         mv_prod[nprod:ntri] = pprpa.contraction(tri_vec=tri_vec[nprod:ntri])
         nprod = ntri
 
