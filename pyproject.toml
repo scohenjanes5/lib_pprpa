@@ -10,7 +10,7 @@ readme = "README.md"
 authors = [{ name = "Jiachen Li", email = "jiachen.li@yale.edu" }]
 urls = { "Homepage" = "https://github.com/lijiachen417/lib_pprpa" }
 dependencies = [
-  "numpy",
+  "numpy<=2.3",
   "h5py",
   "scipy",
   "pyscf",
