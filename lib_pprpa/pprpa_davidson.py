@@ -24,6 +24,7 @@ def kernel(pprpa):
             data_type = pprpa.Lpq.dtype
 
     # gpprpa_davidson does not have checkpoint_file attribute, but uses this kernel
+    normal_setup = True
     if hasattr(pprpa, "checkpoint_file"):
         if pprpa.checkpoint_file is not None and Path(pprpa.checkpoint_file).exists():
             checkpoint_data = pprpa._load_pprpa_checkpoint()
@@ -32,7 +33,9 @@ def kernel(pprpa):
             mv_prod = checkpoint_data.mv_prod
             ntri = checkpoint_data.ntri
             nprod = checkpoint_data.nprod
-    else:
+            normal_setup = False
+
+    if normal_setup:
         # the maximum size is max_vec + nroot for compacting
         tri_size = pprpa.max_vec + pprpa.nroot
         tri_vec = np.zeros(
