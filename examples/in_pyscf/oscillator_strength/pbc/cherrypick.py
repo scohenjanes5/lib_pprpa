@@ -1,6 +1,7 @@
 import numpy as np
 from argparse import ArgumentParser, ArgumentTypeError
 from lib_pprpa.pprpa_util import generate_spectrum
+from pyscf.data.nist import HARTREE2EV
 import re, os
 
 """This script is useful if you have excitations from both the pp and hh
@@ -116,7 +117,7 @@ for f in files:
     energies = energies[idxs]
     tdms = tdms[idxs]
     tdm_res.append(tdms)
-    e_Hartree = energies / 27.211386
+    e_Hartree = energies / HARTREE2EV
     f = 2/3 * e_Hartree * np.sum(tdms**2, axis=1)
 
     results.append(np.array((energies, f)))

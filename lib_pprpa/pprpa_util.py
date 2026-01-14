@@ -1,4 +1,5 @@
 import numpy
+from pyscf.data.nist import HARTREE2EV
 import time
 from typing import List, Tuple
 
@@ -367,9 +368,8 @@ def generate_spectrum(
         Tuple[numpy.ndarray, numpy.ndarray]: Energy axis (x) and absorption spectrum (y)
     """
 
-    #import scipy.constants as sp
-    #ev2ry=sp.e / sp.m_e / sp.e**4 * (8.0 * sp.epsilon_0**2 * sp.h**2) # 0.0734985857 Ry / eV
-    ev2ry = 0.0734985857 # Ry / eV units
+    # Convert eV to Rydberg using pyscf constant: 1 Ry = 0.5 Hartree
+    ev2ry = 2.0 / HARTREE2EV  # Ry / eV units
 
     # Validate inputs
     valid_ipols = ["XX", "XY", "XZ", "YX", "YY", "YZ", "ZX", "ZY", "ZZ", "XYZ"]

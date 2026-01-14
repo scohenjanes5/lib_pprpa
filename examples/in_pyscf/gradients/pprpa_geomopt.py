@@ -6,6 +6,7 @@ berny_solver.
 import numpy as np
 from pyscf import gto, scf, dft
 from pyscf.geomopt import berny_solver, as_pyscf_method
+from pyscf.data.nist import BOHR
 from lib_pprpa.pyscf_util import get_pyscf_input_mol
 from lib_pprpa.pprpa_davidson import ppRPA_Davidson
 from lib_pprpa.grad import pprpa as ppRPA_grad
@@ -83,7 +84,7 @@ print(new_mol.atom_coords())
 oh1 = new_mol.atom_coords()[1] - new_mol.atom_coords()[0]
 oh2 = new_mol.atom_coords()[2] - new_mol.atom_coords()[0]
 print('OH bond lengths (Angstrom)')
-print(np.linalg.norm(oh1) / 1.8897259886)
-print(np.linalg.norm(oh2) / 1.8897259886)
+print(np.linalg.norm(oh1) * BOHR)
+print(np.linalg.norm(oh2) * BOHR)
 print('Bond angle (degree)')
 print(np.arccos(np.dot(oh1, oh2) / np.linalg.norm(oh1) / np.linalg.norm(oh2)) * 180 / np.pi)
