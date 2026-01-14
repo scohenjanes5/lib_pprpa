@@ -107,14 +107,14 @@ def _pprpa_print_eigenvector(
     tri_row_v, tri_col_v = np.tril_indices(nvir, -1)
 
     nroot = len(exci)
-    au2ev = 27.211386
+    from pyscf.data.nist import HARTREE2EV
     from lib_pprpa.gpprpa_direct import complex_matrix_norm
     from lib_pprpa.pprpa_davidson import pprpa_print_a_pair
     if channel == "pp":
         for iroot in range(nroot):
             print("#%-d excitation:  exci= %-12.6f  eV   2e=  %-12.6f  eV" %
                   (iroot + 1,
-                   (exci[iroot] - exci0) * au2ev, exci[iroot] * au2ev))
+                   (exci[iroot] - exci0) * HARTREE2EV, exci[iroot] * HARTREE2EV))
             if nocc > 0:
                 full = np.zeros(shape=[nocc, nocc], dtype=xy.dtype)
                 full[tri_row_o, tri_col_o] = xy[iroot][:oo_dim]
@@ -136,7 +136,7 @@ def _pprpa_print_eigenvector(
         for iroot in range(nroot):
             print("#%-d de-excitation:  exci= %-12.6f  eV   2e=  %-12.6f  eV" %
                   (iroot + 1,
-                   (exci[iroot] - exci0) * au2ev, exci[iroot] * au2ev))
+                   (exci[iroot] - exci0) * HARTREE2EV, exci[iroot] * HARTREE2EV))
             full = np.zeros(shape=[nocc, nocc], dtype=xy.dtype)
             full[tri_row_o, tri_col_o] = xy[iroot][:oo_dim]
             full = complex_matrix_norm(full)

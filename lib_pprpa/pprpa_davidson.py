@@ -645,7 +645,7 @@ def _pprpa_print_eigenvector(
     tri_row_v, tri_col_v = np.tril_indices(nvir, is_singlet-1)
 
     nroot = len(exci)
-    au2ev = 27.211386
+    from pyscf.data.nist import HARTREE2EV
     f_vals = []
     tdm_vals = []
     vees = []
@@ -655,7 +655,7 @@ def _pprpa_print_eigenvector(
             vee = exci[iroot] - exci0
             print("#%-d %s excitation:  exci= %-12.6f  eV   2e=  %-12.6f  eV" %
                   (iroot + 1, multi,
-                   vee * au2ev, exci[iroot] * au2ev))
+                   vee * HARTREE2EV, exci[iroot] * HARTREE2EV))
             if mo_dip is not None:
                 f, tdm = get_pprpa_oscillator_strength(
                     nocc=nocc, mo_dip=mo_dip, channel=channel,
@@ -687,7 +687,7 @@ def _pprpa_print_eigenvector(
             vee = exci[iroot] - exci0
             print("#%-d %s de-excitation:  exci= %-12.6f  eV   2e=  %-12.6f  eV" %
                   (iroot + 1, multi,
-                   vee * au2ev, exci[iroot] * au2ev))
+                   vee * HARTREE2EV, exci[iroot] * HARTREE2EV))
             if mo_dip is not None:
                 f, tdm = get_pprpa_oscillator_strength(
                     nocc=nocc, mo_dip=mo_dip, channel=channel,
@@ -716,7 +716,7 @@ def _pprpa_print_eigenvector(
 
     f_vals = np.array(f_vals)
     tdm_vals = np.array(tdm_vals)
-    vees = np.array(vees) * au2ev
+    vees = np.array(vees) * HARTREE2EV
     if len(f_vals) > 0 and np.sum(f_vals) > 0.0:
         return tdm_vals, vees
     else:
