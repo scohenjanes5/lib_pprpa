@@ -201,13 +201,13 @@ def _pprpa_print_eigenvector(subspace, nocc, nvir, nocc_fro, thresh, hh_state,
         tri_row_o, tri_col_o = numpy.tril_indices(nocc, -1)
         tri_row_v, tri_col_v = numpy.tril_indices(nvir, -1)
 
-    au2ev = 27.211386
+    from pyscf.data.nist import HARTREE2EV
 
     # =====================> two-electron removal <======================
     for istate in range(min(hh_state, oo_dim)):
         print("#%-d %s de-excitation:  exci= %-12.6f  eV   2e=  %-12.6f  eV" %
-              (istate + 1, subspace[:2], (exci[oo_dim-istate-1] - exci0) * au2ev,
-               exci[oo_dim-istate-1] * au2ev))
+              (istate + 1, subspace[:2], (exci[oo_dim-istate-1] - exci0) * HARTREE2EV,
+               exci[oo_dim-istate-1] * HARTREE2EV))
         if subspace == 'aaaa' or subspace == 'bbbb':
             full = numpy.zeros(shape=[nocc, nocc], dtype=numpy.double)
             full[tri_row_o, tri_col_o] = xy[oo_dim-istate-1][:oo_dim]
@@ -244,8 +244,8 @@ def _pprpa_print_eigenvector(subspace, nocc, nvir, nocc_fro, thresh, hh_state,
     # =====================> two-electron addition <=====================
     for istate in range(min(pp_state, vv_dim)):
         print("#%-d %s excitation:  exci= %-12.6f  eV   2e=  %-12.6f  eV" %
-              (istate + 1, subspace[:2], (exci[oo_dim+istate] - exci0) * au2ev,
-               exci[oo_dim+istate] * au2ev))
+              (istate + 1, subspace[:2], (exci[oo_dim+istate] - exci0) * HARTREE2EV,
+               exci[oo_dim+istate] * HARTREE2EV))
         if subspace == 'aaaa' or subspace == 'bbbb':
             full = numpy.zeros(shape=[nocc, nocc], dtype=numpy.double)
             full[tri_row_o, tri_col_o] = xy[oo_dim+istate][:oo_dim]
