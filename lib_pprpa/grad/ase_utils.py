@@ -38,7 +38,7 @@ from pyscf.gto.mole import charge
 from pyscf.pbc.tools.pyscf_ase import pyscf_to_ase_atoms
 from lib_pprpa.pprpa_davidson import ppRPA_Davidson
 
-def pprpaobj(mf, channel, nocc=None, nvir=None, mo_eri=False):
+def pprpaobj(mf, channel, nocc=None, nvir=None, mo_eri=False, nroot=1):
     mo_ene = mf.mo_energy
     mol = mf.mol
     if nocc is None:
@@ -49,7 +49,7 @@ def pprpaobj(mf, channel, nocc=None, nvir=None, mo_eri=False):
     mo_energy = mo_ene[mol.nelectron//2 - nocc:mol.nelectron//2 + nvir]
     mo_coeff = mf.mo_coeff[:,mol.nelectron//2 - nocc:mol.nelectron//2 + nvir]
     
-    pprpa = ppRPA_Davidson(nocc, mo_energy, Lpq=None, channel=channel, nroot=1, residue_thresh=1e-12)
+    pprpa = ppRPA_Davidson(nocc, mo_energy, Lpq=None, channel=channel, nroot=nroot, residue_thresh=1e-12)
     pprpa.cell = mol
 
     # One can use either the MO eri or the ao direct approach.
@@ -68,40 +68,29 @@ def pprpaobj(mf, channel, nocc=None, nvir=None, mo_eri=False):
     pprpa.mu = 0.0
     return pprpa
 
-def pprpa_energy(cell):
-    mf = cell.RKS(xc="pbe")
+def pprpa_energy(cell, with_extras=False, **kwargs):
+    mf = cell.RKS(xc=kwargs.get("xc", "pbe"))
     mf.exxdiv = None
-    mf.conv_tol = 1e-12
+    mf.conv_tol = kwargs.get("conv_tol", 1e-8)
     mf.kernel()
     e = mf.e_tot
 
-    istate = 0
-    mult = 't'
-    nroot = 3
-    mp = pprpaobj(mf, "pp")
-    mp.nroot = nroot
+    istate = kwargs.get("istate", 0)
+    mult = kwargs.get("mult", "t")
+    nroot = kwargs.get("nroot", 3)
+    channel = kwargs.get("channel", "pp")
+    mo_eri = kwargs.get("mo_eri", False)
+    mp = pprpaobj(mf, channel=channel, mo_eri=mo_eri, nroot=nroot)
     mp.kernel(mult)
     mp.analyze()
     e_pprpa = mp.exci_s[istate] if mult == 's' else mp.exci_t[istate]
     e = e + e_pprpa if mp.channel == "pp" else e - e_pprpa
+    if with_extras:
+        return e, mp, mf, mult, istate
     return e
 
-def pprpa_grad(cell):
-    mf = cell.RKS(xc="pbe")
-    mf.exxdiv = None
-    mf.conv_tol = 1e-12
-    mf.kernel()
-    e = mf.e_tot
-
-    istate = 0
-    mult = 't'
-    nroot = 3
-    mp = pprpaobj(mf, "pp")
-    mp.nroot = nroot
-    mp.kernel(mult)
-    mp.analyze()
-    e_pprpa = mp.exci_s[istate] if mult == 's' else mp.exci_t[istate]
-    e = e + e_pprpa if mp.channel == "pp" else e - e_pprpa
+def pprpa_grad(cell, **kwargs):
+    e, mp, mf, mult, istate = pprpa_energy(cell, with_extras=True, **kwargs)
     from lib_pprpa.grad import pprpa_gamma
     mpg = mp.Gradients(mf, mult, istate)
     mpg.kernel()
@@ -122,6 +111,7 @@ class ASE_calculator(Calculator):
         self.cell = cell
         self.grad_func = grad_func
         self.ene_func = ene_func
+        self.kwargs = kwargs
 
     def set(self, **kwargs):
         changed_parameters = Calculator.set(self, **kwargs)
@@ -146,20 +136,20 @@ class ASE_calculator(Calculator):
         with_energy = with_grad or 'energy' in properties
 
         if with_energy and with_grad:
-            e_tot, grad = self.grad_func(self.cell)
+            e_tot, grad = self.grad_func(self.cell, **self.kwargs)
             self.results['energy'] = e_tot * HARTREE2EV
             self.results['forces'] = -grad * (HARTREE2EV / BOHR)
         elif with_energy:
-            e_tot = self.ene_func(self.cell)
+            e_tot = self.ene_func(self.cell, **self.kwargs)
             self.results['energy'] = e_tot * HARTREE2EV
         else:
             raise NotImplementedError("Only energy and forces are implemented for ppRPA calculator.")
         
-def kernel(cell, grad_func, ene_func=None, logfile=None, fmax=0.05, max_steps=100):
+def kernel(cell, grad_func, ene_func=None, logfile=None, fmax=0.05, max_steps=100, **kwargs):
     '''Optimize the geometry using ASE.
     '''
     atoms = pyscf_to_ase_atoms(cell)
-    atoms.calc = ASE_calculator(cell, grad_func=grad_func, ene_func=ene_func)
+    atoms.calc = ASE_calculator(cell, grad_func=grad_func, ene_func=ene_func, **kwargs)
     if logfile is None:
         logfile = '-' # stdout
 
