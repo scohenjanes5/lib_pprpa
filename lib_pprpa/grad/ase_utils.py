@@ -38,16 +38,20 @@ from pyscf.gto.mole import charge
 from pyscf.pbc.tools.pyscf_ase import pyscf_to_ase_atoms
 from lib_pprpa.pprpa_davidson import ppRPA_Davidson
 
-def pprpaobj(mf, channel, nocc=None, nvir=None, mo_eri=False, nroot=1, checkpoint=None):
-    mo_ene = mf.mo_energy
+def pprpaobj(mf, channel, nocc=None, nvir=None, mo_eri=False, nroot=1, AS_size=None, checkpoint=None):
     mol = mf.mol
+    mo_ene = mf.mo_energy
     if nocc is None:
         nocc = mol.nelectron // 2
     if nvir is None:
         nvir = mo_ene.shape[0] - nocc
     nmo = nocc + nvir
-    mo_energy = mo_ene[mol.nelectron//2 - nocc:mol.nelectron//2 + nvir]
-    mo_coeff = mf.mo_coeff[:,mol.nelectron//2 - nocc:mol.nelectron//2 + nvir]
+    mo_energy = mo_ene[mol.nelectron // 2 - nocc:mol.nelectron // 2 + nvir]
+    mo_coeff = mf.mo_coeff[:, mol.nelectron // 2 - nocc:mol.nelectron // 2 + nvir]
+
+    if AS_size is not None:
+        from lib_pprpa.pyscf_util import get_pyscf_input_sc
+        nocc, mo_energy, _ = get_pyscf_input_sc(mf, nocc_act=AS_size, nvir_act=AS_size, cholesky=True)
     
     pprpa = ppRPA_Davidson(nocc, mo_energy, Lpq=None, channel=channel, nroot=nroot, residue_thresh=1e-12, checkpoint_file=checkpoint)
     pprpa.cell = mol
@@ -81,7 +85,8 @@ def pprpa_energy(cell, with_extras=False, **kwargs):
     channel = kwargs.get("channel", "pp")
     mo_eri = kwargs.get("mo_eri", False)
     checkpoint = kwargs.get("checkpoint", None)
-    mp = pprpaobj(mf, channel=channel, mo_eri=mo_eri, nroot=nroot, checkpoint=checkpoint)
+    AS_size = kwargs.get("AS_size", None)
+    mp = pprpaobj(mf, channel, mo_eri=mo_eri, nroot=nroot, checkpoint=checkpoint, AS_size=AS_size)
     mp.kernel(mult)
     mp.analyze()
     e_pprpa = mp.exci_s[istate] if mult == 's' else mp.exci_t[istate]
