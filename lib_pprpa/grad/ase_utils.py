@@ -61,9 +61,9 @@ def pprpaobj(mf, channel, nocc=None, nvir=None, mo_eri=False, nroot=1, AS_size=N
     if mo_eri:
         eri = mf.with_df.get_mo_eri(mo_coeff, compact=False)
         eri = eri.reshape(nmo, nmo, nmo, nmo).transpose(0, 2, 1, 3)
-        vvvv = np.ascontiguousarray(eri[nocc:, nocc:, nocc:, nocc:])
-        oovv = np.ascontiguousarray(eri[:nocc, :nocc, nocc:, nocc:])
-        oooo = np.ascontiguousarray(eri[:nocc, :nocc, :nocc, :nocc])
+        vvvv = eri[nocc:, nocc:, nocc:, nocc:]
+        oovv = eri[:nocc, :nocc, nocc:, nocc:]
+        oooo = eri[:nocc, :nocc, :nocc, :nocc]
         pprpa.use_eri(vvvv, oovv, oooo)
     else:
         pprpa._ao_direct = True
