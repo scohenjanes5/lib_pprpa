@@ -49,9 +49,19 @@ def pprpaobj(mf, channel, nocc=None, nvir=None, mo_eri=False, nroot=1, AS_size=N
     mo_energy = mo_ene[mol.nelectron // 2 - nocc:mol.nelectron // 2 + nvir]
     mo_coeff = mf.mo_coeff[:, mol.nelectron // 2 - nocc:mol.nelectron // 2 + nvir]
 
+    nocc_act = nocc if AS_size is None else min(nocc, AS_size)
+    nvir_act = nvir if AS_size is None else min(nvir, AS_size)
+
     if AS_size is not None:
         from lib_pprpa.pyscf_util import get_pyscf_input_sc
-        nocc, mo_energy, _ = get_pyscf_input_sc(mf, nocc_act=AS_size, nvir_act=AS_size, cholesky=True)
+        v = nocc + nvir_act
+        o = nocc - nocc_act
+        m = nocc
+        nocc, mo_energy, _ = get_pyscf_input_sc(mf, nocc_act=nocc_act, nvir_act=nvir_act, cholesky=True)
+    else:
+        v = nmo
+        o = 0
+        m = nocc
     
     pprpa = ppRPA_Davidson(nocc, mo_energy, Lpq=None, channel=channel, nroot=nroot, residue_thresh=1e-12, checkpoint_file=checkpoint)
     pprpa.cell = mol
@@ -61,9 +71,9 @@ def pprpaobj(mf, channel, nocc=None, nvir=None, mo_eri=False, nroot=1, AS_size=N
     if mo_eri:
         eri = mf.with_df.get_mo_eri(mo_coeff, compact=False)
         eri = eri.reshape(nmo, nmo, nmo, nmo).transpose(0, 2, 1, 3)
-        vvvv = eri[nocc:, nocc:, nocc:, nocc:]
-        oovv = eri[:nocc, :nocc, nocc:, nocc:]
-        oooo = eri[:nocc, :nocc, :nocc, :nocc]
+        vvvv = eri[m:v, m:v, m:v, m:v]
+        oovv = eri[o:m, o:m, m:v, m:v]
+        oooo = eri[o:m, o:m, o:m, o:m]
         pprpa.use_eri(vvvv, oovv, oooo)
     else:
         pprpa._ao_direct = True
