@@ -86,6 +86,8 @@ def pprpa_energy(cell, with_extras=False, **kwargs):
     mf = cell.RKS(xc=kwargs.get("xc", "pbe"))
     mf.exxdiv = None
     mf.conv_tol = kwargs.get("conv_tol", 1e-8)
+    mf.chkfile = kwargs.get("chkfile", None)
+    mf.init_guess = "chk" if mf.chkfile is not None else "minao"
     mf.kernel()
     e = mf.e_tot
 
