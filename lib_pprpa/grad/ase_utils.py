@@ -52,7 +52,7 @@ def pprpaobj(mf, channel, nocc=None, nvir=None, mo_eri=False, nroot=1, AS_size=N
     nocc_act = nocc if AS_size is None else min(nocc, AS_size)
     nvir_act = nvir if AS_size is None else min(nvir, AS_size)
 
-    if AS_size is not None:
+    if AS_size is not None and (AS_size < nocc or AS_size < nvir):
         from lib_pprpa.pyscf_util import get_pyscf_input_sc
         v = nocc + nvir_act
         o = nocc - nocc_act
