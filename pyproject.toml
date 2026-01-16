@@ -23,6 +23,7 @@ classifiers = [
 
 [project.optional-dependencies]
 ase = ["ase"]
+socutils = ["socutils"]
 
 [tool.setuptools.packages.find]
 where = ["."]
