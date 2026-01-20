@@ -1,7 +1,6 @@
 import numpy
 import time
 from typing import List, Tuple
-from dataclasses import dataclass
 
 
 def ij2index(r, c, row, col):
@@ -470,37 +469,3 @@ def int2ordinal(num: int):
     q, mod = divmod(num, 10)
     suffix = q % 10 != 1 and ordinal_dict.get(mod) or "th"
     return f"{num}{suffix}"
-
-@dataclass
-class PPRPAIntermediates:
-    """Container for the ppRPA intermediates."""
-    nocc: int
-    nvir: int
-    # _use_eri: bool
-    # _ao_direct: bool
-    _use_Lov: bool
-    nroot: int
-    max_vec: int
-    conv: bool
-    ntri: int
-    multi: str
-    channel: str
-    trial: str
-    tri_vec: numpy.ndarray
-    tri_vec_sig: numpy.ndarray
-
-def verify_checkpoint_compatibility(pprpa, checkpoint_data: PPRPAIntermediates):
-    """Verify that the checkpoint data is compatible with the ppRPA instance.
-    
-    Args:
-        pprpa (PPRPA): The ppRPA instance.
-        checkpoint_data (PPRPAIntermediates): The checkpoint data.
-    
-    Note: some of the data does not need to match because it isn't set in the ppRPA instance yet
-    """
-    assert pprpa.nocc == checkpoint_data.nocc
-    assert pprpa.nvir == checkpoint_data.nvir
-    # assert pprpa._use_eri == checkpoint_data._use_eri
-    # assert pprpa._ao_direct == checkpoint_data._ao_direct
-    assert pprpa._use_Lov == checkpoint_data._use_Lov
-    assert pprpa.channel == checkpoint_data.channel

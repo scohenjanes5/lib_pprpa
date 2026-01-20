@@ -2,14 +2,14 @@ import h5py
 import numpy as np
 import scipy
 from pathlib import Path
+from dataclasses import dataclass
 
 from lib_pprpa.analyze import pprpa_print_a_pair, get_pprpa_oscillator_strength
 from lib_pprpa.pprpa_direct import pprpa_orthonormalize_eigenvector, \
     diagonalize_pprpa_singlet, diagonalize_pprpa_triplet
 
 from lib_pprpa.pprpa_util import ij2index, inner_product, start_clock, \
-    stop_clock, print_citation, get_chemical_potential, int2ordinal, \
-    PPRPAIntermediates, verify_checkpoint_compatibility
+    stop_clock, print_citation, get_chemical_potential, int2ordinal
 
 def kernel(pprpa):
     # initialize trial vector and product matrix
@@ -784,6 +784,39 @@ def _analyze_pprpa_davidson(
 
     return res # either None or (tdm, vee)
 
+@dataclass
+class PPRPAIntermediates:
+    """Container for the Davidson algorithm intermediates."""
+    nocc: int
+    nvir: int
+    # _use_eri: bool
+    # _ao_direct: bool
+    _use_Lov: bool
+    nroot: int
+    max_vec: int
+    conv: bool
+    ntri: int
+    multi: str
+    channel: str
+    trial: str
+    tri_vec: np.ndarray
+    tri_vec_sig: np.ndarray
+
+def verify_checkpoint_compatibility(pprpa, checkpoint_data: PPRPAIntermediates):
+    """Verify that the checkpoint data is compatible with the ppRPA instance.
+    
+    Args:
+        pprpa (PPRPA): The ppRPA instance.
+        checkpoint_data (PPRPAIntermediates): The checkpoint data.
+    
+    Note: some of the data does not need to match because it isn't set in the ppRPA instance yet
+    """
+    assert pprpa.nocc == checkpoint_data.nocc
+    assert pprpa.nvir == checkpoint_data.nvir
+    # assert pprpa._use_eri == checkpoint_data._use_eri
+    # assert pprpa._ao_direct == checkpoint_data._ao_direct
+    assert pprpa._use_Lov == checkpoint_data._use_Lov
+    assert pprpa.channel == checkpoint_data.channel
 
 class ppRPA_Davidson():
     def __init__(
