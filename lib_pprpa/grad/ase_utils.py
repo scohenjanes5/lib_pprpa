@@ -38,7 +38,7 @@ from pyscf.gto.mole import charge
 from pyscf.pbc.tools.pyscf_ase import pyscf_to_ase_atoms
 from lib_pprpa.pprpa_davidson import ppRPA_Davidson
 
-def pprpaobj(mf, channel, nocc=None, nvir=None, mo_eri=False, nroot=1, AS_size=None, checkpoint=None):
+def pprpaobj(mf, channel, nocc=None, nvir=None, mo_eri=False, nroot=1, AS_size=None, checkpoint=None, max_mem=None):
     mol = mf.mol
     mo_ene = mf.mo_energy
     if nocc is None:
@@ -69,6 +69,8 @@ def pprpaobj(mf, channel, nocc=None, nvir=None, mo_eri=False, nroot=1, AS_size=N
     # One can use either the MO eri or the ao direct approach.
     # For small active spaces, MO eri should be faster.
     if mo_eri:
+        if max_mem is not None:
+            mf.with_df.max_memory = max_mem
         eri = mf.with_df.get_mo_eri(mo_coeff, compact=False)
         eri = eri.reshape(nmo, nmo, nmo, nmo).transpose(0, 2, 1, 3)
         vvvv = eri[m:v, m:v, m:v, m:v]
@@ -98,7 +100,8 @@ def pprpa_energy(cell, with_extras=False, **kwargs):
     mo_eri = kwargs.get("mo_eri", False)
     checkpoint = kwargs.get("checkpoint", None)
     AS_size = kwargs.get("AS_size", None)
-    mp = pprpaobj(mf, channel, mo_eri=mo_eri, nroot=nroot, checkpoint=checkpoint, AS_size=AS_size)
+    max_mem = kwargs.get("max_mem", None)
+    mp = pprpaobj(mf, channel, mo_eri=mo_eri, nroot=nroot, checkpoint=checkpoint, AS_size=AS_size, max_mem=max_mem)
     mp.kernel(mult)
     mp.analyze()
     e_pprpa = mp.exci_s[istate] if mult == 's' else mp.exci_t[istate]
