@@ -5,9 +5,10 @@ from pyscf.df.df_jk import _DFHF
 from pyscf.lib import logger
 from pyscf.df.grad import rhf as rhf_grad
 from lib_pprpa.grad import grad_utils
+from lib_pprpa.pprpa_util import start_clock, stop_clock
 
 
-def grad_elec(pprpa_grad, xy, mult, atmlst=None, correlation_only=False):
+def grad_elec(pprpa_grad, xy, mult, atmlst=None):
     mf = pprpa_grad.mf
     pprpa = pprpa_grad.base
     mol = mf.mol
@@ -30,8 +31,7 @@ def grad_elec(pprpa_grad, xy, mult, atmlst=None, correlation_only=False):
     pprpa_grad.rdm1e = dm0
     dm0_hf = mf.make_rdm1()
     i_int = np.einsum('pi,ij,qj->pq', mf.mo_coeff, i_int, mf.mo_coeff, optimize=True)
-    if not correlation_only:
-        i_int -= mf_grad.make_rdm1e(mf.mo_energy, mf.mo_coeff, mf.mo_occ)
+    i_int -= mf_grad.make_rdm1e(mf.mo_energy, mf.mo_coeff, mf.mo_occ)
 
     occ_y_mat, vir_x_mat = grad_utils.get_xy_full(xy, pprpa.oo_dim, mult)
     coeff_occ = mf.mo_coeff[:, nfrozen_occ : nfrozen_occ + nocc]
@@ -40,19 +40,12 @@ def grad_elec(pprpa_grad, xy, mult, atmlst=None, correlation_only=False):
         'pi,ij,qj->pq', coeff_occ, occ_y_mat, coeff_occ, optimize=True
     )
 
-    if correlation_only:
-        dm0_1e = dm0
-        dm0_2e = dm0
-    else:
-        dm0_1e = dm0 + dm0_hf
-        dm0_2e = dm0 + 0.5 * dm0_hf
-
     aux_response = False
     if isinstance(mf, _DFHF):
         # aux_response is Ture by default in DFHF
         # To my opinion, aux_response should always be True for DFHF
         aux_response = mf_grad.auxbasis_response
-    else:
+    elif not pprpa._use_eri and not pprpa._ao_direct:
         print(
             'Warning:   The analytical gradient of the ppRPA must be used with the density\n\
             fitting mean-field method. The calculation will proceed but the analytical\n\
@@ -60,7 +53,7 @@ def grad_elec(pprpa_grad, xy, mult, atmlst=None, correlation_only=False):
         )
 
     if not hasattr(mf, 'xc'):  # RHF
-        vj, vk = mf_grad.get_jk(mol, (dm0_hf, dm0_2e, xy_ao), hermi=0)
+        vj, vk = mf_grad.get_jk(mol, (dm0_hf, dm0, xy_ao), hermi=0)
         vhf = np.zeros_like(vj)
 
         vhf[:2] = vj[:2] - 0.5 * vk[:2]
@@ -79,17 +72,18 @@ def grad_elec(pprpa_grad, xy, mult, atmlst=None, correlation_only=False):
         for k, ia in enumerate(atmlst):
             p0, p1 = aoslices[ia, 2:]
             h1ao = hcore_deriv(ia)
-            de[k] += np.einsum('xij,ij->x', h1ao, dm0_1e)
+            h1ao[:,p0:p1]   += vhf[0,:,p0:p1]
+            h1ao[:,:,p0:p1] += vhf[0,:,p0:p1].transpose(0,2,1)
+            de[k] += np.einsum('xij,ij->x', h1ao, dm0+dm0_hf)
             # nabla was applied on bra in s1, *2 for the contributions of nabla|ket>
-            de[k] += np.einsum('xij,ij->x', vhf[0, :, p0:p1], dm0_2e[p0:p1]) * 2
             de[k] += np.einsum('xij,ij->x', vhf[1, :, p0:p1], dm0_hf[p0:p1, :]) * 2
             de[k] += np.einsum('xij,ij->x', vhf[2, :, p0:p1], xy_ao[p0:p1, :]) * 2
 
             de[k] += np.einsum('xij,ji->x', s1[:, p0:p1], i_int[:, p0:p1]) * 2
 
             if aux_response:
-                de[k] += vhf.aux[0, 1, ia]
-                de[k] += vhf.aux[1, 0, ia]
+                de[k] += vhf.aux[0, 1, ia] + 0.5*vhf.aux[0, 0, ia]
+                de[k] += vhf.aux[1, 0, ia] + 0.5*vhf.aux[0, 0, ia]
                 de[k] += vhf.aux[2, 2, ia]
     else:  # RKS
         # The grid response by default is not included.
@@ -100,40 +94,36 @@ def grad_elec(pprpa_grad, xy, mult, atmlst=None, correlation_only=False):
         from lib_pprpa.grad.grad_utils import get_veff_df_rks, get_veff_rks, _contract_xc_kernel
 
         vj, vk = mf_grad.get_jk(mol, xy_ao, hermi=0)
-        fxc1 = _contract_xc_kernel(mf, mf.xc, dm0, None, False, False, True)[0][1:]
-
         vhf = vk
         if aux_response:
-            vxc, vjk = get_veff_df_rks(mf_grad, mol, (dm0_hf, dm0_2e))
+            vxc, vjk = get_veff_df_rks(mf_grad, mol, (dm0_hf, dm0))
             if mult == 's':
                 vhf_aux = vk.aux[0, 0]
             else:
                 vhf_aux = -vk.aux[0, 0]
             vhf = lib.tag_array(vhf, aux=vhf_aux)
         else:
-            vxc, vjk = get_veff_rks(mf_grad, mol, (dm0_hf, dm0_2e))
+            vxc, vjk = get_veff_rks(mf_grad, mol, (dm0_hf, dm0))
+        
+        vjk[1] += _contract_xc_kernel(mf, mf.xc, dm0, None, False, False, True)[0][1:]*0.5
 
         aoslices = mol.aoslice_by_atom()
         de = np.zeros((len(atmlst), 3))
         for k, ia in enumerate(atmlst):
             p0, p1 = aoslices[ia, 2:]
             h1ao = hcore_deriv(ia)
-            h1ao[:, p0:p1] += vxc[0, :, p0:p1]
-            h1ao[:, :, p0:p1] += vxc[0, :, p0:p1].transpose(0, 2, 1)
-            de[k] += np.einsum('xij,ij->x', h1ao, dm0_1e)
-
+            h1ao[:, p0:p1] += vxc[0, :, p0:p1] + vjk[0, :, p0:p1]
+            h1ao[:, :, p0:p1] += vxc[0, :, p0:p1].transpose(0, 2, 1) + vjk[0, :, p0:p1].transpose(0, 2, 1)
+            de[k] += np.einsum('xij,ij->x', h1ao, dm0 + dm0_hf)
             # nabla was applied on bra in s1, *2 for the contributions of nabla|ket>
-            de[k] += np.einsum('xij,ij->x', vjk[0, :, p0:p1], dm0_2e[p0:p1]) * 2
             de[k] += np.einsum('xij,ij->x', vjk[1, :, p0:p1], dm0_hf[p0:p1, :]) * 2
-            # de[k] += np.einsum('xij,ij->x', fxc1[:, p0:p1], dm0_hf[p0:p1, :]) / 2.0
-            # de[k] += np.einsum('xij,ji->x', fxc1[:, p0:p1], dm0_hf[:, p0:p1]) / 2.0
             de[k] += np.einsum('xij,ij->x', vhf[:, p0:p1], xy_ao[p0:p1, :]) * 2
 
             de[k] += np.einsum('xij,ji->x', s1[:, p0:p1], i_int[:, p0:p1]) * 2
 
             if aux_response:
-                de[k] += vjk.aux[0, 1, ia]
-                de[k] += vjk.aux[1, 0, ia]
+                de[k] += vjk.aux[0, 1, ia] + 0.5*vjk.aux[0, 0, ia]
+                de[k] += vjk.aux[1, 0, ia] + 0.5*vjk.aux[0, 0, ia]
                 de[k] += vhf.aux[ia]
             if mf_grad.grid_response:
                 de[k] += vxc.exc1_grid[0, ia]
@@ -187,9 +177,8 @@ def make_rdm1_relaxed_rhf_pprpa(pprpa, mf, xy=None, mult='t', istate=0, cphf_max
     """
     assert mult in ['t', 's'], 'mult = {}. is not valid in make_rdm1_relaxed_pprpa'.format(mult)
     from lib_pprpa import pyscf_util
-    from lib_pprpa.grad.grad_utils import choose_slice, choose_range, contraction_2rdm_eri, \
-                           get_xy_full, make_rdm1_unrelaxed_from_xy_full
-    from lib_pprpa.pprpa_util import start_clock, stop_clock
+    from lib_pprpa.grad.grad_utils import choose_slice, choose_range, contraction_2rdm_Lpq, \
+                           contraction_2rdm_eri, get_xy_full, make_rdm1_unrelaxed_from_xy_full
 
     if xy is None:
         if mult == 's':
@@ -202,12 +191,6 @@ def make_rdm1_relaxed_rhf_pprpa(pprpa, mf, xy=None, mult='t', istate=0, cphf_max
     nvir = pprpa.nvir
     nfrozen_occ = nocc_all - nocc
     nfrozen_vir = nvir_all - nvir
-    if nfrozen_occ > 0 or nfrozen_vir > 0:
-        _, mo_ene_full, Lpq_full = pyscf_util.get_pyscf_input_mol(mf)
-    else:
-        mo_ene_full = pprpa.mo_energy
-        Lpq_full = pprpa.Lpq
-
     if mult == 's':
         oo_dim = (nocc + 1) * nocc // 2
     else:
@@ -227,11 +210,25 @@ def make_rdm1_relaxed_rhf_pprpa(pprpa, mf, xy=None, mult='t', istate=0, cphf_max
     orbp = mf.mo_coeff[:, slice_p]
     orbi = mf.mo_coeff[:, slice_i]
     orba = mf.mo_coeff[:, slice_a]
+    occ_y_mat, vir_x_mat = get_xy_full(xy, oo_dim, mult)
+    if pprpa._use_eri or pprpa._ao_direct:
+        hermi = 1 if mult == 's' else 2
+        mo_ene_full = mf.mo_energy
+        X_ao = orba @ vir_x_mat @ orba.T
+        X_eri = mf.get_k(dm=X_ao, hermi=hermi)
+        X_eri = mf.mo_coeff.T @ X_eri @ orbp
+        Y_ao = orbi @ occ_y_mat @ orbi.T
+        Y_eri = mf.get_k(dm=Y_ao, hermi=hermi)
+        Y_eri = mf.mo_coeff.T @ Y_eri @ orbp
+    else:
+        if nfrozen_occ > 0 or nfrozen_vir > 0:
+            _, mo_ene_full, Lpq_full = pyscf_util.get_pyscf_input_mol(mf)
+        else:
+            mo_ene_full = pprpa.mo_energy
+            Lpq_full = pprpa.Lpq
 
     # set singlet=None, generate function for CPHF type response kernel
     vresp = mf.gen_response(singlet=None, hermi=1)
-
-    occ_y_mat, vir_x_mat = get_xy_full(xy, oo_dim, mult)
     den_u = make_rdm1_unrelaxed_from_xy_full(occ_y_mat, vir_x_mat)
     den_u_ao = np.einsum('pi,i,qi->pq', orbp, den_u, orbp, optimize=True)
     veff_den_u = reduce(np.dot, (mf.mo_coeff.T, vresp(den_u_ao) * 2, mf.mo_coeff))
@@ -240,24 +237,39 @@ def make_rdm1_relaxed_rhf_pprpa(pprpa, mf, xy=None, mult='t', istate=0, cphf_max
     # calculate I' first
     i_prime = np.zeros((len(mo_ene_full), len(mo_ene_full)), dtype=occ_y_mat.dtype)
     # I' active-active block
-    i_prime[slice_p, slice_p] += contraction_2rdm_eri(
-        occ_y_mat, vir_x_mat, Lpq_full, nocc, nvir, nfrozen_occ, nfrozen_vir, 'p', 'p'
-    )
+    if not pprpa._use_eri and not pprpa._ao_direct:
+        i_prime[slice_p, slice_p] += contraction_2rdm_Lpq(
+            occ_y_mat, vir_x_mat, Lpq_full, nocc, nvir, nfrozen_occ, nfrozen_vir, 'p', 'p'
+        )
+    else:
+        i_prime[slice_p, slice_p] += contraction_2rdm_eri(
+            occ_y_mat, vir_x_mat, X_eri, Y_eri, nocc, nvir, nfrozen_occ, nfrozen_vir, 'p', 'p'
+        )
     i_prime[slice_a, slice_i] += veff_den_u[slice_a, slice_i]
     for p in choose_range('p', nfrozen_occ, nocc, nvir, nfrozen_vir):
         i_prime[p, p] += mo_ene_full[p] * den_u[p - nfrozen_occ]
 
     if nfrozen_vir > 0:
         # I' frozen virtual-active block
-        i_prime[slice_ap, slice_p] += contraction_2rdm_eri(
-            occ_y_mat, vir_x_mat, Lpq_full, nocc, nvir, nfrozen_occ, nfrozen_vir, 'ap', 'p'
-        )
+        if not pprpa._use_eri and not pprpa._ao_direct:
+            i_prime[slice_ap, slice_p] += contraction_2rdm_Lpq(
+                occ_y_mat, vir_x_mat, Lpq_full, nocc, nvir, nfrozen_occ, nfrozen_vir, 'ap', 'p'
+            )
+        else:
+            i_prime[slice_ap, slice_p] += contraction_2rdm_eri(
+                occ_y_mat, vir_x_mat, X_eri, Y_eri, nocc, nvir, nfrozen_occ, nfrozen_vir, 'ap', 'p'
+            )
         i_prime[slice_ap, slice_i] += veff_den_u[slice_ap, slice_i]
     if nfrozen_occ > 0:
         # I' frozen occupied-active block
-        i_prime[slice_ip, slice_p] += contraction_2rdm_eri(
-            occ_y_mat, vir_x_mat, Lpq_full, nocc, nvir, nfrozen_occ, nfrozen_vir, 'ip', 'p'
-        )
+        if not pprpa._use_eri and not pprpa._ao_direct:
+            i_prime[slice_ip, slice_p] += contraction_2rdm_Lpq(
+                occ_y_mat, vir_x_mat, Lpq_full, nocc, nvir, nfrozen_occ, nfrozen_vir, 'ip', 'p'
+            )
+        else:
+            i_prime[slice_ip, slice_p] += contraction_2rdm_eri(
+                occ_y_mat, vir_x_mat, X_eri, Y_eri, nocc, nvir, nfrozen_occ, nfrozen_vir, 'ip', 'p'
+            )
         # I' all virtual-frozen occupied block
         i_prime[slice_A, slice_ip] += veff_den_u[slice_A, slice_ip]
 
@@ -310,7 +322,7 @@ def make_rdm1_relaxed_rhf_pprpa(pprpa, mf, xy=None, mult='t', istate=0, cphf_max
     i_int = -np.einsum('qp,p->qp', d_prime, mo_ene_full)
     # I all occupied-all occupied block
     dp_ao = reduce(np.dot, (mf.mo_coeff, d_prime, mf.mo_coeff.T))
-    veff_dp_II = reduce(np.dot, (orbI.T, vresp(dp_ao) * 2, orbI))
+    veff_dp_II = reduce(np.dot, (orbI.T, vresp(dp_ao + dp_ao.T), orbI))
     i_int[slice_I, slice_I] -= 0.5 * veff_den_u[slice_I, slice_I]
     i_int[slice_I, slice_I] -= veff_dp_II
     # I active virtual-all occupied block
