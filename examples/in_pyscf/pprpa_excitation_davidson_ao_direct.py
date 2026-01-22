@@ -18,30 +18,36 @@ mol.build()
 mf = scf.RHF(mol)
 mf.kernel()
 
-# get density-fitting matrix in AO
+# 1. simple ppRPA calculation use eri_ao
+nmo = len(mf.mo_energy)
+nocc = mf.mol.nelectron // 2
+nvir = nmo - nocc
+
+Lpq = None
+pprpa = ppRPA_Davidson(nocc, mf.mo_energy, Lpq)
+pprpa._ao_direct = True
+pprpa._scf = mf  # assign SCF object for eri_ao_direct use
+pprpa.kernel("s")
+pprpa.kernel("t")
+pprpa.analyze()
+
+# 2. simple ppRPA calculation use eri_ao for with_df
 if getattr(mf, 'with_df', None):
     pass
 else:
+    mf = mf.density_fit() # only with this line can change the get_jk behavior
     mf.with_df = df.DF(mf.mol)
     try:
         mf.with_df.auxbasis = df.make_auxbasis(mf.mol, mp2fit=True)
     except:
         mf.with_df.auxbasis = df.make_auxbasis(mf.mol, mp2fit=False)
     mf._keys.update(['with_df'])
-
-# get density-fitting matrix in MO space
-nmo = len(mf.mo_energy)
-nocc = mf.mol.nelectron // 2
-nvir = nmo - nocc
-naux = mf.with_df.get_naoaux()
-mo = numpy.asarray(mf.mo_coeff, order='F')
-ijslice = (0, nmo, 0, nmo)
+    
 Lpq = None
-Lpq = _ao2mo.nr_e2(mf.with_df._cderi, mo, ijslice, aosym='s2', out=Lpq)
-Lpq = Lpq.reshape(naux, nmo, nmo)
-
-# 1. hhRPA
-pprpa = ppRPA_Davidson(nocc, mf.mo_energy, Lpq, channel="hh")
+pprpa = ppRPA_Davidson(nocc, mf.mo_energy, Lpq)
+pprpa._ao_direct = True
+pprpa._scf = mf  # assign SCF object for eri_ao_direct use
 pprpa.kernel("s")
 pprpa.kernel("t")
 pprpa.analyze()
+               
