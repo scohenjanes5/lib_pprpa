@@ -263,13 +263,16 @@ def get_pprpa_oscillator_strength(
         f (double): oscillator strength.
         trans_dip (numpy.ndarray): transition dipole moment.
     """
+    assert channel in ["pp", "hh"], "channel must be pp or hh"
+    assert multi in ["s", "t"], "multi must be s or t"
+
     if multi == "s":
         oo_dim = (nocc + 1) * nocc // 2
-    elif multi == "t":
+    else:
         oo_dim = (nocc - 1) * nocc // 2
 
     xy0_multi = xy0_multi if xy0_multi is not None else multi
-    # S->T or T->S transition is spin-forbidden
+    # S -> T or T -> S transition is spin-forbidden
     if xy0_multi != multi:
         return 0.0, numpy.zeros((3))
 
@@ -280,12 +283,44 @@ def get_pprpa_oscillator_strength(
         _, full = get_xy_full(xy, oo_dim, mult=multi)
         _, full0 = get_xy_full(xy0, oo_dim, mult=multi)
         trans_dip = numpy.einsum("pa,qa,rpq->r", full0, full, ints_vv, optimize=True)
-    elif channel == "hh":
+    else:
         full, _ = get_xy_full(xy, oo_dim, mult=multi)
         full0, _ = get_xy_full(xy0, oo_dim, mult=multi)
         trans_dip = -numpy.einsum("pj,qj,rpq->r", full0, full, ints_oo, optimize=True)
+
+    if exci == exci0: # ground state
+        trans_dip += numpy.einsum("xy,xy,rpp->r", full0, full, ints_oo, optimize=True)
 
     # |<Psi_0|r|Psi_m>|^2
     f = 2.0 / 3.0 * (exci - exci0) * numpy.sum(trans_dip**2)
     # (exci - exci0) in hh channel is de-excitation energy
     return numpy.abs(f), trans_dip
+
+def get_dipole_moment(nocc, mo_dip, channel, xy, multi):
+    """Compute dipole moments for an arbitrary ppRPA state.
+    See get_pprpa_oscillator_strength for info on arguments.
+
+    The third term in the dipole moment expression appears if the starting
+    and ending electronic states are the same, which is true by design here.
+    """
+    assert channel in ["pp", "hh"], "channel must be pp or hh"
+    assert multi in ["s", "t"], "multi must be s or t"
+
+    if multi == "s":
+        oo_dim = (nocc + 1) * nocc // 2
+    else:
+        oo_dim = (nocc - 1) * nocc // 2
+
+    ints_oo = mo_dip[:, :nocc, :nocc]
+    ints_vv = mo_dip[:, nocc:, nocc:]
+
+    if channel == "pp":
+        _, full = get_xy_full(xy, oo_dim, mult=multi)
+        dip = numpy.einsum("pa,qa,rpq->r", full, full, ints_vv, optimize=True)
+    else:
+        full, _ = get_xy_full(xy, oo_dim, mult=multi)
+        dip = -numpy.einsum("pj,qj,rpq->r", full, full, ints_oo, optimize=True)
+
+    dip += numpy.einsum("xy,xy,rpp->r", full, full, ints_oo, optimize=True)
+
+    return dip
