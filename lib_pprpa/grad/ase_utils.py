@@ -59,18 +59,15 @@ def pprpaobj(mf, channel, **kwargs):
     if nfrozen_occ > 0  or vir_cut < np.inf:
         if AS_size is not None:
             raise ValueError("Cannot specify both nfrozen_occ/vir_cut and AS_size")
-        nvircut = np.sum(mo_ene > vir_cut)
-        nvir -= nvircut
+        nvir -= np.sum(mo_ene > vir_cut)
         nocc -= nfrozen_occ
         assert nocc > 1, "Too many frozen occupied orbitals!"
         assert nvir > 1, "Too many excluded virtual orbitals!"
     # create active space by explicitly setting the size of the active space
     elif AS_size is not None and (AS_size < full_nocc or AS_size < nvir):
-        nocc_act = full_nocc if AS_size is None else min(full_nocc, AS_size)
-        nvir_act = nvir if AS_size is None else min(nvir, AS_size)
-        nfrozen_occ = full_nocc - nocc_act
+        nvir = min(nvir, AS_size)
+        nfrozen_occ = full_nocc - min(full_nocc, AS_size)
         nocc = full_nocc - nfrozen_occ
-        nvir = nvir_act
 
     vir_act_idx = full_nocc + nvir
     mo_energy = mo_ene[nfrozen_occ:vir_act_idx]
