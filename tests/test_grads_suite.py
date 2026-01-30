@@ -2,7 +2,8 @@ import numpy as np
 import pytest
 from pyscf import gto, scf, dft, pbc
 from lib_pprpa import pprpa_davidson, gpprpa_davidson
-from lib_pprpa.grad import pprpa_gamma, grad_utils, ref_implementations
+from lib_pprpa.grad import pprpa_gamma, grad_utils
+from benchmarks import references as ref_implementations
 from lib_pprpa.grad import pprpa as pprpa_grad_mod
 from lib_pprpa.grad import pprpa_gamma as pprpa_gamma_grad_mod
 from lib_pprpa.grad.ase_utils import pprpaobj
