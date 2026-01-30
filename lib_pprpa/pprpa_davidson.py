@@ -984,6 +984,11 @@ class ppRPA_Davidson():
             self.mu = get_chemical_potential(
                 nocc=self.nocc, mo_energy=self.mo_energy)
 
+        if self.channel == "pp":
+            assert self.nroot <= self.vv_dim, "nroot (%d) is larger than possible states in pp channel (%d)" % (self.nroot, self.vv_dim)
+        else:
+            assert self.nroot <= self.oo_dim, "nroot (%d) is larger than possible states in hh channel (%d)" % (self.nroot, self.oo_dim)
+
         return
 
     def dump_flags(self):
