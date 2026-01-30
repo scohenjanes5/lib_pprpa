@@ -52,6 +52,8 @@ def pprpaobj(mf, channel, **kwargs):
     checkpoint = kwargs.get("checkpoint", None)
     max_mem = kwargs.get("max_mem", None)
     trial = kwargs.get("trial", "identity")
+    Lpq = kwargs.get("Lpq", None)
+    cls = kwargs.get("cls", ppRPA_Davidson)
     full_nocc = nocc
     nmo = nocc + nvir
 
@@ -72,15 +74,23 @@ def pprpaobj(mf, channel, **kwargs):
     vir_act_idx = full_nocc + nvir
     mo_energy = mo_ene[nfrozen_occ:vir_act_idx]
 
-    pprpa = ppRPA_Davidson(nocc, mo_energy, Lpq=None, channel=channel, nroot=nroot, residue_thresh=1e-12, checkpoint_file=checkpoint, trial=trial)
+    pprpa = cls(nocc, mo_energy, Lpq=Lpq, channel=channel, nroot=nroot, residue_thresh=1e-12, checkpoint_file=checkpoint, trial=trial)
     pprpa.cell = mol
+
+    pprpa.mu = 0.0
+    if Lpq is not None:
+        return pprpa
 
     # One can use either the MO eri or the ao direct approach.
     # For small active spaces, MO eri should be faster.
     if mo_eri:
-        if max_mem is not None:
-            mf.with_df.max_memory = max_mem
-        eri = mf.with_df.get_mo_eri(mf.mo_coeff, compact=False)
+        if hasattr(mf, "with_df") and mf.with_df is not None:
+            if max_mem is not None:
+                mf.with_df.max_memory = max_mem
+            eri = mf.with_df.get_mo_eri(mf.mo_coeff, compact=False)
+        else:
+            from pyscf import ao2mo
+            eri = ao2mo.kernel(mf.mol, mf.mo_coeff, compact=False)
         eri = eri.reshape(nmo, nmo, nmo, nmo).transpose(0, 2, 1, 3)
         vvvv = eri[full_nocc:vir_act_idx, full_nocc:vir_act_idx, full_nocc:vir_act_idx, full_nocc:vir_act_idx]
         oovv = eri[nfrozen_occ:full_nocc, nfrozen_occ:full_nocc, full_nocc:vir_act_idx, full_nocc:vir_act_idx]
@@ -89,8 +99,7 @@ def pprpaobj(mf, channel, **kwargs):
     else:
         pprpa._ao_direct = True
         pprpa._scf = mf
-    
-    pprpa.mu = 0.0
+ 
     return pprpa
 
 def pprpa_energy(cell, with_extras=False, **kwargs):
