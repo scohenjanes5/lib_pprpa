@@ -286,19 +286,21 @@ def make_rdm1_relaxed_rhf_pprpa(pprpa, mf, xy=None, mult='t', istate=0, cphf_max
     start_clock('Calculate d_prime')
     d_prime = np.zeros_like(i_prime_prime)
     threshold = 1.0e-6
-    # D' all occupied-active occupied block
-    for i in choose_range('I', nfrozen_occ, nocc, nvir, nfrozen_vir):
-        for j in choose_range('i', nfrozen_occ, nocc, nvir, nfrozen_vir):
-            denorm = mo_ene_full[j] - mo_ene_full[i]
-            factor = 1.0 / denorm if abs(denorm) >= threshold else 0.0
-            d_prime[i, j] = factor * i_prime_prime[i, j]
+    # D' all occupied-active occupied block (vectorized)
+    mo_I = mo_ene_full[slice_I]
+    mo_i = mo_ene_full[slice_i]
+    denorm_Ii = mo_i[None, :] - mo_I[:, None]  # shape (nI, ni)
+    mask_Ii = np.abs(denorm_Ii) >= threshold
+    factor_Ii = np.divide(1.0, denorm_Ii, where=mask_Ii, out=np.zeros_like(denorm_Ii))
+    d_prime[slice_I, slice_i] = factor_Ii * i_prime_prime[slice_I, slice_i]
 
-    # D' all virtual-active virtual block
-    for a in choose_range('A', nfrozen_occ, nocc, nvir, nfrozen_vir):
-        for b in choose_range('a', nfrozen_occ, nocc, nvir, nfrozen_vir):
-            denorm = mo_ene_full[b] - mo_ene_full[a]
-            factor = 1.0 / denorm if abs(denorm) >= threshold else 0.0
-            d_prime[a, b] = factor * i_prime_prime[a, b]
+    # D' all virtual-active virtual block (vectorized)
+    mo_A = mo_ene_full[slice_A]
+    mo_a = mo_ene_full[slice_a]
+    denorm_Aa = mo_a[None, :] - mo_A[:, None]  # shape (nA, na)
+    mask_Aa = np.abs(denorm_Aa) >= threshold
+    factor_Aa = np.divide(1.0, denorm_Aa, where=mask_Aa, out=np.zeros_like(denorm_Aa))
+    d_prime[slice_A, slice_a] = factor_Aa * i_prime_prime[slice_A, slice_a]
 
     x_int = i_prime_prime[slice_A, slice_I].copy()
     d_ao = reduce(np.dot, (orbI, d_prime[slice_I, slice_i], orbi.T))
@@ -328,18 +330,17 @@ def make_rdm1_relaxed_rhf_pprpa(pprpa, mf, xy=None, mult='t', istate=0, cphf_max
     # I active virtual-all occupied block
     i_int[slice_I, slice_a] -= i_prime[slice_I, slice_a]
 
-    # I active-active block extra term
-    for i in choose_range('p', nfrozen_occ, nocc, nvir, nfrozen_vir):
-        for j in choose_range('p', nfrozen_occ, nocc, nvir, nfrozen_vir):
-            denorm = mo_ene_full[j] - mo_ene_full[i]
-            if abs(denorm) < threshold:
-                i_int[i, j] -= 0.5 * i_prime[i, j]
+    # I active-active block extra term (vectorized)
+    mo_p = mo_ene_full[slice_p]
+    denorm_pp = mo_p[None, :] - mo_p[:, None]  # shape (np, np)
+    mask_degenerate = np.abs(denorm_pp) < threshold
+    i_int[slice_p, slice_p] -= 0.5 * i_prime[slice_p, slice_p] * mask_degenerate
     stop_clock('Calculate I intermediates')
 
     den_relaxed = d_prime
-    # active-active block
-    for p in choose_range('p', nfrozen_occ, nocc, nvir, nfrozen_vir):
-        den_relaxed[p, p] += 0.5 * den_u[p - nfrozen_occ]
+    # active-active block (vectorized)
+    p_indices = np.arange(nfrozen_occ, nfrozen_occ + nocc + nvir)
+    den_relaxed[p_indices, p_indices] += 0.5 * den_u
     den_relaxed = den_relaxed + den_relaxed.T
     i_int = i_int + i_int.T
 
