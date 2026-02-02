@@ -84,17 +84,17 @@ def pprpaobj(mf, channel, **kwargs):
     # One can use either the MO eri or the ao direct approach.
     # For small active spaces, MO eri should be faster.
     if mo_eri:
-        if hasattr(mf, "with_df") and mf.with_df is not None:
+        try:
             if max_mem is not None:
                 mf.with_df.max_memory = max_mem
             eri = mf.with_df.get_mo_eri(mf.mo_coeff, compact=False)
-        else:
-            from pyscf import ao2mo
-            eri = ao2mo.kernel(mf.mol, mf.mo_coeff, compact=False)
-        eri = eri.reshape(nmo, nmo, nmo, nmo).transpose(0, 2, 1, 3)
-        vvvv = eri[full_nocc:vir_act_idx, full_nocc:vir_act_idx, full_nocc:vir_act_idx, full_nocc:vir_act_idx]
-        oovv = eri[nfrozen_occ:full_nocc, nfrozen_occ:full_nocc, full_nocc:vir_act_idx, full_nocc:vir_act_idx]
-        oooo = eri[nfrozen_occ:full_nocc, nfrozen_occ:full_nocc, nfrozen_occ:full_nocc, nfrozen_occ:full_nocc]
+            eri = eri.reshape(nmo, nmo, nmo, nmo).transpose(0, 2, 1, 3)
+            vvvv = eri[full_nocc:vir_act_idx, full_nocc:vir_act_idx, full_nocc:vir_act_idx, full_nocc:vir_act_idx]
+            oovv = eri[nfrozen_occ:full_nocc, nfrozen_occ:full_nocc, full_nocc:vir_act_idx, full_nocc:vir_act_idx]
+            oooo = eri[nfrozen_occ:full_nocc, nfrozen_occ:full_nocc, nfrozen_occ:full_nocc, nfrozen_occ:full_nocc]
+        except AttributeError: # mols without DF
+            from lib_pprpa.pyscf_util import get_pyscf_input_mol_eri_r
+            nocc, mo_energy, vvvv, oooo, oovv = get_pyscf_input_mol_eri_r(mf, nocc_act=nocc, nvir_act=nvir)
         pprpa.use_eri(vvvv, oovv, oooo)
     else:
         pprpa._ao_direct = True

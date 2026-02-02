@@ -57,7 +57,6 @@ def test_water_s_act_intermediates(h2o_s_act):
 
 @pytest.fixture(scope="module")
 def h2o_t_eri():
-    from lib_pprpa import pyscf_util
     mol, mf = get_water_rhf(df=False)
     pp = pprpaobj(mf, 'pp', mo_eri=True, nroot=1)
     pp.kernel('t')
@@ -98,7 +97,6 @@ def test_water_t_large_act_grad(h2o_t_act_large):
 
 @pytest.fixture(scope="module")
 def h2o_pbc():
-    from lib_pprpa import pyscf_util
     cell, mf = get_water_pbc_rks()
     # PBC must use MO-ERI or AO-direct with non-DF DFT
     pp = pprpaobj(mf, 'pp', mo_eri=True, nroot=1)
