@@ -99,7 +99,7 @@ def pprpaobj(mf, channel, **kwargs):
     else:
         pprpa._ao_direct = True
         pprpa._scf = mf
- 
+
     return pprpa
 
 def pprpa_energy(cell, with_extras=False, **kwargs):
@@ -126,7 +126,9 @@ def pprpa_energy(cell, with_extras=False, **kwargs):
 def pprpa_grad(cell, **kwargs):
     e, mp, mf, mult, istate = pprpa_energy(cell, with_extras=True, **kwargs)
     from lib_pprpa.grad import pprpa_gamma
+    cphf_max_cycle = kwargs.get("cphf_max_cycle", 50)
     mpg = mp.Gradients(mf, mult, istate)
+    mpg.cphf_max_cycle = cphf_max_cycle
     mpg.kernel()
     return e, mpg.de
 
@@ -178,7 +180,7 @@ class ASE_calculator(Calculator):
             self.results['energy'] = e_tot * HARTREE2EV
         else:
             raise NotImplementedError("Only energy and forces are implemented for ppRPA calculator.")
-        
+
 def kernel(cell, grad_func, ene_func=None, logfile=None, fmax=0.05, max_steps=100, **kwargs):
     '''Optimize the geometry using ASE.
     '''
