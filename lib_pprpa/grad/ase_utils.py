@@ -84,8 +84,9 @@ def pprpaobj(mf, channel, **kwargs):
     # One can use either the MO eri or the ao direct approach.
     # For small active spaces, MO eri should be faster.
     if mo_eri:
-        from lib_pprpa.pyscf_util import start_clock, stop_clock
-        try:
+        from pyscf.pbc.df.fft import FFTDF
+        if hasattr(mf, "with_df") and isinstance(mf.with_df, FFTDF):
+            from lib_pprpa.pyscf_util import start_clock, stop_clock
             start_clock("Creating MO eri")
             if max_mem is not None:
                 mf.with_df.max_memory = max_mem
@@ -95,11 +96,8 @@ def pprpaobj(mf, channel, **kwargs):
             oovv = eri[nfrozen_occ:full_nocc, nfrozen_occ:full_nocc, full_nocc:vir_act_idx, full_nocc:vir_act_idx]
             oooo = eri[nfrozen_occ:full_nocc, nfrozen_occ:full_nocc, nfrozen_occ:full_nocc, nfrozen_occ:full_nocc]
             stop_clock("Creating MO eri")
-        except AttributeError: # mols without DF
-            print("Mol without DF, switching generation strategy")
-            stop_clock("Creating MO eri")
+        else:
             from lib_pprpa.pyscf_util import get_pyscf_input_mol_eri_r
-            # Has clock within
             nocc, mo_energy, vvvv, oooo, oovv = get_pyscf_input_mol_eri_r(mf, nocc_act=nocc, nvir_act=nvir)
         pprpa.use_eri(vvvv, oovv, oooo)
     else:
