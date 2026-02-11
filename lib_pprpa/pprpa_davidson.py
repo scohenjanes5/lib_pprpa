@@ -36,7 +36,8 @@ def kernel(pprpa):
             ntri = checkpoint_data.ntri
             tri_vec[:ntri] = checkpoint_data.tri_vec
             tri_vec_sig[:ntri] = checkpoint_data.tri_vec_sig
-            mv_prod = pprpa.contraction(tri_vec[:ntri])
+            mv_prod = np.zeros_like(tri_vec)
+            mv_prod[:ntri] = pprpa.contraction(tri_vec[:ntri])
             nprod = ntri
             normal_setup = False
 
