@@ -1138,8 +1138,8 @@ class ppRPA_Davidson():
         g["max_vec"] = np.asarray(self.max_vec)
         g["conv"] = np.asarray(conv)
         g["ntri"] = np.asarray(ntri)
-        g["tri_vec"] = np.asarray(tri_vec)
-        g["tri_vec_sig"] = np.asarray(tri_vec_sig)
+        g["tri_vec"] = np.asarray(tri_vec[:ntri])
+        g["tri_vec_sig"] = np.asarray(tri_vec_sig[:ntri])
         f.close()
         return
 
