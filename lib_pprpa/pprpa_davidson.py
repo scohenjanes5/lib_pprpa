@@ -323,96 +323,91 @@ def _pprpa_contraction(pprpa, tri_vec):
     is_singlet = 1 if pprpa.multi == "s" else 0
     tri_row_o, tri_col_o = np.tril_indices(nocc, is_singlet - 1)
     tri_row_v, tri_col_v = np.tril_indices(nvir, is_singlet - 1)
+    diag_idx_o = np.arange(nocc)
+    diag_idx_v = np.arange(nvir)
 
-    z_oo = np.zeros(shape=[nocc, nocc], dtype=np.double)
-    z_vv = np.zeros(shape=[nvir, nvir], dtype=np.double)
-
-    if not pprpa._ao_direct: # Lpq or eri
-        # Batch restore trial vectors
-        z_oo = np.zeros((ntri, nocc, nocc), dtype=np.double)
-        z_vv = np.zeros((ntri, nvir, nvir), dtype=np.double)
-        
-        # Vectorized assignment using broadcasting
-        z_oo[:, tri_row_o, tri_col_o] = tri_vec[:, :pprpa.oo_dim]
-        # Diagonal scaling
-        diag_idx_o = np.arange(nocc)
-        z_oo[:, diag_idx_o, diag_idx_o] *= 1.0 / np.sqrt(2)
-        
-        z_vv[:, tri_row_v, tri_col_v] = tri_vec[:, pprpa.oo_dim:]
-        diag_idx_v = np.arange(nvir)
-        z_vv[:, diag_idx_v, diag_idx_v] *= 1.0 / np.sqrt(2)
-
+    if not pprpa._ao_direct:  # Lpq or eri
+        # Cap intermediate size to avoid OOM on large systems by chunking trial vectors
+        itemsize = tri_vec.dtype.itemsize
         if pprpa._use_eri:
-            prod_vv = np.zeros((ntri, nvir*nvir, 1))
-            prod_oo = np.zeros((ntri, nocc*nocc, 1))
-            
-            # z vectors for matmul: (ntri, n*n, 1)
-            z_vv_flat = z_vv.transpose(0, 2, 1).reshape(ntri, nvir*nvir, 1)
-            z_oo_flat = z_oo.transpose(0, 2, 1).reshape(ntri, nocc*nocc, 1)
-            
-            if nvir > 0:
-                # (NV*NV, NV*NV) @ (ntri, NV*NV, 1) -> (ntri, NV*NV, 1)
-                vvvv = pprpa.vvvv.reshape(nvir*nvir, nvir*nvir)
-                prod_vv += np.matmul(vvvv, z_vv_flat)
-            if nocc > 0:
-                oooo = pprpa.oooo.reshape(nocc*nocc, nocc*nocc)
-                prod_oo += np.matmul(oooo, z_oo_flat)
-            if nvir > 0 and nocc > 0:
-                oovv = pprpa.oovv.reshape(nocc*nocc, nvir*nvir)
-                prod_vv += np.matmul(oovv.T, z_oo_flat)
-                prod_oo += np.matmul(oovv, z_vv_flat)
-            
-            prod_vv = prod_vv.reshape(ntri, nvir, nvir)
-            prod_oo = prod_oo.reshape(ntri, nocc, nocc)
-            
-        else: # use Lpq
-            # Prepare L matrices
-            if pprpa._use_Lov:
-                L_left = Lpi.reshape(naux * nmo, nocc)
-                L_right = Lpa.reshape(naux * nmo, nvir)
-            else:
-                L_left = Lpq[:, :, :nocc].reshape(naux * nmo, nocc)
-                L_right = Lpq[:, :, nocc:].reshape(naux * nmo, nvir)
-            
-            # First contraction: L @ Z.T
-            # L (N, K) @ Z.T (ntri, K, M) -> (ntri, N, M)
-            # z_oo: (ntri, nocc, nocc) -> transpose -> (ntri, nocc, nocc)
-            Lpq_z_o = np.matmul(L_left, z_oo.transpose(0, 2, 1))
-            Lpq_z_v = np.matmul(L_right, z_vv.transpose(0, 2, 1))
-            
-            Lpq_z = np.concatenate([Lpq_z_o, Lpq_z_v], axis=2) # (ntri, naux*nmo, nmo)
-            
-            # Transpose and reshape
-            # (ntri, naux*nmo, nmo) -> (ntri, naux, nmo, nmo) -> (ntri, nmo, naux, nmo) -> (ntri, nmo, naux*nmo)
-            Lpq_z = Lpq_z.reshape(ntri, naux, nmo, nmo).transpose(0, 2, 1, 3).reshape(ntri, nmo, naux*nmo)
-            
-            # Second contraction
-            if pprpa._use_Lov:
-                prod_oo = np.matmul(Lpq_z[:, :nocc], L_left)
-                prod_vv = np.matmul(Lpq_z[:, nocc:], L_right)
-            else:
-                prod_oo = np.matmul(Lpq_z[:, :nocc], L_left)
-                prod_vv = np.matmul(Lpq_z[:, nocc:], L_right)
-        
-        # Symm/Anti-symm
-        if pprpa.multi == "s":
-            prod_vv += prod_vv.transpose(0, 2, 1)
-            prod_oo += prod_oo.transpose(0, 2, 1)
+            bytes_per_vec = max(1, (nocc * nocc + nvir * nvir + nocc * nvir) * itemsize)
         else:
-            prod_vv -= prod_vv.transpose(0, 2, 1)
-            prod_oo -= prod_oo.transpose(0, 2, 1)
-            
-        # Rotate and scale
-        prod_oo = prod_oo.transpose(0, 2, 1)
-        prod_oo[:, diag_idx_o, diag_idx_o] *= 1.0 / np.sqrt(2)
-        
-        prod_vv = prod_vv.transpose(0, 2, 1)
-        prod_vv[:, diag_idx_v, diag_idx_v] *= 1.0 / np.sqrt(2)
-        
-        # Store results
-        mv_prod[:, :pprpa.oo_dim] = prod_oo[:, tri_row_o, tri_col_o]
-        mv_prod[:, pprpa.oo_dim:] = prod_vv[:, tri_row_v, tri_col_v]
+            bytes_per_vec = max(1, naux * nmo * nmo * itemsize)
+
+        mem_budget_bytes = pprpa._work_mem_bytes
+        if mem_budget_bytes is None:
+            mem_budget_bytes = pprpa.check_memory()
+        min_budget_bytes = 256 * 1024 * 1024
+        target_bytes = max(min_budget_bytes, mem_budget_bytes)
+        batch_size = max(1, min(ntri, int(target_bytes // bytes_per_vec)))
+
+        for start in range(0, ntri, batch_size):
+            end = min(ntri, start + batch_size)
+            tri_chunk = tri_vec[start:end]
+            batch = tri_chunk.shape[0]
+
+            # Restore trial vectors into full matrices for this chunk
+            z_oo = np.zeros((batch, nocc, nocc), dtype=np.double)
+            z_vv = np.zeros((batch, nvir, nvir), dtype=np.double)
+            z_oo[:, tri_row_o, tri_col_o] = tri_chunk[:, :pprpa.oo_dim]
+            z_vv[:, tri_row_v, tri_col_v] = tri_chunk[:, pprpa.oo_dim:]
+            z_oo[:, diag_idx_o, diag_idx_o] *= 1.0 / np.sqrt(2)
+            z_vv[:, diag_idx_v, diag_idx_v] *= 1.0 / np.sqrt(2)
+
+            if pprpa._use_eri:
+                prod_vv = np.zeros((batch, nvir * nvir, 1))
+                prod_oo = np.zeros((batch, nocc * nocc, 1))
+
+                z_vv_flat = z_vv.transpose(0, 2, 1).reshape(batch, nvir * nvir, 1)
+                z_oo_flat = z_oo.transpose(0, 2, 1).reshape(batch, nocc * nocc, 1)
+
+                if nvir > 0:
+                    vvvv = pprpa.vvvv.reshape(nvir * nvir, nvir * nvir)
+                    prod_vv += np.matmul(vvvv, z_vv_flat)
+                if nocc > 0:
+                    oooo = pprpa.oooo.reshape(nocc * nocc, nocc * nocc)
+                    prod_oo += np.matmul(oooo, z_oo_flat)
+                if nvir > 0 and nocc > 0:
+                    oovv = pprpa.oovv.reshape(nocc * nocc, nvir * nvir)
+                    prod_vv += np.matmul(oovv.T, z_oo_flat)
+                    prod_oo += np.matmul(oovv, z_vv_flat)
+
+                prod_vv = prod_vv.reshape(batch, nvir, nvir)
+                prod_oo = prod_oo.reshape(batch, nocc, nocc)
+            else:  # use Lpq
+                if pprpa._use_Lov:
+                    L_left = Lpi.reshape(naux * nmo, nocc)
+                    L_right = Lpa.reshape(naux * nmo, nvir)
+                else:
+                    L_left = Lpq[:, :, :nocc].reshape(naux * nmo, nocc)
+                    L_right = Lpq[:, :, nocc:].reshape(naux * nmo, nvir)
+                Lpq_z_o = np.matmul(L_left, z_oo.transpose(0, 2, 1))
+                Lpq_z_v = np.matmul(L_right, z_vv.transpose(0, 2, 1))
+
+                Lpq_z = np.concatenate([Lpq_z_o, Lpq_z_v], axis=2)
+                Lpq_z = Lpq_z.reshape(batch, naux, nmo, nmo).transpose(0, 2, 1, 3)
+                Lpq_z = Lpq_z.reshape(batch, nmo, naux * nmo)
+
+                prod_oo = np.matmul(Lpq_z[:, :nocc], L_left)
+                prod_vv = np.matmul(Lpq_z[:, nocc:], L_right)
+
+            if pprpa.multi == "s":
+                prod_vv += prod_vv.transpose(0, 2, 1)
+                prod_oo += prod_oo.transpose(0, 2, 1)
+            else:
+                prod_vv -= prod_vv.transpose(0, 2, 1)
+                prod_oo -= prod_oo.transpose(0, 2, 1)
+
+            prod_oo = prod_oo.transpose(0, 2, 1)
+            prod_vv = prod_vv.transpose(0, 2, 1)
+            prod_oo[:, diag_idx_o, diag_idx_o] *= 1.0 / np.sqrt(2)
+            prod_vv[:, diag_idx_v, diag_idx_v] *= 1.0 / np.sqrt(2)
+
+            mv_prod[start:end, :pprpa.oo_dim] = prod_oo[:, tri_row_o, tri_col_o]
+            mv_prod[start:end, pprpa.oo_dim:] = prod_vv[:, tri_row_v, tri_col_v]
     else:
+        z_oo = np.zeros(shape=[nocc, nocc], dtype=np.double)
+        z_vv = np.zeros(shape=[nvir, nvir], dtype=np.double)
         dms = []
         assert pprpa._scf is not None, "SCF object is required for eri_ao_direct contraction."
         from pyscf.pbc.scf.khf import KSCF
@@ -986,6 +981,8 @@ class ppRPA_Davidson():
         self.xy_t = None  # triplet two-electron addition eigenvector
         self.tdm = None  # transition dipole moments
         self.vee = None  # vertical excitation energies
+        self._work_mem_bytes = None
+        self.work_mem_gb = None
         print_citation()
 
         return
@@ -1062,7 +1059,13 @@ class ppRPA_Davidson():
             print("ppRPA needs at least %d MB memory." % mem)
         else:
             print("ppRPA needs at least %.1f GB memory." % (mem / 1.0e3))
-        return
+        if self.work_mem_gb is not None:
+            self._work_mem_bytes = int(self.work_mem_gb * 1024 ** 3)
+            user_mb = self._work_mem_bytes / 1.0e6
+            mem = max(mem, user_mb)
+            if mem == user_mb:
+                print("User requested memory budget set to %.1f GB." % (mem / 1.0e3))
+        return mem * 1.0e6
     
     def use_eri(self, eri_vvvv, eri_oovv, eri_oooo):
         """Use ERI instead of Lpq."""

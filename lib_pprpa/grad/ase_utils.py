@@ -48,6 +48,7 @@ def pprpaobj(mf, channel, **kwargs):
     nocc = kwargs.get("nocc", mol.nelectron // 2)
     nvir = kwargs.get("nvir", mo_ene.shape[0] - nocc)
     mo_eri = kwargs.get("mo_eri", False)
+    work_mem_gb = kwargs.get("work_mem_gb", None)
     nroot = kwargs.get("nroot", 1)
     checkpoint = kwargs.get("checkpoint", None)
     max_mem = kwargs.get("max_mem", None)
@@ -75,6 +76,8 @@ def pprpaobj(mf, channel, **kwargs):
     mo_energy = mo_ene[nfrozen_occ:vir_act_idx]
 
     pprpa = cls(nocc, mo_energy, Lpq=Lpq, channel=channel, nroot=nroot, residue_thresh=1e-12, checkpoint_file=checkpoint, trial=trial)
+    if work_mem_gb is not None:
+        pprpa.work_mem_gb = work_mem_gb
     pprpa.cell = mol
 
     pprpa.mu = 0.0
