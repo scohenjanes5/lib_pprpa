@@ -334,9 +334,7 @@ def _pprpa_contraction(pprpa, tri_vec):
         else:
             bytes_per_vec = max(1, naux * nmo * nmo * itemsize)
 
-        mem_budget_bytes = pprpa._work_mem_bytes
-        if mem_budget_bytes is None:
-            mem_budget_bytes = pprpa.check_memory()
+        mem_budget_bytes = pprpa._work_mem_bytes or getattr(pprpa, "_last_mem_bytes", pprpa.check_memory())
         min_budget_bytes = 256 * 1024 * 1024
         target_bytes = max(min_budget_bytes, mem_budget_bytes)
         batch_size = max(1, min(ntri, int(target_bytes // bytes_per_vec)))
@@ -1065,7 +1063,8 @@ class ppRPA_Davidson():
             mem = max(mem, user_mb)
             if mem == user_mb:
                 print("User requested memory budget set to %.1f GB." % (mem / 1.0e3))
-        return mem * 1.0e6
+        self._last_mem_bytes = mem * 1.0e6
+        return self._last_mem_bytes
     
     def use_eri(self, eri_vvvv, eri_oovv, eri_oooo):
         """Use ERI instead of Lpq."""
