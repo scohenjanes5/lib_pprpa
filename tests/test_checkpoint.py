@@ -16,6 +16,7 @@ def test_checkpoint_truncates_and_restarts(tmp_path):
     pp = pprpaobj(mf, "pp", Lpq=Lpq, nroot=1, checkpoint=str(chkfile))
     pp.max_vec = 500  # ensure the saved slice would be much smaller than max_vec
     pp.kernel("s")
+    exci_saved = pp.exci_s.copy()
 
     with h5py.File(chkfile, "r") as f:
         g = f["singlet"]
@@ -31,3 +32,5 @@ def test_checkpoint_truncates_and_restarts(tmp_path):
     pp_restart = pprpaobj(mf, "pp", Lpq=Lpq, nroot=1, checkpoint=str(chkfile))
     pp_restart.max_vec = 500
     pp_restart.kernel("s")
+    # Restart should load the truncated trial vectors and produce the same result.
+    assert np.allclose(pp_restart.exci_s, exci_saved)
