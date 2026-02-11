@@ -28,10 +28,15 @@ def kernel(pprpa):
     if getattr(pprpa, "checkpoint_file", None) is not None and Path(pprpa.checkpoint_file).exists():
         checkpoint_data = pprpa._load_pprpa_checkpoint()
         if checkpoint_data is not None:
-            tri_vec = checkpoint_data.tri_vec
-            tri_vec_sig = checkpoint_data.tri_vec_sig
+            # Rebuild full-size work arrays and seed with the saved subspace
+            tri_size = pprpa.max_vec + pprpa.nroot
+            tri_vec = np.zeros(
+                shape=[tri_size, pprpa.full_dim], dtype=data_type)
+            tri_vec_sig = np.zeros(shape=[tri_size], dtype=data_type)
             ntri = checkpoint_data.ntri
-            mv_prod = pprpa.contraction(tri_vec)
+            tri_vec[:ntri] = checkpoint_data.tri_vec
+            tri_vec_sig[:ntri] = checkpoint_data.tri_vec_sig
+            mv_prod = pprpa.contraction(tri_vec[:ntri])
             nprod = ntri
             normal_setup = False
 
