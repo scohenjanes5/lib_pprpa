@@ -32,19 +32,19 @@ def grad_elec(pprpa_grad, xy, mult, atmlst=None):
     if hasattr(mf, 'xc') and kmf_grad.grid_response:
         raise NotImplementedError('Grid response is not implemented in pprpa yet.')
 
-    # Reuse one grid AO evaluation across all CPHF iterations: build an AO
-    # cache for the reference and hand it to the stock response function.
+    # CPHF response. AO cache is opt-in (Gradients.use_ao_cache); pyscf
+    # ao_cache branches default it off, and forcing set_ao_cache broke Krylov
+    # CPHF on NV. Stock pyscf without the API just uses plain gen_response.
     if hasattr(mf, "xc"):
         ni_resp = mf._numint
-        deriv_resp = 1 if ni_resp._xc_type(mf.xc) in ("GGA", "MGGA") else 0
-        if hasattr(ni_resp, 'set_ao_cache'):
-            # pyscf-warlocat: cache on the numint object
+        use_cache = bool(getattr(pprpa_grad, "use_ao_cache", False))
+        if use_cache and hasattr(ni_resp, "set_ao_cache"):
+            deriv_resp = 1 if ni_resp._xc_type(mf.xc) in ("GGA", "MGGA") else 0
             ni_resp.set_ao_cache(cell, mf.grids, deriv_resp,
                                  kpts=None, max_memory=mf.max_memory)
-            vresp = mf.gen_response(singlet=None, hermi=1)
-        else:
-            # FIX(audit): stock pyscf has no ao_cache support; plain response (no caching)
-            vresp = mf.gen_response(singlet=None, hermi=1)
+        elif hasattr(ni_resp, "ao_cache"):
+            ni_resp.ao_cache = None
+        vresp = mf.gen_response(singlet=None, hermi=1)
     else:
         vresp = None
     dm0, i_int = make_rdm1_relaxed_rhf_pprpa(
@@ -89,29 +89,25 @@ def grad_elec(pprpa_grad, xy, mult, atmlst=None):
 
             de[k] += np.einsum('xij,ji->x', s1[:, p0:p1], i_int[:, p0:p1]) * 2
     else:  # KS
-        # Precompute the uniform-grid AOs once and reuse them across the Vxc,
-        # Coulomb, and fxc-kernel derivative passes. On pyscf-warlocat the cache
-        # lives on the numint object; on legacy pyscf it is a standalone AOCache
-        # passed as a kwarg to every downstream function.
+        # Match pyscf Gradients.use_ao_cache default (False): do not force
+        # set_ao_cache. get_veff_krks already tolerates ao_cache=None.
         ni = kmf._numint
-        ao_deriv = 2 if ni._xc_type(kmf.xc) in ('GGA', 'MGGA') else 1
-        if hasattr(ni, 'set_ao_cache'):
-            ni.set_ao_cache(cell, kmf.grids, ao_deriv, kpts=kmf.kpts,
-                            max_memory=kmf_grad.max_memory)
-            vk = kmf_grad.get_k(np.array([xy_ao]))
-            vk = vk[:,0,:,:]
-            vxc, vjk = get_veff_krks(kmf_grad, np.array([[dm0_hf], [dm0]]))
-            vxc = vxc[:,:,0,:,:].transpose(1,0,2,3)
-            vjk = vjk[:,:,0,:,:].transpose(1,0,2,3)
-            vjk[1] += _contract_xc_kernel_krks(kmf, kmf.xc, dm0)[0][1:]*0.5
-        else:
-            # FIX(audit): stock pyscf has no ao_cache support; plain calls (no caching)
-            vk = kmf_grad.get_k(np.array([xy_ao]))
-            vk = vk[:,0,:,:]
-            vxc, vjk = get_veff_krks(kmf_grad, np.array([[dm0_hf], [dm0]]))
-            vxc = vxc[:,:,0,:,:].transpose(1,0,2,3)
-            vjk = vjk[:,:,0,:,:].transpose(1,0,2,3)
-            vjk[1] += _contract_xc_kernel_krks(kmf, kmf.xc, dm0)[0][1:]*0.5
+        use_cache = bool(getattr(pprpa_grad, "use_ao_cache", False))
+        ao_cache = None
+        if use_cache and hasattr(ni, "set_ao_cache"):
+            ao_deriv = 2 if ni._xc_type(kmf.xc) in ("GGA", "MGGA") else 1
+            ao_cache = ni.set_ao_cache(cell, kmf.grids, ao_deriv, kpts=kmf.kpts,
+                                       max_memory=kmf_grad.max_memory)
+        elif hasattr(ni, "ao_cache"):
+            ni.ao_cache = None
+        vk = kmf_grad.get_k(np.array([xy_ao]))
+        vk = vk[:,0,:,:]
+        vxc, vjk = get_veff_krks(kmf_grad, np.array([[dm0_hf], [dm0]]),
+                                 ao_cache=ao_cache)
+        vxc = vxc[:,:,0,:,:].transpose(1,0,2,3)
+        vjk = vjk[:,:,0,:,:].transpose(1,0,2,3)
+        vjk[1] += _contract_xc_kernel_krks(
+            kmf, kmf.xc, dm0, ao_cache=ao_cache)[0][1:]*0.5
 
         aoslices = cell.aoslice_by_atom()
         de = np.zeros((len(atmlst), 3))
