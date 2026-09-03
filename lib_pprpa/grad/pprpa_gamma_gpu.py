@@ -33,6 +33,7 @@ Requirements / scope
 * Validated: vs CPU 2e-10 (C2 diamond, up to gth-tzv2p, singlet+triplet);
   vs finite difference 2.9e-7 (C2, off-grid).  Runs on the 63-atom NV cell.
 """
+import time
 import numpy as np
 import cupy as cp
 
@@ -43,6 +44,23 @@ from lib_pprpa.grad.grad_utils import get_xy_full
 from lib_pprpa.grad.grad_utils_gpu_pbc import _contract_xc_kernel as _cxk_gpu
 from lib_pprpa.grad.grad_utils_gpu_pbc import nr_rks_fxc as _nr_rks_fxc_gpu
 
+
+
+LAST_TELEMETRY = {}
+
+
+def get_last_telemetry():
+    return dict(LAST_TELEMETRY)
+
+
+def _timer_start():
+    cp.cuda.Device().synchronize()
+    return time.perf_counter()
+
+
+def _timer_stop(started):
+    cp.cuda.Device().synchronize()
+    return time.perf_counter() - started
 
 def _aftdf(cell, kpts):
     """AFTDF set up for energy-gradient J/K (FFTDF lacks get_k_e1)."""
@@ -82,6 +100,11 @@ def make_gpu_vresp(cell, mf):
 
 
 def grad_elec(pprpa_grad, xy, mult, atmlst=None):
+    global LAST_TELEMETRY
+    total_started = _timer_start()
+    timings = {}
+    free_started, total_vram = cp.cuda.runtime.memGetInfo()
+    min_free = int(free_started)
     mf = pprpa_grad.mf
     pprpa = pprpa_grad.base
     cell = mf.mol
@@ -101,6 +124,7 @@ def grad_elec(pprpa_grad, xy, mult, atmlst=None):
     nfo = nocc_all - nocc
     mo = mf.mo_coeff
 
+    phase_started = _timer_start()
     # --- relaxed density / energy-weighted density (CPU, validated) ----------
     kmf_cpu = _cpu.rhf_to_krhf(mf)
     kg_cpu = kmf_cpu.nuc_grad_method()
@@ -121,8 +145,15 @@ def grad_elec(pprpa_grad, xy, mult, atmlst=None):
     cocc = mo[:, nfo:nfo+nocc]
     cvir = mo[:, nfo+nocc:nfo+nocc+nvir]
     X = cvir @ vir_x @ cvir.T + cocc @ occ_y @ cocc.T
+    timings["cphf_relaxed_density_seconds"] = _timer_stop(phase_started)
+    min_free = min(min_free, int(cp.cuda.runtime.memGetInfo()[0]))
 
     # --- GPU assembly --------------------------------------------------------
+    def _prog(msg):
+        print(f"[gpu_grad] {msg}", flush=True)
+
+    _prog("relaxed density done; starting force assembly "
+          f"(mesh={list(cell.mesh)}, natm={cell.natm})")
     if is_ks:
         kmf = gdft.KRKS(cell, kpts=kpts, xc=mf.xc)
     else:
@@ -159,25 +190,35 @@ def grad_elec(pprpa_grad, xy, mult, atmlst=None):
     natm = cell.natm
     de = cp.zeros((natm, 3))
 
+    phase_started = _timer_start()
     # hcore (kinetic + local PP) contracted with the total density
+    _prog("hcore × density")
     hcore_deriv = krhf_g.hcore_generator(gg, cell, kpts)
     for ia in range(natm):
         de[ia] += cp.einsum('kxij,kji->x', hcore_deriv(ia), Tg[None]).real
 
+    timings["hcore_seconds"] = _timer_stop(phase_started)
+    phase_started = _timer_start()
     # J reference via the polarization identity Q(D+P)-Q(P), batched (FFTDF).
+    _prog("J force (FFTDF jk_energy_per_atom on T,P)")
     eJ = krhf_g.jk_energy_per_atom(
         kmf, cp.stack([Tg, Pg])[:, None], kpts, j_factor=1.0,
         sr_factor=0.0, lr_factor=0.0, omega=0.0, exxdiv=None)
     de += cp.asarray(eJ[0] - eJ[1])
+    timings["j_force_seconds"] = _timer_stop(phase_started)
+    min_free = min(min_free, int(cp.cuda.runtime.memGetInfo()[0]))
+    _prog("J force done")
 
     kaft = _kmf_aft() if need_k else None
     if need_k and abs(hyb) > 1e-12:
         # hybrid reference exchange K (AFTDF) via the same polarization identity
+        _prog(f"hybrid K force (AFTDF, hyb={hyb:.4f})")
         def dvk(dm):
             return cp.asarray(krhf_g.jk_energy_per_atom(
                 kaft, dm[None], kpts, j_factor=0.0, sr_factor=hyb, lr_factor=hyb,
                 omega=omega, exxdiv=exxdiv))
         de += dvk(Tg) - dvk(Pg)
+        _prog("hybrid K force done")
 
     # pp-RPA pairing exchange Tr[K[X]^x X] (AFTDF).  get_ek_ip1 assumes a
     # symmetric density: it returns +Q_K for the antisymmetric part of X and
@@ -189,30 +230,52 @@ def grad_elec(pprpa_grad, xy, mult, atmlst=None):
         return cp.asarray(krhf_g.jk_energy_per_atom(
             kaft, dm[None], kpts, j_factor=0.0, sr_factor=2.0, lr_factor=2.0,
             omega=omega, exxdiv=None))
+    phase_started = _timer_start()
     Xa = (Xg - Xg.T) * 0.5
     Xs = (Xg + Xg.T) * 0.5
     if kaft is None:
         kaft = _kmf_aft()
     if float(cp.abs(Xa).max()) > 1e-10:
+        _prog("pairing K force (AFTDF, antisym X) — often the slow step at large ke")
         de += _pair(Xa)
+        _prog("pairing K antisym done")
     if float(cp.abs(Xs).max()) > 1e-10:
+        _prog("pairing K force (AFTDF, sym X)")
         de -= _pair(Xs)
+        _prog("pairing K sym done")
 
+    timings["pairing_k_seconds"] = _timer_stop(phase_started)
+    min_free = min(min_free, int(cp.cuda.runtime.memGetInfo()[0]))
+    phase_started = _timer_start()
     # Vxc skeleton (contract with T) + fxc.P skeleton (contract with D)
     if is_ks:
+        _prog("Vxc / fxc skeletons")
         f1vo, v1ao = _cxk_gpu(kmf, mf.xc, Pg, dm0=Dg, with_vxc=True)
         for ia in range(natm):
             p0, p1 = aoslices[ia, 2:]
             de[ia] += cp.einsum('xij,ij->x', v1ao[1:, p0:p1], Tg[p0:p1]).real * 2
             de[ia] += cp.einsum('xij,ij->x', f1vo[1:, p0:p1], Dg[p0:p1]).real
+        _prog("Vxc / fxc done")
 
+    timings["vxc_fxc_seconds"] = _timer_stop(phase_started)
+    min_free = min(min_free, int(cp.cuda.runtime.memGetInfo()[0]))
     de = de.get()
 
     # overlap (energy-weighted) and nonlocal pseudo-potential
+    _prog("overlap + nonlocal PP")
     s1 = gg.get_ovlp(cell, kpts)
     de += krhf_g.contract_h1e_dm(cell, s1, Wg[None], hermi=1)
     de += krhf_g.vppnl_nuc_grad(cell, T[None], kpts=kpts)
+    _prog("force assembly complete")
 
+    timings["total_grad_elec_seconds"] = _timer_stop(total_started)
+    LAST_TELEMETRY.clear()
+    LAST_TELEMETRY.update({
+        "timings": timings,
+        "free_started_bytes": int(free_started),
+        "min_free_bytes": int(min_free),
+        "total_vram_bytes": int(total_vram),
+    })
     return de[list(atmlst)] if not isinstance(atmlst, range) else de
 
 
