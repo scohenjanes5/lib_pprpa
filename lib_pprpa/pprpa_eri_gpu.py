@@ -43,6 +43,30 @@ def attach_gpu_eri_contraction(pprpa, vvvv, oovv, oooo):
     return pprpa
 
 
+
+def release_gpu_eri(pprpa, *extra):
+    """Drop GPU MO-ERI tensors held by attach_gpu_eri_contraction.
+
+    Large CuPy allocations often bypass the memory pool (gpu4pyscf cuda_malloc)
+    and only return to the driver when the ndarray is destroyed.  The PBC
+    gradient path needs xy + mf.get_k, not the stored MO ERI, so call this
+    after Davidson (and after copying xy to numpy) and before grad_elec.
+    """
+    import gc
+    for attr in ("_gpu_vvvv", "_gpu_oooo", "_gpu_oovv", "_gpu_mo_energy"):
+        if hasattr(pprpa, attr):
+            setattr(pprpa, attr, None)
+    for obj in extra:
+        del obj
+    gc.collect()
+    cp.get_default_memory_pool().free_all_blocks()
+    try:
+        cp.get_default_pinned_memory_pool().free_all_blocks()
+    except Exception:
+        pass
+    free, total = cp.cuda.runtime.memGetInfo()
+    print(f"[mem] after ERI release: free≈{free/1e9:.2f}/{total/1e9:.2f} GB", flush=True)
+
 def _gpu_eri_contraction(pprpa, tri_vec):
     nocc, nvir = pprpa.nocc, pprpa.nvir
     no2, nv2 = nocc * nocc, nvir * nvir
