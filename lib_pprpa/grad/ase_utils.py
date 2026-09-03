@@ -170,16 +170,73 @@ class ASE_calculator(Calculator):
         else:
             raise NotImplementedError("Only energy and forces are implemented for ppRPA calculator.")
         
-def kernel(cell, grad_func, ene_func=None, logfile=None, fmax=0.05, max_steps=100, **kwargs):
+def _atomic_write_atoms(path, atoms):
+    """Write atoms to ``path`` via a temp file + os.replace (crash-safe).
+
+    ASE picks the writer from the *temp* filename extension, so ``.xyz.tmp``
+    fails with a cryptic ``tmp`` error — always pass an explicit format.
+    """
+    import os
+    from ase.io import write
+    path = os.path.abspath(path)
+    ext = os.path.splitext(path)[1].lower()
+    # Prefer extxyz for .xyz so cell / pbc / info survive the round-trip.
+    fmt = 'extxyz' if ext in ('.xyz', '.extxyz', '') else ext.lstrip('.')
+    tmp = path + '.tmp'
+    write(tmp, atoms, format=fmt)
+    os.replace(tmp, path)
+
+
+def kernel(cell, grad_func, ene_func=None, logfile=None, fmax=0.05, max_steps=100,
+           checkpoint=None, bfgs_restart=None, trajectory=None, **kwargs):
     '''Optimize the geometry using ASE.
+
+    Parameters
+    ----------
+    checkpoint : str or None
+        If set, write the current geometry (extxyz/xyz) after every BFGS step
+        so a walltime kill can resume from the last completed step.
+    bfgs_restart : str or None
+        ASE BFGS restart file (Hessian). Reused across job resubmissions when
+        the path is kept the same.
+    trajectory : str or None
+        Optional ASE trajectory path.
     '''
+    import os
+    import signal
+
     atoms = pyscf_to_ase_atoms(cell)
     atoms.calc = ASE_calculator(cell, grad_func=grad_func, ene_func=ene_func, **kwargs)
     if logfile is None:
         logfile = '-' # stdout
 
-    opt = BFGS(atoms, logfile=logfile)
+    opt = BFGS(atoms, logfile=logfile, restart=bfgs_restart, trajectory=trajectory)
+
+    def _save_checkpoint(step=None):
+        if not checkpoint:
+            return
+        try:
+            n = int(getattr(opt, 'nsteps', 0)) if step is None else int(step)
+            atoms.info = dict(getattr(atoms, 'info', {}) or {})
+            atoms.info['bfgs_step'] = n
+            _atomic_write_atoms(checkpoint, atoms)
+            print(f"[opt_ckpt] wrote {checkpoint} (BFGS step {n})", flush=True)
+        except Exception as exc:
+            print(f"[opt_ckpt] WARNING: failed to write {checkpoint}: {exc}", flush=True)
+
+    if checkpoint:
+        # interval=1: after each completed optimizer step
+        opt.attach(_save_checkpoint, interval=1)
+        # also dump on SIGTERM (Slurm soft kill before walltime hard-kill)
+        def _on_term(signum, frame):
+            print(f"[opt_ckpt] caught signal {signum}; saving checkpoint", flush=True)
+            _save_checkpoint()
+            raise SystemExit(128 + int(signum))
+
+        signal.signal(signal.SIGTERM, _on_term)
+
     converged = opt.run(fmax=fmax, steps=max_steps)
+    _save_checkpoint()
 
     cell = cell.set_geom_(atoms.get_positions(), unit='Ang', a=atoms.cell, inplace=False)
 
