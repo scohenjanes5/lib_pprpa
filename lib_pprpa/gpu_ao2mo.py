@@ -14,6 +14,9 @@ Memory strategy
 * Chem ERI is moved to the GPU only if that same pair_blk still fits beside it —
   never shrink the strip just to keep chem on device.
 * Chemist->physicist reorder host-bounces to avoid a 2x GPU peak.
+* After assembly, the three finals are uploaded only if they still fit in
+  75% of VRAM (``gpu_mem.fits_resident``). Otherwise they stay on the host
+  for tiled Davidson contraction.
 
 Validated element-wise vs CPU pprpaobj(mo_eri=True) (run this file as __main__).
 """
@@ -27,6 +30,8 @@ import numpy as np
 import cupy as cp
 from gpu4pyscf.pbc import tools as gtools
 from gpu4pyscf.pbc.dft import numint as gnumint
+
+from lib_pprpa.gpu_mem import eri_bytes, fits_resident
 
 
 LAST_TELEMETRY = {}
@@ -271,6 +276,7 @@ def gpu_ao2mo_blocks(cell, cocc, cvir, mesh, pair_blk=None, return_gpu=False):
     _sync()
     grid_seconds = time.perf_counter() - grid_started
 
+    final_bytes = eri_bytes(no, nv)
     vvvv_b = nv ** 4 * 8
     oooo_b = no ** 4 * 8
     oovv_b = (no ** 2) * (nv ** 2) * 8
@@ -280,11 +286,12 @@ def gpu_ao2mo_blocks(cell, cocc, cvir, mesh, pair_blk=None, return_gpu=False):
         f"{vvvv_b/1e9:.2f}/{oovv_b/1e9:.2f}/{oooo_b/1e9:.2f} GB | "
         f"free≈{_free_bytes()/1e9:.2f} GB", flush=True)
 
-    final_bytes = vvvv_b + oooo_b + oovv_b
     grid_bytes = moO.nbytes + moV.nbytes + coulG.nbytes + wcoulG.nbytes
-    stage_host = final_bytes + grid_bytes > int(0.75 * total_bytes)
+    stage_host = not fits_resident(
+        no, nv, extra_bytes=grid_bytes, total_bytes=total_bytes)
     if stage_host:
-        print("[gpu_ao2mo] staging all final ERIs on host until MO grids are released", flush=True)
+        print("[gpu_ao2mo] staging all final ERIs on host until MO grids are released",
+              flush=True)
     vvvv, stat_v = _block_direct(
         "vvvv", moV, moV, wcoulG, mesh, pair_blk=pair_blk, force_host=stage_host)
     oooo, stat_o = _block_direct(
@@ -294,10 +301,23 @@ def gpu_ao2mo_blocks(cell, cocc, cvir, mesh, pair_blk=None, return_gpu=False):
 
     del moO, moV, coulG, wcoulG
     _reclaim_gpu()
+    uploaded = False
     if stage_host:
-        vvvv_g = cp.asarray(vvvv); del vvvv; vvvv = vvvv_g
-        oovv_g = cp.asarray(oovv); del oovv; oovv = oovv_g
-        oooo_g = cp.asarray(oooo); del oooo; oooo = oooo_g
+        can_resident = fits_resident(no, nv, extra_bytes=0, total_bytes=total_bytes)
+        if can_resident:
+            print("[gpu_ao2mo] uploading host ERIs to GPU for resident Davidson",
+                  flush=True)
+            vvvv_g = cp.asarray(vvvv); del vvvv; vvvv = vvvv_g
+            oovv_g = cp.asarray(oovv); del oovv; oovv = oovv_g
+            oooo_g = cp.asarray(oooo); del oooo; oooo = oooo_g
+            uploaded = True
+        else:
+            print(
+                f"[gpu_ao2mo] leaving ERIs on host for tiled Davidson "
+                f"(eri={final_bytes/1e9:.2f} GB, "
+                f"0.75*VRAM={0.75 * total_bytes/1e9:.2f} GB)",
+                flush=True,
+            )
     _free_pool()
     _sync()
     LAST_TELEMETRY.clear()
@@ -312,12 +332,16 @@ def gpu_ao2mo_blocks(cell, cocc, cvir, mesh, pair_blk=None, return_gpu=False):
         "free_started_bytes": int(free_started),
         "total_vram_bytes": int(total_bytes),
         "host_staged": bool(stage_host),
+        "uploaded_to_gpu": bool(uploaded),
         "seconds": float(time.perf_counter() - total_started),
     })
 
+    on_gpu = uploaded or not stage_host
     if return_gpu:
         return vvvv, oovv, oooo
-    return cp.asnumpy(vvvv), cp.asnumpy(oovv), cp.asnumpy(oooo)
+    if on_gpu:
+        return cp.asnumpy(vvvv), cp.asnumpy(oovv), cp.asnumpy(oooo)
+    return vvvv, oovv, oooo
 
 
 if __name__ == "__main__":
