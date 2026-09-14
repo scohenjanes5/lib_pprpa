@@ -132,3 +132,34 @@ of the script — edit there for a different defect or charge state.
   much faster — that is the path used for the NV-center production runs.
 - The CPU `make_rdm1_relaxed_rhf_pprpa` builds the relaxed density (small MO-space
   algebra); only `mf.get_k` for the 2-RDM term and the response are routed to GPU.
+
+## Multi-GPU (opt-in) and the low-rank pairing-K force (2026-09-11)
+
+The 216-atom force took 23 h on one B200: pairing-K force 16.4 h (AFT
+`get_ek_ip1` on the dense amplitude density), ao2mo 5.2 h, everything else
+~1.3 h.  Two changes address this:
+
+1. **Low-rank FFT pairing-K force** (`lib_pprpa/gpu_pairing_force.py`, default in
+   `pprpa_gamma_gpu.Gradients`).  X = L R^T with rank <= nocc + nvir, so the
+   force reduces to one FFT pass over the r(r+1)/2 active-MO codensity pairs
+   plus a chunked gradient-AO contraction.  Exact for a general X (matches the
+   CPU reference `pprpa_gamma.py` pairing term to ~1e-10 on the diamond cell);
+   `PPRPA_PAIRING_K=aft` or `Gradients.pairing_k_method = "aft"` restores the
+   AFT kernel for cross-checks.  Patch 2 above is then only needed for hybrid
+   reference functionals.
+2. **Device group dispatch** (`lib_pprpa/gpu_multi.py`).  The strip loops of
+   ao2mo, the low-rank exchange, the pairing force and the per-atom hcore
+   derivative pull global tasks from a shared iterator on one thread per GPU;
+   read-only arrays are replicated (peer copy or host bounce), an OOM shrinks
+   only that slot's sub-block and redoes the failing task (no whole-tensor
+   restart).  It is **opt-in**: `LIB_PPRPA_GPUS=2` (exported by the 2-GPU
+   Slurm scripts `pprpa_force_gpu2.sbatch` / `pprpa_opt_gpu2.sbatch`, or
+   `submit_pprpa_opt_resumable.sh --gpus 2`) enables two slots; unset means one
+   slot and the single-device code path is unchanged.  `DeviceGroup([0, 0])`
+   runs two virtual slots on one GPU for tests.  Multi-GPU halves wall-clock
+   of those phases only; GPU-hours are unchanged, the algorithmic change above
+   is what lowers the budget.
+
+Tests: `tests/test_gpu_multi.py`, `tests/test_gpu_pairing_force.py`,
+`tests/test_gpu_ao2mo_multi.py`, `tests/test_gpu_grad_pairing_e2e.py`
+(1-GPU node suffices; a `--gres=gpu:2` job exercises real peer copies).
