@@ -64,6 +64,27 @@ blksize = int(avail_mem/(nao**2*bvk_ncells*16*8))//16*16
 
 Keep `.orig_bak` backups next to each file; to revert, copy them back.
 
+### Patch 1 is no longer enough at the 216-atom cell — use `get_k_lowrank`
+Even with adaptive `blksize`, `fft_jk.get_k_kpts` keeps `ao` (nao x ngrid),
+`ao_dms` and `vR_dm` (nset x nao x ngrid each) resident and FFTs one full
+nao x ngrid codensity row at a time. For nao=2795, mesh 159^3 (216-atom NV cell,
+ke=300 Ha) those are 90 / 180 / 180 GB plus a 270 GB per-row transient, so the
+2-RDM exchange OOMs on a 183 GB B200 regardless of block size (job 25686365).
+
+The pp-RPA densities are low rank (X_ao = C_a x C_a^T, Y_ao = C_i y C_i^T, rank
+<= AS), so the drivers now attach `lib_pprpa.gpu_fft_k.attach_lowrank_getk(mf, cell)`;
+`make_rdm1_relaxed_rhf_pprpa` uses `mf.get_k_lowrank` when present and builds
+K from (AO, active-MO) codensities: only the AO grid is nao x ngrid, the FFT
+batch is `row_blk * rank_blk * ngrid`, and there are ~nao/AS fewer FFTs.
+
+### Optional gpu4pyscf follow-up (NOT implemented yet)
+`get_k_kpts` never needs the persistent `vR_dm`: the per-block result can be
+contracted into `vk` immediately (`vk[i, p0:p1] += weight * blk.dot(ao1)`),
+saving `nset * nao * ngrid * 8` bytes for every dense caller (e.g. hybrid
+reference K in the CPHF response). It does not by itself make the 216-atom
+2-RDM exchange fit (ao_dms and the per-row FFT remain), so it was deferred in
+favour of the low-rank path above.
+
 ## MO-eri version (`pbc_pprpa_gamma_opt_nv_gpu.py`) — what it additionally needs
 
 The AO-direct contraction rebuilds the pairing kernel from the AOs every Davidson

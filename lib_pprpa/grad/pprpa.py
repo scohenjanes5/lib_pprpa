@@ -222,9 +222,18 @@ def make_rdm1_relaxed_rhf_pprpa(pprpa, mf, xy=None, mult='t', istate=0, cphf_max
     elif pprpa._use_eri or pprpa._ao_direct:
         hermi = 1 if mult == 's' else 2
         mo_ene_full = mf.mo_energy
-        X_ao = orba @ vir_x_mat @ orba.T
-        Y_ao = orbi @ occ_y_mat @ orbi.T
-        X_eri, Y_eri = mf.get_k(dm=np.stack((X_ao, Y_ao)), hermi=hermi)
+        get_k_lowrank = getattr(mf, 'get_k_lowrank', None)
+        if get_k_lowrank is not None:
+            # X_ao = orba x orba^T and Y_ao = orbi y orbi^T have rank <= the active
+            # space.  Hand over the factors (D = L R^T) so the exchange build never
+            # holds dense nao x nao densities or nao x nao x ngrid intermediates
+            # (see lib_pprpa.gpu_fft_k.get_k_lowrank).
+            X_eri, Y_eri = get_k_lowrank(
+                ((orba @ vir_x_mat, orba), (orbi @ occ_y_mat, orbi)), hermi=hermi)
+        else:
+            X_ao = orba @ vir_x_mat @ orba.T
+            Y_ao = orbi @ occ_y_mat @ orbi.T
+            X_eri, Y_eri = mf.get_k(dm=np.stack((X_ao, Y_ao)), hermi=hermi)
         X_eri = mf.mo_coeff.T @ X_eri @ orbp
         Y_eri = mf.mo_coeff.T @ Y_eri @ orbp
     else:

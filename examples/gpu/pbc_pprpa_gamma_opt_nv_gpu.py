@@ -125,6 +125,11 @@ def _patch_gpu_getk(mf, cell):
         K = cp.asnumpy(fft_jk.get_k(fdf, dmg, hermi=0, kpt=np.zeros(3), exxdiv=None))
         return K[0] if single else K
     mf.get_k = gk
+    # Low-rank exchange for the pp-RPA amplitude densities (rank <= AS): avoids the
+    # nao x ngrid intermediates of the dense fft_jk.get_k path at large cells.
+    from lib_pprpa.gpu_fft_k import attach_lowrank_getk
+    from lib_pprpa import gpu_multi          # LIB_PPRPA_GPUS=2 opts into 2-GPU dispatch
+    attach_lowrank_getk(mf, cell, cell.mesh, group=gpu_multi.default_group())
 
 
 
