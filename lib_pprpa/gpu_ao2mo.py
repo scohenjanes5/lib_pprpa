@@ -14,6 +14,14 @@ Memory strategy
 * Chem ERI is moved to the GPU only if that same pair_blk still fits beside it —
   never shrink the strip just to keep chem on device.
 * Chemist->physicist reorder host-bounces to avoid a 2x GPU peak.
+* Outer pair strips are dispatched over ``gpu_multi.DeviceGroup`` slots (one
+  by default; LIB_PPRPA_GPUS=2 opts in).  MO grids are replicated per slot; an
+  OOM shrinks only that slot's sub-strip and redoes the failing strip instead
+  of restarting the whole tensor.  With >1 slot the finals are host-staged.
+* Strips are also capped at ``gpu_mem.max_fft_batch(ngrid)`` rows: cuFFT
+  returns CUFFT_INVALID_SIZE (not an OOM) for batched plans above 2^31
+  elements on Bluestein-sized meshes (e.g. 151^3), which a roomy B200 would
+  otherwise trigger with pair_blk=1200.  That error is treated as retryable.
 * After assembly, the three finals are uploaded only if they still fit in
   75% of VRAM (``gpu_mem.fits_resident``). Otherwise they stay on the host
   for tiled Davidson contraction.
@@ -24,6 +32,7 @@ from __future__ import annotations
 
 import math
 import os
+import threading
 import time
 
 import numpy as np
@@ -31,7 +40,8 @@ import cupy as cp
 from gpu4pyscf.pbc import tools as gtools
 from gpu4pyscf.pbc.dft import numint as gnumint
 
-from lib_pprpa.gpu_mem import eri_bytes, fits_resident
+from lib_pprpa.gpu_mem import eri_bytes, fits_resident, max_fft_batch
+from lib_pprpa.pprpa_util import tstamp as _ts
 
 
 LAST_TELEMETRY = {}
@@ -42,46 +52,9 @@ def get_last_telemetry():
     return dict(LAST_TELEMETRY)
 
 
-def _sync():
-    cp.cuda.Device().synchronize()
-
-
-def _free_pool():
-    """Return unused CuPy blocks to the driver."""
-    cp.get_default_memory_pool().free_all_blocks()
-    try:
-        cp.get_default_pinned_memory_pool().free_all_blocks()
-    except Exception:
-        pass
-
-
-def _clear_fft_cache():
-    """cuFFT plan cache retains workspace across probes and starves later allocs."""
-    try:
-        cp.fft.config.get_plan_cache().clear()
-    except Exception:
-        pass
-
-
-def _reclaim_gpu():
-    """Drop FFT plans + pooled blocks so memGetInfo reflects truly free VRAM."""
-    _clear_fft_cache()
-    _free_pool()
-    try:
-        cp.cuda.Device().synchronize()
-    except Exception:
-        pass
-
-
-def _free_bytes():
-    """Driver-reported free VRAM (CuPy pool holdings count as used).
-
-    Do NOT use gpu4pyscf get_avail_mem here: it can report a stale/constant
-    value that ignores live CuPy allocations.  Call ``_reclaim_gpu`` first if
-    you need free after FFT probes.
-    """
-    free, _total = cp.cuda.runtime.memGetInfo()
-    return int(free)
+# current-device helpers live in gpu_multi (shared with gpu_fft_k / gpu_pairing_force)
+from lib_pprpa.gpu_multi import (  # noqa: E402,F401  (re-exported for callers/tests)
+    _sync, _free_pool, _clear_fft_cache, _reclaim_gpu, _free_bytes, _is_oom)
 
 
 def _mo_on_grid(cell, mo, mesh):
@@ -99,15 +72,6 @@ def _codensity_pairs(moA, moB, p0, p1):
     return moA[idx // nB] * moB[idx % nB]
 
 
-def _is_oom(exc):
-    if isinstance(exc, cp.cuda.memory.OutOfMemoryError):
-        return True
-    msg = f"{type(exc).__name__}: {exc}".lower()
-    return ("outofmemory" in msg
-            or "memory allocation" in msg
-            or "cudaerrormemoryallocation" in msg)
-
-
 def _cushion_bytes():
     """VRAM to hold back during probes so assembly is not razor-tight.
 
@@ -117,49 +81,54 @@ def _cushion_bytes():
 
 
 
-def _estimate_pair_blk(npair, ngrid, nB, pair_blk=None):
+def _estimate_pair_blk(npair, ngrid, nB, pair_blk=None, free=None, mesh=None):
     """Estimate a fast strip size from live driver memory.
 
     The final ERI tensor has already been allocated when this is called.  The
     estimate budgets the remaining memory for rho, FFT output/workspace, vR,
     rho_q and the GEMM tile.  Default strips are aligned to complete second-MO
-    rows, which permits direct contiguous writes in physicist layout.
+    rows, which permits direct contiguous writes in physicist layout.  ``free``
+    (bytes) overrides the current-device query (multi-GPU: plan from the
+    slot with the least free memory).
     """
     if pair_blk is not None:
         raw = max(1, min(int(pair_blk), npair))
     else:
-        free = _free_bytes()
+        if free is None:
+            free = _free_bytes()
         reserve = max(_cushion_bytes(), int(0.06 * free))
         budget = max(0, free - reserve)
-        # FFT output/workspace is partly reused; geometric OOM rollback covers
-        # residual driver variation without expensive cold cuFFT probes.
-        linear = max(ngrid * 40, 1)
+        # rho_p (8) + complex FFT copy (16) + vG (16) + vR (16) + rho_q (8) bytes
+        # per pair-gridpoint; 40 was optimistic (216-atom vvvv OOMed at 900 and
+        # fell back to 300 while 600 ran fine).
+        linear = max(ngrid * 64, 1)
         # Solve 8*b^2 + linear*b <= budget (tile plus grid temporaries).
         raw = int((-linear + math.sqrt(linear * linear + 32 * budget)) / 16)
         raw = max(1, min(raw, npair))
         env_cap = os.environ.get("GPU_AO2MO_MAX_PAIR_BLK")
         if env_cap:
             raw = min(raw, max(1, int(env_cap)))
+    # One strip is one batched cuFFT plan: keep it under the cuFFT element limit
+    # (strict 2^31 on Bluestein meshes, relaxed on direct-path meshes).
+    raw = min(raw, max_fft_batch(ngrid, mesh=mesh))
     raw = max(nB, raw)
     raw = max(nB, (raw // nB) * nB)
     return min(raw, npair)
 
-def _assemble_direct(moA, moB, wcoulG, mesh, out, blk, stats, on_gpu):
-    """Fill a physicist-layout ERI directly in baseline arithmetic order."""
-    nA, nB = moA.shape[0], moB.shape[0]
-    npair = nA * nB
-    nblk = (npair + blk - 1) // blk
-    ngemms = nblk * nblk
-    print(
-        f"[gpu_ao2mo]   direct strips={nblk}x{nblk} GEMMs={ngemms}; "
-        f"pair_blk={blk}", flush=True)
-    stats["nstrips"] = nblk
-    stats["gemms"] = ngemms
-
-    for ip, p0 in enumerate(range(0, npair, blk)):
-        p1 = min(p0 + blk, npair)
-        a0, a1 = p0 // nB, p1 // nB
-        rho_p = _codensity_pairs(moA, moB, p0, p1)
+def _strip_task(ctx, task, keyA, keyB, mesh, out, on_gpu, nB, npair):
+    """Outer pair strip [p0, p1) of a physicist-layout ERI, in sub-strips of the
+    slot's ``sub_blk`` (whole nB-row multiples).  Every (outer, inner) tile is a
+    plain assignment into a disjoint ``out`` rectangle, so a retry is idempotent
+    and slots never write the same elements."""
+    st = ctx.state
+    moA, moB, wcoulG = st[keyA], st[keyB], st["wcoulG"]
+    p0, p1 = task
+    s0 = p0
+    while s0 < p1:
+        blk = int(st["sub_blk"])
+        s1 = min(p1, s0 + blk)
+        a0, a1 = s0 // nB, s1 // nB
+        rho_p = _codensity_pairs(moA, moB, s0, s1)
         vR = gtools.ifft(gtools.fft(rho_p, mesh) * wcoulG, mesh).real
         rho_p = None
         for q0 in range(0, npair, blk):
@@ -174,24 +143,35 @@ def _assemble_direct(moA, moB, wcoulG, mesh, out, blk, stats, on_gpu):
                 out[a0:a1, b0:b1] = cp.asnumpy(phys)
             rho_q = tile = phys = None
         vR = None
-        stats["min_free_bytes"] = min(stats["min_free_bytes"], _free_bytes())
-        if nblk > 1 and ((ip + 1) % max(1, nblk // 4) == 0 or ip + 1 == nblk):
-            print(f"[gpu_ao2mo]   strip {ip + 1}/{nblk} done", flush=True)
-    return out
+        s0 = s1
 
 
-def _block_direct(name, moA, moB, wcoulG, mesh, pair_blk=None, force_host=False):
+def _make_strip_shrink(nB):
+    def _shrink(ctx, task, exc):
+        blk = int(ctx.state["sub_blk"])
+        if blk <= nB:
+            return False
+        ctx.state["sub_blk"] = max(nB, ((blk // 2) // nB) * nB)
+        return True
+    return _shrink
+
+
+def _block_direct(name, keyA, keyB, mesh, group, pair_blk=None, force_host=False):
     """Fill a final physicist ERI on GPU or directly on host when VRAM is tight.
 
-    ``force_host`` stages a final tensor until all MO grids are released.  This
-    is required when the three final ERIs fit, but they do not fit together with
-    the MO grids and one FFT strip on smaller high-memory GPUs.
+    ``keyA``/``keyB`` name the MO grids in every slot's ``state`` (see
+    ``DeviceGroup.broadcast``).  ``force_host`` stages a final tensor until all
+    MO grids are released; with more than one GPU slot the tensor is always
+    host-staged because only device 0 could write a cupy ``out``.  Outer pair
+    strips are the dispatched tasks; an OOM shrinks only the failing slot's
+    sub-strip and redoes that task (no whole-tensor restart).
     """
-    nA, nB = moA.shape[0], moB.shape[0]
+    moA0, moB0 = group.ctxs[0].state[keyA], group.ctxs[0].state[keyB]
+    nA, nB, ngrid = moA0.shape[0], moB0.shape[0], moA0.shape[1]
     npair = nA * nB
     out_bytes = npair * npair * 8
-    free_before = _free_bytes()
-    on_gpu = not force_host
+    free_before = group.min_free_bytes()
+    on_gpu = not force_host and group.inline
     if on_gpu:
         try:
             out = cp.empty((nA, nA, nB, nB), dtype=cp.float64)
@@ -202,7 +182,7 @@ def _block_direct(name, moA, moB, wcoulG, mesh, pair_blk=None, force_host=False)
                 f"gpu_ao2mo: final {name} tensor ({out_bytes/1e9:.2f} GB) "
                 f"does not fit (free≈{free_before/1e9:.2f} GB)") from exc
         _reclaim_gpu()
-        blk = _estimate_pair_blk(npair, moA.shape[1], nB, pair_blk=pair_blk)
+        blk = _estimate_pair_blk(npair, ngrid, nB, pair_blk=pair_blk, mesh=mesh)
         # A retained result must leave enough space for useful FFT strips.
         if pair_blk is None and blk <= min(npair, 4 * nB):
             del out
@@ -210,7 +190,8 @@ def _block_direct(name, moA, moB, wcoulG, mesh, pair_blk=None, force_host=False)
             on_gpu = False
     if not on_gpu:
         out = np.empty((nA, nA, nB, nB), dtype=np.float64)
-        blk = _estimate_pair_blk(npair, moA.shape[1], nB, pair_blk=pair_blk)
+        blk = _estimate_pair_blk(npair, ngrid, nB, pair_blk=pair_blk,
+                                 free=group.min_free_bytes(), mesh=mesh)
     stats = {
         "name": name,
         "npair": int(npair),
@@ -221,47 +202,68 @@ def _block_direct(name, moA, moB, wcoulG, mesh, pair_blk=None, force_host=False)
         "output_location": ("gpu" if on_gpu else
                             ("host_staged" if force_host else "host_direct")),
         "free_before_bytes": int(free_before),
-        "free_after_output_bytes": int(_free_bytes()),
-        "min_free_bytes": int(_free_bytes()),
+        "free_after_output_bytes": int(group.min_free_bytes()),
+        "min_free_bytes": int(group.min_free_bytes()),
     }
     location = "GPU" if on_gpu else ("host-staged" if force_host else "host-direct")
+    tasks = [(p0, min(p0 + blk, npair)) for p0 in range(0, npair, blk)]
+    nblk = len(tasks)
     print(
-        f"[gpu_ao2mo] {name} final tensor {out_bytes/1e9:.2f} GB "
+        f"{_ts()} [gpu_ao2mo] {name} final tensor {out_bytes/1e9:.2f} GB "
         f"on {location}; pair_blk={blk} (analytic); "
-        f"free≈{free_before/1e9:.2f}→{_free_bytes()/1e9:.2f} GB", flush=True)
+        f"free≈{free_before/1e9:.2f}→{stats['free_after_output_bytes']/1e9:.2f} GB", flush=True)
+    print(
+        f"{_ts()} [gpu_ao2mo]   direct strips={nblk}x{nblk} GEMMs={nblk * nblk}; "
+        f"pair_blk={blk} on {group.nslots} slot(s)", flush=True)
+    stats["nstrips"] = nblk
+    stats["gemms"] = nblk * nblk
 
-    while True:
-        started = time.perf_counter()
-        try:
-            _assemble_direct(moA, moB, wcoulG, mesh, out, blk, stats, on_gpu)
-            if not on_gpu and not force_host:
-                uploaded = cp.asarray(out)
-                del out
-                out = uploaded
-            _sync()
-            stats["seconds"] = time.perf_counter() - started
-            stats["pair_blk"] = int(blk)
-            return out, stats
-        except Exception as exc:
-            if not _is_oom(exc):
-                del out
-                raise
-            stats["retries"] += 1
-            _reclaim_gpu()
-            if blk <= nB:
-                del out
-                raise MemoryError(
-                    f"gpu_ao2mo: OOM at one complete MO-row strip for {name} "
-                    f"(free≈{_free_bytes()/1e9:.2f} GB)") from exc
-            blk = max(nB, ((blk // 2) // nB) * nB)
-            print(
-                f"[gpu_ao2mo] OOM — retrying {name} from start with "
-                f"pair_blk={blk}; free≈{_free_bytes()/1e9:.2f} GB", flush=True)
+    def _init(ctx):
+        ctx.state["sub_blk"] = blk
+    group.each(_init)
+    done = [0]
+    lock = threading.Lock()
+    report_every = max(1, nblk // 4)
+
+    def _work(ctx, task):
+        _strip_task(ctx, task, keyA, keyB, mesh, out, on_gpu, nB, npair)
+        with lock:
+            done[0] += 1
+            k = done[0]
+        if nblk > 1 and (k % report_every == 0 or k == nblk):
+            print(f"{_ts()} [gpu_ao2mo]   strip {k}/{nblk} done", flush=True)
+
+    started = time.perf_counter()
+    try:
+        _results, run_stats = group.run(tasks, _work, shrink=_make_strip_shrink(nB),
+                                        label=f"ao2mo {name}")
+    except Exception:
+        del out
+        raise
+    if not on_gpu and not force_host:
+        uploaded = cp.asarray(out)
+        del out
+        out = uploaded
+    _sync()
+    stats["seconds"] = time.perf_counter() - started
+    stats["retries"] = int(sum(run_stats["retries_per_slot"]))
+    stats["final_pair_blk_per_slot"] = [int(c.state["sub_blk"]) for c in group.ctxs]
+    stats["min_free_bytes"] = int(min(
+        [b for b in run_stats["min_free_bytes_per_slot"] if b is not None] + [stats["min_free_bytes"]]))
+    stats["multi_gpu"] = run_stats
+    return out, stats
 
 
-def gpu_ao2mo_blocks(cell, cocc, cvir, mesh, pair_blk=None, return_gpu=False):
-    """Return direct-assembled vvvv, oovv, oooo tensors in physicist layout."""
+def gpu_ao2mo_blocks(cell, cocc, cvir, mesh, pair_blk=None, return_gpu=False, group=None):
+    """Return direct-assembled vvvv, oovv, oooo tensors in physicist layout.
+
+    ``group`` (``lib_pprpa.gpu_multi.DeviceGroup``, default LIB_PPRPA_GPUS slots)
+    dispatches the pair strips over GPUs; the MO grids are built once on the
+    current device and replicated to the other slots.
+    """
     global LAST_TELEMETRY
+    from lib_pprpa.gpu_multi import default_group
+    group = group or default_group()
     _free_pool()
     _sync()
     total_started = time.perf_counter()
@@ -274,6 +276,9 @@ def gpu_ao2mo_blocks(cell, cocc, cvir, mesh, pair_blk=None, return_gpu=False):
     coulG = cp.asarray(gtools.get_coulG(cell, mesh=mesh))
     wcoulG = coulG * (cell.vol / ng)
     _sync()
+    group.broadcast(moO, "moO")
+    group.broadcast(moV, "moV")
+    group.broadcast(wcoulG, "wcoulG")
     grid_seconds = time.perf_counter() - grid_started
 
     final_bytes = eri_bytes(no, nv)
@@ -281,7 +286,7 @@ def gpu_ao2mo_blocks(cell, cocc, cvir, mesh, pair_blk=None, return_gpu=False):
     oooo_b = no ** 4 * 8
     oovv_b = (no ** 2) * (nv ** 2) * 8
     print(
-        f"[gpu_ao2mo] no={no} nv={nv} ngrid={ng} | "
+        f"{_ts()} [gpu_ao2mo] no={no} nv={nv} ngrid={ng} | "
         f"ERI sizes vvvv/oovv/oooo = "
         f"{vvvv_b/1e9:.2f}/{oovv_b/1e9:.2f}/{oooo_b/1e9:.2f} GB | "
         f"free≈{_free_bytes()/1e9:.2f} GB", flush=True)
@@ -290,22 +295,23 @@ def gpu_ao2mo_blocks(cell, cocc, cvir, mesh, pair_blk=None, return_gpu=False):
     stage_host = not fits_resident(
         no, nv, extra_bytes=grid_bytes, total_bytes=total_bytes)
     if stage_host:
-        print("[gpu_ao2mo] staging all final ERIs on host until MO grids are released",
+        print(f"{_ts()} [gpu_ao2mo] staging all final ERIs on host until MO grids are released",
               flush=True)
     vvvv, stat_v = _block_direct(
-        "vvvv", moV, moV, wcoulG, mesh, pair_blk=pair_blk, force_host=stage_host)
+        "vvvv", "moV", "moV", mesh, group, pair_blk=pair_blk, force_host=stage_host)
     oooo, stat_o = _block_direct(
-        "oooo", moO, moO, wcoulG, mesh, pair_blk=pair_blk, force_host=stage_host)
+        "oooo", "moO", "moO", mesh, group, pair_blk=pair_blk, force_host=stage_host)
     oovv, stat_ov = _block_direct(
-        "oovv", moO, moV, wcoulG, mesh, pair_blk=pair_blk, force_host=stage_host)
+        "oovv", "moO", "moV", mesh, group, pair_blk=pair_blk, force_host=stage_host)
 
+    group.free(["moO", "moV", "wcoulG"])
     del moO, moV, coulG, wcoulG
     _reclaim_gpu()
     uploaded = False
     if stage_host:
         can_resident = fits_resident(no, nv, extra_bytes=0, total_bytes=total_bytes)
         if can_resident:
-            print("[gpu_ao2mo] uploading host ERIs to GPU for resident Davidson",
+            print(f"{_ts()} [gpu_ao2mo] uploading host ERIs to GPU for resident Davidson",
                   flush=True)
             vvvv_g = cp.asarray(vvvv); del vvvv; vvvv = vvvv_g
             oovv_g = cp.asarray(oovv); del oovv; oovv = oovv_g
@@ -313,7 +319,7 @@ def gpu_ao2mo_blocks(cell, cocc, cvir, mesh, pair_blk=None, return_gpu=False):
             uploaded = True
         else:
             print(
-                f"[gpu_ao2mo] leaving ERIs on host for tiled Davidson "
+                f"{_ts()} [gpu_ao2mo] leaving ERIs on host for tiled Davidson "
                 f"(eri={final_bytes/1e9:.2f} GB, "
                 f"0.75*VRAM={0.75 * total_bytes/1e9:.2f} GB)",
                 flush=True,
@@ -333,6 +339,7 @@ def gpu_ao2mo_blocks(cell, cocc, cvir, mesh, pair_blk=None, return_gpu=False):
         "total_vram_bytes": int(total_bytes),
         "host_staged": bool(stage_host),
         "uploaded_to_gpu": bool(uploaded),
+        "gpu_slots": list(group.devices),
         "seconds": float(time.perf_counter() - total_started),
     })
 
