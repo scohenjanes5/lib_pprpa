@@ -30,6 +30,7 @@ except ImportError:  # pragma: no cover
     cp = None
 
 from lib_pprpa.gpu_mem import eri_bytes, fits_resident
+from lib_pprpa.pprpa_util import tstamp as _ts
 
 _INV_SQRT2 = 1.0 / math.sqrt(2.0)
 
@@ -182,7 +183,7 @@ def attach_gpu_eri_contraction(pprpa, vvvv, oovv, oooo, mode="auto",
             "nvir": int(nvir),
         })
         print(
-            f"[pprpa_eri_gpu] mode={chosen_mode}"
+            f"{_ts()} [pprpa_eri_gpu] mode={chosen_mode}"
             f"{'' if tile_used is None else f' tile={tile_used}'}"
             f" eri={nbytes/1e9:.2f} GB no={nocc} nv={nvir}",
             flush=True,
@@ -205,7 +206,7 @@ def attach_gpu_eri_contraction(pprpa, vvvv, oovv, oooo, mode="auto",
         except Exception as exc:
             if not _is_oom(exc):
                 raise
-            print("[pprpa_eri_gpu] resident ERI upload OOM — falling back to tiled",
+            print(f"{_ts()} [pprpa_eri_gpu] resident ERI upload OOM — falling back to tiled",
                   flush=True)
             for attr in ("_gpu_vvvv", "_gpu_oooo", "_gpu_oovv"):
                 setattr(pprpa, attr, None)
@@ -239,7 +240,7 @@ def release_gpu_eri(pprpa, *extra):
     except Exception:
         pass
     free, total = cp.cuda.runtime.memGetInfo()
-    print(f"[mem] after ERI release: free≈{free/1e9:.2f}/{total/1e9:.2f} GB", flush=True)
+    print(f"{_ts()} [mem] after ERI release: free≈{free/1e9:.2f}/{total/1e9:.2f} GB", flush=True)
 
 
 def _prepare_z(pprpa, tri_vec):
@@ -323,7 +324,7 @@ def _gpu_eri_contraction_tiled(pprpa, tri_vec):
                 raise
             tile = max(1, tile // 2)
             pprpa._eri_tile = tile
-            print(f"[pprpa_eri_gpu] OOM — retrying tiled MVP with tile={tile}",
+            print(f"{_ts()} [pprpa_eri_gpu] OOM — retrying tiled MVP with tile={tile}",
                   flush=True)
             cp.get_default_memory_pool().free_all_blocks()
     return _finish_mv(pprpa, T, prod_vv, prod_oo, tro, tco, trv, tcv, di_o, di_v)
