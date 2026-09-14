@@ -469,3 +469,8 @@ def int2ordinal(num: int):
     q, mod = divmod(num, 10)
     suffix = q % 10 != 1 and ordinal_dict.get(mod) or "th"
     return f"{num}{suffix}"
+
+
+def tstamp():
+    """Wall-clock stamp for progress prints (shows where Slurm walltime goes)."""
+    return time.strftime("%Y-%m-%d %H:%M:%S")
