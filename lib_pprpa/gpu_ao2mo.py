@@ -8,12 +8,23 @@ then permuted to the physicist convention pp-RPA expects (matches pprpaobj):
 
 Memory strategy
 ---------------
-* Pair strips are streamed so the full (npair, ngrid) codensity is never built.
-* pair_blk is chosen first with chem on host (full VRAM for the FFT strip), via
-  cold cuFFT probes + binary search.
-* Chem ERI is moved to the GPU only if that same pair_blk still fits beside it —
-  never shrink the strip just to keep chem on device.
-* Chemist->physicist reorder host-bounces to avoid a 2x GPU peak.
+* The MO grids are built in grid chunks (``_mos_on_grid``), so the (ngrid, nao)
+  AO array is never materialised (90 GB at nao=2795, 159^3 -- the only term in
+  ao2mo that is quadratic in system size; measured peak 109 -> 54 GB).  One AO
+  block feeds every coefficient set, so the occ and vir grids share a single
+  evaluation.  Each slot builds its own copy concurrently, which replaces the
+  old build-on-device-0-then-broadcast; splitting the chunks across slots
+  instead is opt-in (``GPU_AO2MO_GRID_DISPATCH=1``) because the host round trip
+  costs more than the evaluation it saves at NV216 scale.
+* The chemist ERI is a Gram matrix in the Coulomb metric, E = rho W rho^T with
+  W = (vol/ngrid) F^-1 diag(coulG) F, so it block-factorises exactly:
+  E[I,J] = (rho_I W) rho_J^T.  Pair strips are streamed accordingly and the
+  full (npair, ngrid) codensity is never built (2.9 TB at nv=300, 159^3).
+* pair_blk is chosen analytically from live free memory (``_estimate_pair_blk``:
+  64 B per pair-gridpoint of transients plus the b x b tile), not by probing.
+* Strips are aligned to whole second-MO rows, which makes the chemist->physicist
+  permutation a per-tile reshape+transpose into a contiguous ``out`` rectangle;
+  there is no separate reorder pass.
 * Outer pair strips are dispatched over ``gpu_multi.DeviceGroup`` slots (one
   by default; LIB_PPRPA_GPUS=2 opts in).  MO grids are replicated per slot; an
   OOM shrinks only that slot's sub-strip and redoes the failing strip instead
@@ -57,12 +68,196 @@ from lib_pprpa.gpu_multi import (  # noqa: E402,F401  (re-exported for callers/t
     _sync, _free_pool, _clear_fft_cache, _reclaim_gpu, _free_bytes, _is_oom)
 
 
-def _mo_on_grid(cell, mo, mesh):
-    """MO values on the uniform grid: (nmo, ngrid) cupy real (Gamma)."""
+_KPTS0 = np.zeros((1, 3))  # one object: eval_ao_kpts asserts `kpts is opt.kpts`
+
+# Floor on the grid chunk: below this the per-call overhead of eval_ao_kpts
+# dominates and nothing is gained by shrinking further.
+_AO_CHUNK_FLOOR = 4096
+
+
+def _estimate_gchunk(nao, nmo_total, ngrid, gchunk=None, free=None, frac=0.4):
+    """Grid points per AO chunk, so one chunk uses about ``frac`` of free VRAM.
+
+    ``nao`` enters ao2mo in exactly one place — the AO values on the grid — and
+    it enters quadratically in the system size (8*nao*ngrid bytes, 90 GB at
+    nao=2795 on 159^3, while every other term is 8*nmo*ngrid or 64*pair_blk*
+    ngrid).  Chunking the grid axis caps it at ``8*nao*gchunk``.  ``free``
+    (bytes) overrides the current-device query (multi-GPU: plan from the slot
+    with the least free memory).
+    """
+    if gchunk is not None:
+        return max(1, min(int(gchunk), ngrid))
+    env = os.environ.get("GPU_AO2MO_GRID_CHUNK")
+    if env:
+        return max(1, min(int(env), ngrid))
+    if free is None:
+        free = _free_bytes()
+    # (g, nao) AO block, a like-sized allowance for what eval_ao_kpts holds
+    # while building it, and one output column per MO of every set.
+    per_point = max(1, 16 * int(nao) + 8 * int(nmo_total))
+    budget = int(max(0, free) * frac)
+    return int(max(min(_AO_CHUNK_FLOOR, ngrid),
+                   min(ngrid, budget // per_point)))
+
+
+def _grid_shrink(ctx, task, exc):
+    """Halve this slot's AO chunk after an OOM and redo the same grid task."""
+    cur = int(ctx.state["gchunk"])
+    if cur <= 1:
+        return False
+    ctx.state["gchunk"] = max(1, cur // 2)
+    return True
+
+
+def _mos_on_grid(cell, mos, keys, mesh, group=None, gchunk=None, dispatch=None):
+    """Build MO grids on every slot, leaving them in ``ctx.state[key]``.
+
+    One (nmo, ngrid) array per entry of ``mos``, real at Gamma.  The
+    (ngrid, nao) AO array is never materialised: the AOs are evaluated in grid
+    chunks, and one AO block feeds every coefficient set, so the occupied and
+    virtual grids share a single evaluation.  Chunking is exact -- an output
+    element sums over ``nao`` only, so no reduction crosses a chunk boundary.
+
+    Multi-slot strategy (measured at NV216 scale, nao=2795, 159^3, two B200s):
+
+    * **replicated** (default): every slot chunks the whole grid into its own
+      device arrays, concurrently.  Same wall time as one slot (1.0 s), no host
+      staging and no peer traffic, and every slot ends holding what the strips
+      need -- strictly less work than building on device 0 and broadcasting.
+    * **dispatched** (``GPU_AO2MO_GRID_DISPATCH=1``): chunks are split across
+      slots into a host array that is then broadcast back.  It halves the AO
+      evaluation but pays a host round trip, which loses at this scale (2.5 s
+      vs 1.0 s).  It is kept for systems where the evaluation dominates -- the
+      AO term is the one part of ao2mo that grows as natoms^2.
+    """
+    from lib_pprpa.gpu_multi import default_group
+    group = group or default_group()
+    assert len(keys) == len(mos), "one state key per coefficient set"
     coords = cell.gen_uniform_grids(mesh)
-    ao = gnumint.eval_ao_kpts(cell, coords, kpts=np.zeros((1, 3)), deriv=0)[0]
-    ao = cp.asarray(ao)  # (ngrid, nao), real at Gamma
-    return cp.asarray(mo).T @ ao.T  # (nmo, ngrid)
+    ngrid = len(coords)
+    nao = int(cell.nao)
+    mos = [np.asarray(m) for m in mos]
+    nmos = [int(m.shape[1]) for m in mos]
+    if dispatch is None:
+        dispatch = os.environ.get("GPU_AO2MO_GRID_DISPATCH", "").strip() in ("1", "true", "yes")
+    dispatch = bool(dispatch) and not group.inline
+
+    started = time.perf_counter()
+
+    def _chunk_to(ctx, out_list, s0, s1, to_host):
+        """One AO block -> a column slice of every output. Returns bytes touched."""
+        ao = gnumint.eval_ao_kpts(cell, coords[s0:s1], kpts=_KPTS0,
+                                  deriv=0, opt=ctx.state["ao_opt"])[0]
+        aoT = ao.T  # (nao, g), real at Gamma
+        for out, C in zip(out_list, ctx.state["_mo_coeff"]):
+            sub = C.T @ aoT  # (nmo, g)
+            out[:, s0:s1] = cp.asnumpy(sub) if to_host else sub
+            sub = None
+
+    def _init(ctx, blk):
+        ctx.state["gchunk"] = int(blk)
+        ctx.state["ao_opt"] = gnumint._GTOvalOpt(cell, _KPTS0, deriv=0)
+        ctx.state["_mo_coeff"] = [cp.asarray(m) for m in mos]
+
+    if dispatch:
+        outs = [np.empty((n, ngrid), dtype=np.float64) for n in nmos]
+        blk = _estimate_gchunk(nao, sum(nmos), ngrid, gchunk=gchunk,
+                               free=group.min_free_bytes())
+        tasks = [(g0, min(g0 + blk, ngrid)) for g0 in range(0, ngrid, blk)]
+        group.each(lambda ctx: _init(ctx, blk))
+
+        def _work(ctx, task):
+            g0, g1 = task
+            s0 = g0
+            while s0 < g1:
+                s1 = min(g1, s0 + int(ctx.state["gchunk"]))
+                _chunk_to(ctx, outs, s0, s1, True)
+                s0 = s1
+
+        _results, run_stats = group.run(tasks, _work, shrink=_grid_shrink,
+                                        label="mo_on_grid")
+        final_gchunk = [int(c.state.get("gchunk", blk)) for c in group.ctxs]
+        nchunks = [len(tasks)]
+        for key, arr in zip(keys, outs):
+            group.broadcast(arr, key)
+        outs = None
+    else:
+        blk = _estimate_gchunk(nao, sum(nmos), ngrid, gchunk=gchunk,
+                               free=group.min_free_bytes())
+
+        def _alloc(ctx):
+            _init(ctx, blk)
+            for key, n in zip(keys, nmos):
+                ctx.state[key] = cp.empty((n, ngrid), dtype=np.float64)
+            _reclaim_gpu()
+            # re-plan per slot now that the outputs are resident (slots may be
+            # different devices, or differently loaded)
+            ctx.state["gchunk"] = _estimate_gchunk(nao, sum(nmos), ngrid,
+                                                   gchunk=gchunk)
+
+        def _build(ctx):
+            out_list = [ctx.state[k] for k in keys]
+            s0, done = 0, 0
+            while s0 < ngrid:
+                step = int(ctx.state["gchunk"])
+                s1 = min(ngrid, s0 + step)
+                try:
+                    _chunk_to(ctx, out_list, s0, s1, False)
+                except Exception as exc:  # noqa: BLE001 - classified below
+                    if not _is_oom(exc) or step <= 1:
+                        raise
+                    _reclaim_gpu()
+                    ctx.state["gchunk"] = max(1, step // 2)
+                    ctx.log(f"mo_on_grid: {type(exc).__name__}; retrying with "
+                            f"gchunk={ctx.state['gchunk']}")
+                    continue
+                s0 = s1
+                done += 1
+            return done
+
+        group.each(_alloc)
+        nchunks = group.each(_build)
+        final_gchunk = [int(c.state.get("gchunk", blk)) for c in group.ctxs]
+        run_stats = {"nslots": group.nslots, "devices": list(group.devices),
+                     "mode": "replicated"}
+
+    group.free(["ao_opt", "_mo_coeff", "gchunk"])
+    _sync()
+    stats = {
+        "mode": "dispatched" if dispatch else "replicated",
+        "nao": nao,
+        "nmo_per_set": nmos,
+        "ngrid": int(ngrid),
+        "gchunk": int(blk),
+        "nchunks": nchunks if isinstance(nchunks, list) else [nchunks],
+        "final_gchunk_per_slot": final_gchunk,
+        "ao_block_bytes": int(blk) * nao * 8,
+        "ao_untiled_bytes": int(ngrid) * nao * 8,
+        "seconds": time.perf_counter() - started,
+        "multi_gpu": run_stats,
+    }
+    print(
+        f"{_ts()} [gpu_ao2mo] MO grids nao={nao} "
+        f"nmo={'+'.join(map(str, nmos))} ngrid={ngrid} | {stats['mode']} on "
+        f"{group.nslots} slot(s); gchunk={blk} -> AO block "
+        f"{stats['ao_block_bytes']/1e9:.2f} GB vs untiled "
+        f"{stats['ao_untiled_bytes']/1e9:.2f} GB; {stats['seconds']:.1f} s",
+        flush=True)
+    return stats
+
+
+def _mo_on_grid(cell, mo, mesh, group=None):
+    """MO values on the uniform grid: (nmo, ngrid), real at Gamma.
+
+    Single-set wrapper over ``_mos_on_grid``; returns the rank-0 array and drops
+    the other slots' copies.
+    """
+    from lib_pprpa.gpu_multi import default_group
+    group = group or default_group()
+    _mos_on_grid(cell, [mo], ["_mo_grid_tmp"], mesh, group=group)
+    out = group.ctxs[0].state["_mo_grid_tmp"]
+    group.free(["_mo_grid_tmp"])
+    return out
 
 
 def _codensity_pairs(moA, moB, p0, p1):
@@ -73,7 +268,7 @@ def _codensity_pairs(moA, moB, p0, p1):
 
 
 def _cushion_bytes():
-    """VRAM to hold back during probes so assembly is not razor-tight.
+    """VRAM to hold back from the strip estimate so assembly is not razor-tight.
 
     At least 512 MiB, or 2% of currently free memory (whichever is larger).
     """
@@ -258,8 +453,8 @@ def gpu_ao2mo_blocks(cell, cocc, cvir, mesh, pair_blk=None, return_gpu=False, gr
     """Return direct-assembled vvvv, oovv, oooo tensors in physicist layout.
 
     ``group`` (``lib_pprpa.gpu_multi.DeviceGroup``, default LIB_PPRPA_GPUS slots)
-    dispatches the pair strips over GPUs; the MO grids are built once on the
-    current device and replicated to the other slots.
+    dispatches both the MO-grid chunks and the pair strips over GPUs; the MO
+    grids are then replicated to every slot.
     """
     global LAST_TELEMETRY
     from lib_pprpa.gpu_multi import default_group
@@ -270,15 +465,15 @@ def gpu_ao2mo_blocks(cell, cocc, cvir, mesh, pair_blk=None, return_gpu=False, gr
     free_started, total_bytes = cp.cuda.runtime.memGetInfo()
 
     grid_started = time.perf_counter()
-    moO = _mo_on_grid(cell, cocc, mesh)
-    moV = _mo_on_grid(cell, cvir, mesh)
-    no, nv, ng = moO.shape[0], moV.shape[0], moO.shape[1]
+    # The grids land straight in every slot's state -- no host copy to broadcast.
+    grid_stats = _mos_on_grid(cell, [cocc, cvir], ["moO", "moV"], mesh, group=group)
+    no, nv = int(np.asarray(cocc).shape[1]), int(np.asarray(cvir).shape[1])
+    ng = int(grid_stats["ngrid"])
     coulG = cp.asarray(gtools.get_coulG(cell, mesh=mesh))
     wcoulG = coulG * (cell.vol / ng)
     _sync()
-    group.broadcast(moO, "moO")
-    group.broadcast(moV, "moV")
     group.broadcast(wcoulG, "wcoulG")
+    grid_bytes = (no + nv) * ng * 8 + coulG.nbytes + wcoulG.nbytes
     grid_seconds = time.perf_counter() - grid_started
 
     final_bytes = eri_bytes(no, nv)
@@ -291,7 +486,6 @@ def gpu_ao2mo_blocks(cell, cocc, cvir, mesh, pair_blk=None, return_gpu=False, gr
         f"{vvvv_b/1e9:.2f}/{oovv_b/1e9:.2f}/{oooo_b/1e9:.2f} GB | "
         f"free≈{_free_bytes()/1e9:.2f} GB", flush=True)
 
-    grid_bytes = moO.nbytes + moV.nbytes + coulG.nbytes + wcoulG.nbytes
     stage_host = not fits_resident(
         no, nv, extra_bytes=grid_bytes, total_bytes=total_bytes)
     if stage_host:
@@ -305,7 +499,7 @@ def gpu_ao2mo_blocks(cell, cocc, cvir, mesh, pair_blk=None, return_gpu=False, gr
         "oovv", "moO", "moV", mesh, group, pair_blk=pair_blk, force_host=stage_host)
 
     group.free(["moO", "moV", "wcoulG"])
-    del moO, moV, coulG, wcoulG
+    del coulG, wcoulG
     _reclaim_gpu()
     uploaded = False
     if stage_host:
@@ -333,6 +527,7 @@ def gpu_ao2mo_blocks(cell, cocc, cvir, mesh, pair_blk=None, return_gpu=False, gr
         "nv": int(nv),
         "ngrid": int(ng),
         "mo_grid_seconds": float(grid_seconds),
+        "mo_grid": grid_stats,
         "blocks": [stat_v, stat_o, stat_ov],
         "min_free_bytes": int(min(s["min_free_bytes"] for s in (stat_v, stat_o, stat_ov))),
         "free_started_bytes": int(free_started),
