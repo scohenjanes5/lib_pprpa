@@ -76,7 +76,14 @@ def _plan_blocks(nao, rank, ngrid, row_blk=None, rank_blk=None, reserve_frac=0.1
     # row_blk * rank_blk transforms form one batched cuFFT plan (cuFFT element cap).
     n_el = min(n_el, max_fft_batch(ngrid, mesh=mesh))
     if rank_blk is None:
-        rank_blk = min(rank, n_el)
+        cap = min(rank, n_el)
+        # Ceil-dividing the rank by a cap just under it leaves a runt batch
+        # (rank=300, cap=269 -> 269 + 31).  Spreading the same number of chunks
+        # evenly is never larger than the cap -- ceil(r/ceil(r/c)) <= c -- so it
+        # costs no memory, keeps the chunk count identical, and gives cuFFT two
+        # well-shaped batches instead of one full and one nearly empty.
+        nchunk = max(1, -(-rank // max(1, cap)))
+        rank_blk = -(-rank // nchunk)
     rank_blk = max(1, min(rank, int(rank_blk)))
     if row_blk is None:
         row_blk = max(1, n_el // rank_blk) if rank_blk == rank else 1
@@ -210,6 +217,9 @@ def get_k_lowrank(cell, mesh, factors, hermi=0, exxdiv=None, ao=None,
                                         label=f"fft_k set{iset + 1}")
         final = [(int(c.state["row_blk"]), int(c.state["rank_blk"])) for c in group.ctxs]
         stats.append({"rank": int(rank), "row_blk": int(rb), "rank_blk": int(kb),
+                      "free_at_plan_bytes": int(free_min),
+                      "rank_chunks": int(-(-rank // kb)),
+                      "row_batching": bool(rb > 1),
                       "final_blocks_per_slot": final,
                       "retries": int(sum(run_stats["retries_per_slot"])),
                       "multi_gpu": run_stats})
