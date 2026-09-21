@@ -75,6 +75,47 @@ def test_eri_mvp_tiled_matches_full_numpy():
         np.testing.assert_allclose(t_oo, full_oo, rtol=1e-12, atol=1e-12)
 
 
+class _CountingXP:
+    """numpy shim that records how many bytes ``eri_mvp_tiled`` would upload."""
+
+    def __init__(self):
+        self.nbytes = 0
+
+    def zeros(self, *args, **kwargs):
+        return np.zeros(*args, **kwargs)
+
+    def asarray(self, a, *args, **kwargs):
+        arr = np.asarray(a, *args, **kwargs)
+        self.nbytes += arr.nbytes
+        return arr
+
+
+def test_eri_mvp_tiled_streams_each_block_once():
+    """Every ERI block crosses the host link exactly once per MVP.
+
+    The tiled path is transfer-bound (intensity ntri/4 flop per byte), so a
+    redundant sweep is a straight wall-time loss: streaming ``oovv`` twice cost
+    25% of the per-MVP volume at AS=300 (259.2 vs 194.4 GB).  Row strips of
+    ``oovv`` serve both of its products, so lock the single pass in.
+    """
+    rng = np.random.default_rng(4)
+    nocc, nvir, ntri = 5, 7, 11
+    no2, nv2 = nocc * nocc, nvir * nvir
+    vvvv, oooo, oovv = _random_eri(rng, nocc, nvir)
+    V = np.ascontiguousarray(vvvv.reshape(nv2, nv2))
+    O = np.ascontiguousarray(oooo.reshape(no2, no2))
+    OV = np.ascontiguousarray(oovv.reshape(no2, nv2))
+    zvvT = rng.standard_normal((ntri, nv2))
+    zooT = rng.standard_normal((ntri, no2))
+    once = V.nbytes + O.nbytes + OV.nbytes
+    for tile in (1, 3, 17, no2, nv2, no2 * nv2):
+        xp = _CountingXP()
+        eri_mvp_tiled(zvvT, zooT, V, OV, O, tile, xp=xp)
+        assert xp.nbytes == once, (
+            "tile=%d: uploaded %d B, expected %d B (one pass per block)"
+            % (tile, xp.nbytes, once))
+
+
 def test_estimate_eri_tile_forced():
     assert estimate_eri_tile(90, tile=17) == 17
     assert estimate_eri_tile(10, tile=99) == 10
@@ -177,6 +218,7 @@ if __name__ == "__main__":
     ok &= _run(test_eri_bytes_as300)
     ok &= _run(test_fits_resident_matches_ao2mo_rule)
     ok &= _run(test_eri_mvp_tiled_matches_full_numpy)
+    ok &= _run(test_eri_mvp_tiled_streams_each_block_once)
     ok &= _run(test_estimate_eri_tile_forced)
     ok &= _run(test_auto_selects_tiled_when_vram_too_small)
     ok &= _run(test_auto_selects_resident_when_vram_is_plenty)

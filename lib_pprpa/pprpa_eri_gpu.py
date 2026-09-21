@@ -87,6 +87,12 @@ def eri_mvp_tiled(zvvT, zooT, vvvv, oovv, oooo, tile, xp=np):
     flattened physicist blocks (numpy or cupy).  ``xp`` is the array module for
     the accumulators (``numpy`` or ``cupy``).  Each inner slice is uploaded with
     ``xp.asarray`` so a numpy host ERI + cupy ``xp`` streams tiles to the GPU.
+
+    Every block crosses the link exactly once per call: ``vvvv`` and ``oooo`` as
+    column strips, ``oovv`` as row strips that serve *both* of its products (see
+    below).  That is the whole transfer budget, 194.4 GB at AS=300, and the path
+    is transfer-bound (intensity ntri/4 flop per byte), so a redundant pass costs
+    real wall time.
     """
     tile = max(1, int(tile))
     ntri, nv2 = zvvT.shape
@@ -106,16 +112,23 @@ def eri_mvp_tiled(zvvT, zooT, vvvv, oovv, oooo, tile, xp=np):
         prod_oo = prod_oo + zooT[:, p0:p1] @ Ot.T
         Ot = None
 
+    # One pass over oovv serves both of its products.  A row strip
+    # ov = oovv[P, :] gives prod_vv's rank-|P| update directly, and its
+    # transpose gives the *disjoint column block* prod_oo[:, P] -- summing over
+    # P covers every column exactly once, so no second sweep is needed:
+    #
+    #     prod_vv     += zooT[:, P] @ oovv[P, :]
+    #     prod_oo[:, P] += zvvT      @ oovv[P, :].T
+    #
+    # Streaming column strips for prod_oo instead (the previous fourth loop)
+    # re-read the whole tensor -- 259.2 -> 194.4 GB per MVP at AS=300 -- and,
+    # being a strided slice of a C-contiguous host array, also forced numpy to
+    # materialise a contiguous copy before every upload.
     for p0 in range(0, no2, tile):
         p1 = min(p0 + tile, no2)
         ov = xp.asarray(oovv[p0:p1, :])
         prod_vv = prod_vv + zooT[:, p0:p1] @ ov
-        ov = None
-
-    for q0 in range(0, nv2, tile):
-        q1 = min(q0 + tile, nv2)
-        ov = xp.asarray(oovv[:, q0:q1])
-        prod_oo = prod_oo + zvvT[:, q0:q1] @ ov.T
+        prod_oo[:, p0:p1] += zvvT @ ov.T
         ov = None
 
     return prod_vv, prod_oo
