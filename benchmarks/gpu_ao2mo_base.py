@@ -22,13 +22,9 @@ Memory strategy
   full (npair, ngrid) codensity is never built (2.9 TB at nv=300, 159^3).
 * pair_blk is chosen analytically from live free memory (``_estimate_pair_blk``:
   64 B per pair-gridpoint of transients plus the b x b tile), not by probing.
-* The Gram matrix is symmetric, so only its lower-triangle tiles are formed
-  (``pair_layout``); each tile is scattered together with its transpose.  For
-  vvvv / oooo the same MO set sits on both sides of the pair, so the pair
-  index runs over p >= q only: 1/8 of the all-pairs GEMM flops for those
-  blocks, 1/2 for oovv.  Strips are whole rows of the pair layout, so the
-  chemist->physicist write stays a set of slice assignments (rectangles for
-  oovv, (p+1) x (r+1) sub-blocks for the compact blocks) with no reorder pass.
+* Strips are aligned to whole second-MO rows, which makes the chemist->physicist
+  permutation a per-tile reshape+transpose into a contiguous ``out`` rectangle;
+  there is no separate reorder pass.
 * Outer pair strips are dispatched over ``gpu_multi.DeviceGroup`` slots (one
   by default; LIB_PPRPA_GPUS=2 opts in).  MO grids are replicated per slot; an
   OOM shrinks only that slot's sub-strip and redoes the failing strip instead
@@ -56,7 +52,6 @@ from gpu4pyscf.pbc import tools as gtools
 from gpu4pyscf.pbc.dft import numint as gnumint
 
 from lib_pprpa.gpu_mem import eri_bytes, fits_resident, max_fft_batch
-from lib_pprpa.pair_layout import PairLayout, write_tile
 from lib_pprpa.pprpa_util import tstamp as _ts
 
 
@@ -266,15 +261,10 @@ def _mo_on_grid(cell, mo, mesh, group=None):
 
 
 def _codensity_pairs(moA, moB, p0, p1):
-    """Codensity strip for full pair indices [p0:p1], pair = a*nB + b -> (blk, ngrid)."""
+    """Codensity strip for pair indices [p0:p1], pair = a*nB + b -> (blk, ngrid)."""
     nB = moB.shape[0]
     idx = cp.arange(p0, p1)
     return moA[idx // nB] * moB[idx % nB]
-
-
-def _codensity(moA, moB, pidx, qidx, P0, P1):
-    """Codensity strip for ``PairLayout`` pairs [P0:P1] -> (P1-P0, ngrid)."""
-    return moA[pidx[P0:P1]] * moB[qidx[P0:P1]]
 
 
 def _cushion_bytes():
@@ -286,19 +276,15 @@ def _cushion_bytes():
 
 
 
-def _estimate_pair_blk(npair, ngrid, nB, pair_blk=None, free=None, mesh=None,
-                       compact=False):
+def _estimate_pair_blk(npair, ngrid, nB, pair_blk=None, free=None, mesh=None):
     """Estimate a fast strip size from live driver memory.
 
     The final ERI tensor has already been allocated when this is called.  The
     estimate budgets the remaining memory for rho, FFT output/workspace, vR,
-    rho_q and the GEMM tile.  Strips are whole rows of the pair layout: with
-    the full pair index that means multiples of ``nB`` pairs; with the
-    compact ``p >= q`` index (``compact=True``) rows have variable length, so
-    only the floor of one longest row (``nB`` pairs) applies and
-    ``PairLayout.split`` packs whole rows into the budget.  ``free`` (bytes)
-    overrides the current-device query (multi-GPU: plan from the slot with
-    the least free memory).
+    rho_q and the GEMM tile.  Default strips are aligned to complete second-MO
+    rows, which permits direct contiguous writes in physicist layout.  ``free``
+    (bytes) overrides the current-device query (multi-GPU: plan from the
+    slot with the least free memory).
     """
     if pair_blk is not None:
         raw = max(1, min(int(pair_blk), npair))
@@ -321,57 +307,46 @@ def _estimate_pair_blk(npair, ngrid, nB, pair_blk=None, free=None, mesh=None,
     # (strict 2^31 on Bluestein meshes, relaxed on direct-path meshes).
     raw = min(raw, max_fft_batch(ngrid, mesh=mesh))
     raw = max(nB, raw)
-    if not compact:
-        raw = max(nB, (raw // nB) * nB)
+    raw = max(nB, (raw // nB) * nB)
     return min(raw, npair)
 
-
-def _strip_task(ctx, task, keyA, keyB, mesh, out, on_gpu, layout):
-    """Outer row strip [p0, p1) of one block, in sub-strips of the slot's
-    ``sub_blk`` pairs.
-
-    For each outer sub-strip the Coulomb potential of its codensities is
-    formed once (FFT) and contracted against every inner strip of rows below
-    the sub-strip's end -- the lower triangle of the symmetric Gram matrix.
-    ``write_tile`` scatters each tile and its symmetry images into disjoint
-    elements of ``out``, so a retry is idempotent and slots never write the
-    same element.  Returns ``(gemm_flop, scatter_seconds)``.
-    """
+def _strip_task(ctx, task, keyA, keyB, mesh, out, on_gpu, nB, npair):
+    """Outer pair strip [p0, p1) of a physicist-layout ERI, in sub-strips of the
+    slot's ``sub_blk`` (whole nB-row multiples).  Every (outer, inner) tile is a
+    plain assignment into a disjoint ``out`` rectangle, so a retry is idempotent
+    and slots never write the same elements."""
     st = ctx.state
     moA, moB, wcoulG = st[keyA], st[keyB], st["wcoulG"]
-    pidx, qidx = st["pidx"], st["qidx"]
-    ngrid = moA.shape[1]
-    blk = int(st["sub_blk"])
     p0, p1 = task
-    flop = 0.0
-    t_scatter = 0.0
-    for pa, pb in layout.split(p0, p1, blk):
-        P0, P1 = layout.pairs(pa, pb)
-        rho_p = _codensity(moA, moB, pidx, qidx, P0, P1)
+    s0 = p0
+    while s0 < p1:
+        blk = int(st["sub_blk"])
+        s1 = min(p1, s0 + blk)
+        a0, a1 = s0 // nB, s1 // nB
+        rho_p = _codensity_pairs(moA, moB, s0, s1)
         vR = gtools.ifft(gtools.fft(rho_p, mesh) * wcoulG, mesh).real
         rho_p = None
-        for ra, rb in layout.split(0, pb, blk):
-            Q0, Q1 = layout.pairs(ra, rb)
-            rho_q = _codensity(moA, moB, pidx, qidx, Q0, Q1)
+        for q0 in range(0, npair, blk):
+            q1 = min(q0 + blk, npair)
+            b0, b1 = q0 // nB, q1 // nB
+            rho_q = _codensity_pairs(moA, moB, q0, q1)
             tile = vR.dot(rho_q.T)
-            flop += 2.0 * (P1 - P0) * (Q1 - Q0) * ngrid
-            rho_q = None
-            t0 = time.perf_counter()
-            if not on_gpu:
-                tile = cp.asnumpy(tile)
-            write_tile(out, tile, layout, pa, pb, ra, rb)
-            t_scatter += time.perf_counter() - t0
-            tile = None
+            phys = tile.reshape(a1 - a0, nB, b1 - b0, nB).transpose(0, 2, 1, 3)
+            if on_gpu:
+                out[a0:a1, b0:b1] = phys
+            else:
+                out[a0:a1, b0:b1] = cp.asnumpy(phys)
+            rho_q = tile = phys = None
         vR = None
-    return flop, t_scatter
+        s0 = s1
 
 
-def _make_strip_shrink(min_blk):
+def _make_strip_shrink(nB):
     def _shrink(ctx, task, exc):
         blk = int(ctx.state["sub_blk"])
-        if blk <= min_blk:
+        if blk <= nB:
             return False
-        ctx.state["sub_blk"] = max(min_blk, ((blk // 2) // min_blk) * min_blk)
+        ctx.state["sub_blk"] = max(nB, ((blk // 2) // nB) * nB)
         return True
     return _shrink
 
@@ -388,10 +363,8 @@ def _block_direct(name, keyA, keyB, mesh, group, pair_blk=None, force_host=False
     """
     moA0, moB0 = group.ctxs[0].state[keyA], group.ctxs[0].state[keyB]
     nA, nB, ngrid = moA0.shape[0], moB0.shape[0], moA0.shape[1]
-    compact = keyA == keyB          # same MO set both sides: (p,q) ~ (q,p)
-    layout = PairLayout(nA, nB, compact)
-    npair = layout.npair
-    out_bytes = (nA * nB) ** 2 * 8
+    npair = nA * nB
+    out_bytes = npair * npair * 8
     free_before = group.min_free_bytes()
     on_gpu = not force_host and group.inline
     if on_gpu:
@@ -404,21 +377,18 @@ def _block_direct(name, keyA, keyB, mesh, group, pair_blk=None, force_host=False
                 f"gpu_ao2mo: final {name} tensor ({out_bytes/1e9:.2f} GB) "
                 f"does not fit (free≈{free_before/1e9:.2f} GB)") from exc
         _reclaim_gpu()
-        blk = _estimate_pair_blk(npair, ngrid, layout.min_blk, pair_blk=pair_blk,
-                                 mesh=mesh, compact=compact)
+        blk = _estimate_pair_blk(npair, ngrid, nB, pair_blk=pair_blk, mesh=mesh)
         # A retained result must leave enough space for useful FFT strips.
-        if pair_blk is None and blk <= min(npair, 4 * layout.min_blk):
+        if pair_blk is None and blk <= min(npair, 4 * nB):
             del out
             _reclaim_gpu()
             on_gpu = False
     if not on_gpu:
         out = np.empty((nA, nA, nB, nB), dtype=np.float64)
-        blk = _estimate_pair_blk(npair, ngrid, layout.min_blk, pair_blk=pair_blk,
-                                 free=group.min_free_bytes(), mesh=mesh,
-                                 compact=compact)
+        blk = _estimate_pair_blk(npair, ngrid, nB, pair_blk=pair_blk,
+                                 free=group.min_free_bytes(), mesh=mesh)
     stats = {
         "name": name,
-        "compact": bool(compact),
         "npair": int(npair),
         "output_bytes": int(out_bytes),
         "requested_pair_blk": None if pair_blk is None else int(pair_blk),
@@ -431,68 +401,51 @@ def _block_direct(name, keyA, keyB, mesh, group, pair_blk=None, force_host=False
         "min_free_bytes": int(group.min_free_bytes()),
     }
     location = "GPU" if on_gpu else ("host-staged" if force_host else "host-direct")
-    # Outer strips are whole rows of the pair layout.  High rows own more
-    # lower-triangle tiles, so hand them out first for load balance.
-    tasks = layout.split(0, nA, blk)[::-1]
+    tasks = [(p0, min(p0 + blk, npair)) for p0 in range(0, npair, blk)]
     nblk = len(tasks)
-    ntiles = layout.tiles(tasks, blk)
-    planned_flop = layout.gemm_flop(ngrid, blk)
     print(
         f"{_ts()} [gpu_ao2mo] {name} final tensor {out_bytes/1e9:.2f} GB "
         f"on {location}; pair_blk={blk} (analytic); "
         f"free≈{free_before/1e9:.2f}→{stats['free_after_output_bytes']/1e9:.2f} GB", flush=True)
     print(
-        f"{_ts()} [gpu_ao2mo]   {'compact p>=q pairs, ' if compact else ''}lower-triangle "
-        f"tiles: strips={nblk} tiles={ntiles} GEMM={planned_flop/1e15:.2f} PFLOP; "
+        f"{_ts()} [gpu_ao2mo]   direct strips={nblk}x{nblk} GEMMs={nblk * nblk}; "
         f"pair_blk={blk} on {group.nslots} slot(s)", flush=True)
     stats["nstrips"] = nblk
-    stats["gemms"] = ntiles
-    stats["gemm_flop_planned"] = float(planned_flop)
+    stats["gemms"] = nblk * nblk
 
     def _init(ctx):
         ctx.state["sub_blk"] = blk
-        pi, qi = layout.index_arrays()
-        ctx.state["pidx"] = cp.asarray(pi)
-        ctx.state["qidx"] = cp.asarray(qi)
     group.each(_init)
     done = [0]
     lock = threading.Lock()
     report_every = max(1, nblk // 4)
 
     def _work(ctx, task):
-        res = _strip_task(ctx, task, keyA, keyB, mesh, out, on_gpu, layout)
+        _strip_task(ctx, task, keyA, keyB, mesh, out, on_gpu, nB, npair)
         with lock:
             done[0] += 1
             k = done[0]
         if nblk > 1 and (k % report_every == 0 or k == nblk):
             print(f"{_ts()} [gpu_ao2mo]   strip {k}/{nblk} done", flush=True)
-        return res
 
     started = time.perf_counter()
     try:
-        results, run_stats = group.run(tasks, _work, shrink=_make_strip_shrink(layout.min_blk),
-                                       label=f"ao2mo {name}")
-    finally:
-        group.free(["pidx", "qidx"])
+        _results, run_stats = group.run(tasks, _work, shrink=_make_strip_shrink(nB),
+                                        label=f"ao2mo {name}")
+    except Exception:
+        del out
+        raise
     if not on_gpu and not force_host:
         uploaded = cp.asarray(out)
         del out
         out = uploaded
     _sync()
     stats["seconds"] = time.perf_counter() - started
-    stats["gemm_flop"] = float(sum(r[0] for r in results))
-    stats["scatter_seconds"] = float(sum(r[1] for r in results))
-    stats["tflops"] = stats["gemm_flop"] / max(stats["seconds"], 1e-9) / 1e12
     stats["retries"] = int(sum(run_stats["retries_per_slot"]))
     stats["final_pair_blk_per_slot"] = [int(c.state["sub_blk"]) for c in group.ctxs]
     stats["min_free_bytes"] = int(min(
         [b for b in run_stats["min_free_bytes_per_slot"] if b is not None] + [stats["min_free_bytes"]]))
     stats["multi_gpu"] = run_stats
-    print(
-        f"{_ts()} [gpu_ao2mo]   {name} done in {stats['seconds']:.1f} s: "
-        f"{stats['gemm_flop']/1e15:.3f} PFLOP at {stats['tflops']:.1f} TFLOP/s "
-        f"(tile scatter {stats['scatter_seconds']:.1f} s{'' if on_gpu else ' host'})",
-        flush=True)
     return out, stats
 
 
@@ -535,8 +488,6 @@ def gpu_ao2mo_blocks(cell, cocc, cvir, mesh, pair_blk=None, return_gpu=False, gr
 
     stage_host = not fits_resident(
         no, nv, extra_bytes=grid_bytes, total_bytes=total_bytes)
-    if os.environ.get("GPU_AO2MO_FORCE_HOST", "").strip() in ("1", "true", "yes"):
-        stage_host = True       # benchmark the host-staged (NV216) write path on a small cell
     if stage_host:
         print(f"{_ts()} [gpu_ao2mo] staging all final ERIs on host until MO grids are released",
               flush=True)
