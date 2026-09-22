@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from lib_pprpa.pair_layout import PairLayout, write_tile
+from lib_pprpa.pair_layout import PairLayout, split_diagonal, write_tile
 
 
 def _reference(phiA, phiB, W):
@@ -27,17 +27,16 @@ def _strip_loop(phiA, phiB, W, layout, blk):
     def codensity(P0, P1):
         return phiA[pidx[P0:P1]] * phiB[qidx[P0:P1]]
 
-    ntile = 0
     for pa, pb in layout.split(0, nA, blk):
         P0, P1 = layout.pairs(pa, pb)
         assert P1 - P0 <= max(blk, layout.min_blk)
         vR = codensity(P0, P1) @ W
         for ra, rb in layout.split(0, pb, blk):
-            Q0, Q1 = layout.pairs(ra, rb)
-            tile = vR @ codensity(Q0, Q1).T
-            write_tile(out, tile, layout, pa, pb, ra, rb)
-            ntile += 1
-    assert ntile == layout.tiles(layout.split(0, nA, blk), blk)
+            for oa, ob, ia, ib in split_diagonal(pa, pb, ra, rb):
+                Q0, Q1 = layout.pairs(ia, ib)
+                R0, R1 = layout.pairs(oa, ob)
+                tile = vR[R0 - P0:R1 - P0] @ codensity(Q0, Q1).T
+                write_tile(out, tile, layout, oa, ob, ia, ib)
     return out
 
 
@@ -56,6 +55,23 @@ def _check(nA, nB, compact, seed=0):
         assert not np.isnan(out).any(), (nA, nB, compact, blk, "unwritten elements")
         err = np.abs(out - ref).max()
         assert err < 1e-10 * max(1.0, np.abs(ref).max()), (nA, nB, compact, blk, err)
+
+
+def test_split_diagonal_partitions_the_canonical_cells():
+    rng = np.random.default_rng(7)
+    for _ in range(200):
+        pa = int(rng.integers(0, 20)); pb = pa + int(rng.integers(1, 12))
+        ra = int(rng.integers(0, 20)); rb = ra + int(rng.integers(1, 12))
+        want = {(p, r) for p in range(pa, pb) for r in range(ra, rb) if r <= p}
+        got = []
+        for oa, ob, ia, ib in split_diagonal(pa, pb, ra, rb, depth=int(rng.integers(0, 4))):
+            assert pa <= oa < ob <= pb and ra <= ia < ib <= rb
+            got.extend((p, r) for p in range(oa, ob) for r in range(ia, ib) if r <= p)
+        assert len(got) == len(set(got)) == len(want) and set(got) == want, (pa, pb, ra, rb)
+    # below the diagonal: untouched; straddling: the unused triangle shrinks
+    assert split_diagonal(10, 20, 0, 10) == [(10, 20, 0, 10)]
+    computed = sum((ob - oa) * (ib - ia) for oa, ob, ia, ib in split_diagonal(0, 10, 0, 10, depth=2))
+    assert computed == 63            # 55 canonical cells; depth 2 computes 8 of the 45 unused
 
 
 def test_compact_same_mo_set():
@@ -86,10 +102,33 @@ def test_split_and_counts():
     assert 0.5 < mixed.gemm_flop(1, 600) / full_m < 0.56
 
 
+def test_symmetric_half_kernel_matches_c2c_real():
+    """R2C with the symmetrised half kernel == C2C followed by .real, even when
+    the kernel is not even in G (Nyquist planes of an even mesh)."""
+    from lib_pprpa.pair_layout import symmetric_half_kernel
+    rng = np.random.default_rng(3)
+    for mesh in ((6, 8, 10), (7, 9, 11), (8, 8, 8), (5, 6, 7)):
+        w = rng.random(int(np.prod(mesh)))                    # generic, not even in G
+        rho = rng.standard_normal((3, *mesh))
+        c2c = np.fft.ifftn(np.fft.fftn(rho, axes=(1, 2, 3)) * w.reshape(mesh), axes=(1, 2, 3)).real
+        half = symmetric_half_kernel(w, mesh)
+        assert half.shape == (mesh[0], mesh[1], mesh[2] // 2 + 1)
+        r2c = np.fft.irfftn(np.fft.rfftn(rho, axes=(1, 2, 3)) * half, s=mesh, axes=(1, 2, 3))
+        assert np.abs(r2c - c2c).max() < 1e-13, (mesh, np.abs(r2c - c2c).max())
+        # the naive (unsymmetrised) half kernel differs on even meshes
+        naive = w.reshape(mesh)[:, :, :mesh[2] // 2 + 1]
+        r2c_naive = np.fft.irfftn(np.fft.rfftn(rho, axes=(1, 2, 3)) * naive, s=mesh, axes=(1, 2, 3))
+        assert np.abs(r2c_naive - c2c).max() > 1e-6
+
+
 if __name__ == "__main__":
+    test_split_diagonal_partitions_the_canonical_cells()
+    print("OK  test_split_diagonal_partitions_the_canonical_cells")
     test_compact_same_mo_set()
     print("OK  test_compact_same_mo_set")
     test_mixed_mo_sets()
     print("OK  test_mixed_mo_sets")
     test_split_and_counts()
     print("OK  test_split_and_counts")
+    test_symmetric_half_kernel_matches_c2c_real()
+    print("OK  test_symmetric_half_kernel_matches_c2c_real")

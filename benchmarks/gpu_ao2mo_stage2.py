@@ -22,24 +22,11 @@ Memory strategy
   full (npair, ngrid) codensity is never built (2.9 TB at nv=300, 159^3).
 * pair_blk is chosen analytically from live free memory (``_plan_strips``), not
   by probing.  The Coulomb potential of an outer strip is formed in FFT
-  sub-batches (``fft_blk``, ~15% of the budget) into a real strip buffer, so
-  the GEMM strip width is set only by its own operands (16 B per
-  pair-gridpoint: the potential strip and the inner codensity strip) plus the
-  b x b tile.  The tall-skinny tile GEMM (M = N = b, K = ngrid) runs far below
-  peak at b = 300-600 and at the B200's fp64 rate from b ~ 2400.
-* The Coulomb chain is real-to-complex by default: rfftn, an in-place product
-  with the symmetrised half-mesh kernel (``pair_layout.symmetric_half_kernel``
-  -- the C2C path's ``.real`` only ever sees the even part of the kernel, and
-  on the Nyquist planes of an even mesh in a non-orthogonal cell the kernel
-  is not even), irfftn straight back to real.  Half the spectral traffic, no
-  complex cast or ``.real`` copy; identical to the C2C chain to rounding.
-  FFT sub-batches have one fixed shape per block (the last is zero-padded) so
-  cuFFT keeps a single cached plan, and the strip buffers are allocated once
-  per task so the pool never fragments.
-* The codensity strips come from one fused gather-multiply kernel
-  (``_CODENSITY_KERNEL``), and strip pairs that straddle the diagonal are cut
-  into sub-tiles (``pair_layout.split_diagonal``) so most of the unused upper
-  triangle of the Gram matrix is never computed.
+  sub-batches (``fft_blk``, ~15% of the budget at 56 B per pair-gridpoint of
+  complex transients) into a real strip buffer, so the GEMM strip width is
+  set only by its own operands (24 B per pair-gridpoint) plus the b x b tile.
+  The tall-skinny tile GEMM (M = N = b, K = ngrid) runs far below peak at
+  b = 300-600 and much closer to it at b ~ 2000, which the decoupling allows.
 * The Gram matrix is symmetric, so only its lower-triangle tiles are formed
   (``pair_layout``); each tile is scattered together with its transpose.  For
   vvvv / oooo the same MO set sits on both sides of the pair, so the pair
@@ -70,12 +57,11 @@ import time
 
 import numpy as np
 import cupy as cp
-import cupyx.scipy.fft as cufft
 from gpu4pyscf.pbc import tools as gtools
 from gpu4pyscf.pbc.dft import numint as gnumint
 
 from lib_pprpa.gpu_mem import eri_bytes, fits_resident, max_fft_batch
-from lib_pprpa.pair_layout import PairLayout, split_diagonal, symmetric_half_kernel, write_tile
+from lib_pprpa.pair_layout import PairLayout, write_tile
 from lib_pprpa.pprpa_util import tstamp as _ts
 
 
@@ -291,56 +277,16 @@ def _codensity_pairs(moA, moB, p0, p1):
     return moA[idx // nB] * moB[idx % nB]
 
 
-# rho[P, g] = moA[pidx[P], g] * moB[qidx[P], g] in one pass: two reads and one
-# write per element (24 B) and no gathered temporaries, against 48 B and a
-# second (blk, ngrid) array for take + in-place multiply.
-_CODENSITY_KERNEL = cp.ElementwiseKernel(
-    "raw float64 moA, raw float64 moB, raw int32 pidx, raw int32 qidx, int64 ngrid, int64 P0",
-    "float64 rho",
+def _codensity(moA, moB, pidx, qidx, P0, P1):
+    """Codensity strip for ``PairLayout`` pairs [P0:P1] -> (P1-P0, ngrid).
+
+    Gather the first factor into the result and multiply in place, so the
+    transient peak is two (blk, ngrid) arrays (16 B per pair-gridpoint), not
+    three.
     """
-    const long long row = i / ngrid;
-    const long long g = i - row * ngrid;
-    const long long P = P0 + row;
-    rho = moA[(long long)pidx[P] * ngrid + g] * moB[(long long)qidx[P] * ngrid + g];
-    """,
-    "pprpa_codensity")
-
-
-def _codensity(moA, moB, pidx, qidx, P0, P1, out=None):
-    """Codensity strip for ``PairLayout`` pairs [P0:P1] -> (P1-P0, ngrid),
-    written into ``out`` when given (a contiguous (P1-P0, ngrid) view)."""
-    ngrid = moA.shape[1]
-    if out is None:
-        out = cp.empty((P1 - P0, ngrid), dtype=cp.float64)
-    _CODENSITY_KERNEL(moA, moB, pidx, qidx, ngrid, P0, out)
-    return out
-
-
-def _coulomb_potential(rho, mesh, w, rfft):
-    """``vR = ifft(fft(rho) * w)`` for a batch of real codensities, (f, ngrid) -> (f, ngrid).
-
-    C2C (``rfft=False``): gpu4pyscf's fft / ifft chain -- real -> complex cast,
-    two complex transforms, a complex product and a ``.real`` copy, ~56 B per
-    pair-gridpoint at its peak.  R2C (``rfft=True``): real input to the half
-    spectrum, in-place multiply by the half-mesh kernel, C2R straight back to
-    real: no cast, no ``.real`` copy, half the spectral traffic, ~24 B per
-    pair-gridpoint.  ``w`` must be the *symmetrised* half kernel
-    (``pair_layout.symmetric_half_kernel``): C2R assumes a Hermitian spectrum,
-    and the C2C path's ``.real`` only ever sees the even part of the kernel,
-    so with that kernel the two paths agree to rounding on every mesh.
-    """
-    if not rfft:
-        return gtools.ifft(gtools.fft(rho, mesh) * w, mesh).real
-    f = rho.shape[0]
-    vG = cufft.rfftn(rho.reshape(f, *mesh), axes=(1, 2, 3))
-    vG *= w                                   # w: (nx, ny, nz//2 + 1), real
-    vR = cufft.irfftn(vG, s=tuple(int(m) for m in mesh), axes=(1, 2, 3), overwrite_x=True)
-    return vR.reshape(f, -1)
-
-
-def _half_kernel(wcoulG, mesh):
-    """The symmetrised Coulomb kernel on the R2C half mesh, (nx, ny, nz//2 + 1)."""
-    return cp.ascontiguousarray(symmetric_half_kernel(wcoulG, mesh))
+    rho = cp.take(moA, pidx[P0:P1], axis=0)
+    rho *= cp.take(moB, qidx[P0:P1], axis=0)
+    return rho
 
 
 def _cushion_bytes():
@@ -352,24 +298,21 @@ def _cushion_bytes():
 
 
 
-# Bytes per pair-gridpoint alive while one FFT sub-batch is transformed.
-# C2C: real rho (8) + complex FFT (16) + vG (16) + complex vR (16); its .real
-# lands in the strip's potential buffer.  R2C: rho (8) + half spectrum (8,
-# multiplied in place) + real vR (8) + cuFFT work area for the batched R2C and
-# C2R plans (~16); 24 was measured too tight (OOM + retry on the B200).
+# Bytes per pair-gridpoint alive while one FFT sub-batch is transformed: real
+# rho (8) + complex FFT (16) + vG (16) + complex vR (16).  Its .real lands in
+# the strip's potential buffer, which the GEMM term below accounts for.
 _FFT_BYTES_PER_POINT = 56
-_RFFT_BYTES_PER_POINT = 40
 # Share of the strip budget handed to the FFT sub-batch; the transform is
 # ~0.1% of the flops, so it only needs to be big enough to keep cuFFT busy.
 _FFT_BUDGET_FRAC = 0.15
 _FFT_BLK_FLOOR = 16
 # Bytes per pair-gridpoint of the GEMM operands: the real potential strip vR
-# (8) and the inner codensity strip (8; the fused kernel has no temporaries).
-_GEMM_BYTES_PER_POINT = 16
+# (8) and the inner codensity strip at its build peak (16, see _codensity).
+_GEMM_BYTES_PER_POINT = 24
 
 
 def _plan_strips(npair, ngrid, nB, pair_blk=None, fft_blk=None, free=None, mesh=None,
-                 compact=False, rfft=False):
+                 compact=False):
     """Plan ``(pair_blk, fft_blk)``: the GEMM strip width and the FFT sub-batch.
 
     The Coulomb potential of an outer strip is formed in FFT sub-batches of
@@ -395,9 +338,8 @@ def _plan_strips(npair, ngrid, nB, pair_blk=None, fft_blk=None, free=None, mesh=
     if fft_blk is None:
         env = os.environ.get("GPU_AO2MO_FFT_BLK")
         fft_blk = int(env) if env else None
-    fft_bpp = _RFFT_BYTES_PER_POINT if rfft else _FFT_BYTES_PER_POINT
     if fft_blk is None:
-        fblk = int(budget * _FFT_BUDGET_FRAC) // max(1, fft_bpp * ngrid)
+        fblk = int(budget * _FFT_BUDGET_FRAC) // max(1, _FFT_BYTES_PER_POINT * ngrid)
         fblk = max(_FFT_BLK_FLOOR, fblk)
     else:
         fblk = max(1, int(fft_blk))
@@ -405,7 +347,7 @@ def _plan_strips(npair, ngrid, nB, pair_blk=None, fft_blk=None, free=None, mesh=
     if pair_blk is not None:
         raw = max(1, min(int(pair_blk), npair))
     else:
-        remaining = max(0, budget - fft_bpp * ngrid * fblk)
+        remaining = max(0, budget - _FFT_BYTES_PER_POINT * ngrid * fblk)
         linear = max(_GEMM_BYTES_PER_POINT * ngrid, 1)
         # Solve 8*b^2 + linear*b <= remaining (b x b tile plus the two operand strips).
         raw = int((-linear + math.sqrt(linear * linear + 32 * remaining)) / 16)
@@ -435,75 +377,40 @@ def _strip_task(ctx, task, keyA, keyB, mesh, out, on_gpu, layout):
     formed once -- in FFT sub-batches of the slot's ``fft_blk`` pairs into a
     real (strip, ngrid) buffer -- and contracted against every inner strip of
     rows below the sub-strip's end (the lower triangle of the symmetric Gram
-    matrix); a strip pair that straddles the diagonal is cut into sub-tiles
-    (``split_diagonal``) so most of the unused upper triangle is never
-    computed.  ``write_tile`` scatters each tile and its symmetry images into
+    matrix).  ``write_tile`` scatters each tile and its symmetry images into
     disjoint elements of ``out``, so a retry is idempotent and slots never
     write the same element.  Returns ``(gemm_flop, scatter_seconds)``.
-
-    The potential, the inner codensity and the FFT input live in three
-    fixed-size buffers for the whole task: the pool never sees a new size
-    (no fragmentation at tens of GB per strip) and the FFT batch shape is
-    constant (the last sub-batch is zero-padded), so cuFFT keeps one cached
-    plan per block instead of re-planning every remainder size.
-
-    With ``ctx.state["prof"]`` a dict (``GPU_AO2MO_PROFILE=1``) every phase is
-    synchronised and timed into it: rho_outer, fft, rho_inner, gemm, scatter.
     """
     st = ctx.state
-    moA, moB = st[keyA], st[keyB]
-    rfft = bool(st.get("rfft", False))
-    w = st["wcoulG_half"] if rfft else st["wcoulG"]
+    moA, moB, wcoulG = st[keyA], st[keyB], st["wcoulG"]
     pidx, qidx = st["pidx"], st["qidx"]
     ngrid = moA.shape[1]
     blk = int(st["sub_blk"])
     fblk = max(1, min(int(st["fft_blk"]), blk))
-    prof = st.get("prof")
-
-    def lap(key, t0):
-        if prof is None:
-            return t0
-        _sync()
-        t1 = time.perf_counter()
-        prof[key] = prof.get(key, 0.0) + (t1 - t0)
-        return t1
-
     p0, p1 = task
-    vR_buf = cp.empty((blk, ngrid), dtype=cp.float64)
-    rho_buf = cp.empty((blk, ngrid), dtype=cp.float64)
-    rho_f = cp.empty((fblk, ngrid), dtype=cp.float64)
     flop = 0.0
     t_scatter = 0.0
-    t = time.perf_counter()
     for pa, pb in layout.split(p0, p1, blk):
         P0, P1 = layout.pairs(pa, pb)
-        vR = vR_buf[:P1 - P0]
+        vR = cp.empty((P1 - P0, ngrid), dtype=cp.float64)
         for f0 in range(P0, P1, fblk):
             f1 = min(P1, f0 + fblk)
-            n = f1 - f0
-            if n < fblk:
-                rho_f[n:] = 0.0
-            _codensity(moA, moB, pidx, qidx, f0, f1, out=rho_f[:n])
-            t = lap("rho_outer", t)
-            vR[f0 - P0:f1 - P0] = _coulomb_potential(rho_f, mesh, w, rfft)[:n]
-            t = lap("fft", t)
+            rho_p = _codensity(moA, moB, pidx, qidx, f0, f1)
+            vR[f0 - P0:f1 - P0] = gtools.ifft(gtools.fft(rho_p, mesh) * wcoulG, mesh).real
+            rho_p = None
         for ra, rb in layout.split(0, pb, blk):
-            for oa, ob, ia, ib in split_diagonal(pa, pb, ra, rb):
-                Q0, Q1 = layout.pairs(ia, ib)
-                R0, R1 = layout.pairs(oa, ob)
-                rho_q = _codensity(moA, moB, pidx, qidx, Q0, Q1, out=rho_buf[:Q1 - Q0])
-                t = lap("rho_inner", t)
-                tile = vR[R0 - P0:R1 - P0].dot(rho_q.T)
-                flop += 2.0 * (R1 - R0) * (Q1 - Q0) * ngrid
-                t = lap("gemm", t)
-                t0 = time.perf_counter()
-                if not on_gpu:
-                    tile = cp.asnumpy(tile)
-                write_tile(out, tile, layout, oa, ob, ia, ib)
-                t_scatter += time.perf_counter() - t0
-                tile = None
-                t = lap("scatter", t)
-    vR = vR_buf = rho_buf = rho_f = None
+            Q0, Q1 = layout.pairs(ra, rb)
+            rho_q = _codensity(moA, moB, pidx, qidx, Q0, Q1)
+            tile = vR.dot(rho_q.T)
+            flop += 2.0 * (P1 - P0) * (Q1 - Q0) * ngrid
+            rho_q = None
+            t0 = time.perf_counter()
+            if not on_gpu:
+                tile = cp.asnumpy(tile)
+            write_tile(out, tile, layout, pa, pb, ra, rb)
+            t_scatter += time.perf_counter() - t0
+            tile = None
+        vR = None
     return flop, t_scatter
 
 
@@ -526,7 +433,7 @@ def _make_strip_shrink(min_blk):
 
 
 def _block_direct(name, keyA, keyB, mesh, group, pair_blk=None, force_host=False,
-                  fft_blk=None, rfft=False, profile=False):
+                  fft_blk=None):
     """Fill a final physicist ERI on GPU or directly on host when VRAM is tight.
 
     ``keyA``/``keyB`` name the MO grids in every slot's ``state`` (see
@@ -555,7 +462,7 @@ def _block_direct(name, keyA, keyB, mesh, group, pair_blk=None, force_host=False
                 f"does not fit (free≈{free_before/1e9:.2f} GB)") from exc
         _reclaim_gpu()
         blk, fblk = _plan_strips(npair, ngrid, layout.min_blk, pair_blk=pair_blk,
-                                 fft_blk=fft_blk, mesh=mesh, compact=compact, rfft=rfft)
+                                 fft_blk=fft_blk, mesh=mesh, compact=compact)
         # A retained result must leave enough space for useful GEMM strips.
         if pair_blk is None and blk <= min(npair, 4 * layout.min_blk):
             del out
@@ -565,11 +472,10 @@ def _block_direct(name, keyA, keyB, mesh, group, pair_blk=None, force_host=False
         out = np.empty((nA, nA, nB, nB), dtype=np.float64)
         blk, fblk = _plan_strips(npair, ngrid, layout.min_blk, pair_blk=pair_blk,
                                  fft_blk=fft_blk, free=group.min_free_bytes(), mesh=mesh,
-                                 compact=compact, rfft=rfft)
+                                 compact=compact)
     stats = {
         "name": name,
         "compact": bool(compact),
-        "rfft": bool(rfft),
         "npair": int(npair),
         "output_bytes": int(out_bytes),
         "requested_pair_blk": None if pair_blk is None else int(pair_blk),
@@ -596,8 +502,7 @@ def _block_direct(name, keyA, keyB, mesh, group, pair_blk=None, force_host=False
     print(
         f"{_ts()} [gpu_ao2mo]   {'compact p>=q pairs, ' if compact else ''}lower-triangle "
         f"tiles: strips={nblk} tiles={ntiles} GEMM={planned_flop/1e15:.2f} PFLOP; "
-        f"pair_blk={blk} fft_blk={fblk} {'r2c' if rfft else 'c2c'} on {group.nslots} slot(s)",
-        flush=True)
+        f"pair_blk={blk} fft_blk={fblk} on {group.nslots} slot(s)", flush=True)
     stats["nstrips"] = nblk
     stats["gemms"] = ntiles
     stats["gemm_flop_planned"] = float(planned_flop)
@@ -605,8 +510,6 @@ def _block_direct(name, keyA, keyB, mesh, group, pair_blk=None, force_host=False
     def _init(ctx):
         ctx.state["sub_blk"] = blk
         ctx.state["fft_blk"] = fblk
-        ctx.state["rfft"] = bool(rfft)
-        ctx.state["prof"] = {} if profile else None
         pi, qi = layout.index_arrays()
         ctx.state["pidx"] = cp.asarray(pi)
         ctx.state["qidx"] = cp.asarray(qi)
@@ -629,15 +532,7 @@ def _block_direct(name, keyA, keyB, mesh, group, pair_blk=None, force_host=False
         results, run_stats = group.run(tasks, _work, shrink=_make_strip_shrink(layout.min_blk),
                                        label=f"ao2mo {name}")
     finally:
-        if profile:
-            prof = {}
-            for c in group.ctxs:
-                for k, v in (c.state.get("prof") or {}).items():
-                    prof[k] = prof.get(k, 0.0) + float(v)
-            stats["profile"] = prof
-            print(f"{_ts()} [gpu_ao2mo]   {name} phases (s): "
-                  + "  ".join(f"{k}={v:.1f}" for k, v in sorted(prof.items())), flush=True)
-        group.free(["pidx", "qidx", "prof"])
+        group.free(["pidx", "qidx"])
     if not on_gpu and not force_host:
         uploaded = cp.asarray(out)
         del out
@@ -661,32 +556,18 @@ def _block_direct(name, keyA, keyB, mesh, group, pair_blk=None, force_host=False
     return out, stats
 
 
-def _env_flag(name, default=False):
-    v = os.environ.get(name)
-    if v is None or not v.strip():
-        return default
-    return v.strip().lower() in ("1", "true", "yes")
-
-
 def gpu_ao2mo_blocks(cell, cocc, cvir, mesh, pair_blk=None, return_gpu=False, group=None,
-                     fft_blk=None, rfft=None, profile=None):
+                     fft_blk=None):
     """Return direct-assembled vvvv, oovv, oooo tensors in physicist layout.
 
     ``group`` (``lib_pprpa.gpu_multi.DeviceGroup``, default LIB_PPRPA_GPUS slots)
     dispatches both the MO-grid chunks and the pair strips over GPUs; the MO
     grids are then replicated to every slot.  ``pair_blk`` / ``fft_blk`` force
     the GEMM strip width and the FFT sub-batch (default: ``_plan_strips``).
-    ``rfft`` selects the real-to-complex Coulomb chain (default on;
-    ``GPU_AO2MO_RFFT=0`` restores gpu4pyscf's complex chain); ``profile``
-    times every strip phase (``GPU_AO2MO_PROFILE``).
     """
     global LAST_TELEMETRY
     from lib_pprpa.gpu_multi import default_group
     group = group or default_group()
-    if rfft is None:
-        rfft = _env_flag("GPU_AO2MO_RFFT", True)
-    if profile is None:
-        profile = _env_flag("GPU_AO2MO_PROFILE", False)
     _free_pool()
     _sync()
     total_started = time.perf_counter()
@@ -701,8 +582,7 @@ def gpu_ao2mo_blocks(cell, cocc, cvir, mesh, pair_blk=None, return_gpu=False, gr
     wcoulG = coulG * (cell.vol / ng)
     _sync()
     group.broadcast(wcoulG, "wcoulG")
-    group.broadcast(_half_kernel(wcoulG, mesh), "wcoulG_half")
-    grid_bytes = (no + nv) * ng * 8 + coulG.nbytes + 2 * wcoulG.nbytes
+    grid_bytes = (no + nv) * ng * 8 + coulG.nbytes + wcoulG.nbytes
     grid_seconds = time.perf_counter() - grid_started
 
     final_bytes = eri_bytes(no, nv)
@@ -724,15 +604,15 @@ def gpu_ao2mo_blocks(cell, cocc, cvir, mesh, pair_blk=None, return_gpu=False, gr
               flush=True)
     vvvv, stat_v = _block_direct(
         "vvvv", "moV", "moV", mesh, group, pair_blk=pair_blk, force_host=stage_host,
-        fft_blk=fft_blk, rfft=rfft, profile=profile)
+        fft_blk=fft_blk)
     oooo, stat_o = _block_direct(
         "oooo", "moO", "moO", mesh, group, pair_blk=pair_blk, force_host=stage_host,
-        fft_blk=fft_blk, rfft=rfft, profile=profile)
+        fft_blk=fft_blk)
     oovv, stat_ov = _block_direct(
         "oovv", "moO", "moV", mesh, group, pair_blk=pair_blk, force_host=stage_host,
-        fft_blk=fft_blk, rfft=rfft, profile=profile)
+        fft_blk=fft_blk)
 
-    group.free(["moO", "moV", "wcoulG", "wcoulG_half"])
+    group.free(["moO", "moV", "wcoulG"])
     del coulG, wcoulG
     _reclaim_gpu()
     uploaded = False
@@ -808,11 +688,11 @@ if __name__ == "__main__":
     vvvv_c = eri[nocc:, nocc:, nocc:, nocc:]
     oovv_c = eri[:nocc, :nocc, nocc:, nocc:]
     oooo_c = eri[:nocc, :nocc, :nocc, :nocc]
-    for pb, rfft in ((None, False), (8, False), (None, True), (8, True)):
+    for pb in (None, 8):
         vvvv_g, oovv_g, oooo_g = gpu_ao2mo_blocks(
-            cell, cocc, cvir, cell.mesh, pair_blk=pb, rfft=rfft
+            cell, cocc, cvir, cell.mesh, pair_blk=pb
         )
-        print(f"pair_blk={pb} rfft={rfft}:")
+        print(f"pair_blk={pb}:")
         for name, g, c in [
             ("vvvv", vvvv_g, vvvv_c),
             ("oovv", oovv_g, oovv_c),

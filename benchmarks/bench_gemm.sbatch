@@ -39,6 +39,20 @@ python "${CHECKOUT}/tests/test_fft_batch_cap.py"
 python "${CHECKOUT}/lib_pprpa/gpu_ao2mo.py"      # __main__: element-wise vs pyscf, two strip sizes
 
 B="python ${CHECKOUT}/benchmarks/bench_gpu_ao2mo.py --geom ${GEOM} --ke 300"
+# Reference tensors (vvvv/oovv/oooo .npy, ~80 GB at AS=300) live on scratch and are
+# written once (--save) so later stages only --compare against them instead of
+# recomputing an earlier kernel.  REF_STAGE2 = commit f138fc3 (stage 2), the
+# baseline every later change is checked against.
+REF_ROOT="${REF_ROOT:-/nfs/roberts/scratch/pi_tz324/sc3352/ao2mo_refs}"
+REF_STAGE2="${REF_ROOT}/nv63_ke300_as300_stage2"
+ensure_ref_stage2() {
+  if [[ -f "${REF_STAGE2}/oooo.npy" && -f "${REF_STAGE2}/vvvv.npy" && -f "${REF_STAGE2}/oovv.npy" ]]; then
+    echo "[job] stage2 reference present: ${REF_STAGE2}"
+  else
+    echo "=== writing the stage2 reference tensors to ${REF_STAGE2} (once) ==="
+    $B --as 300 --impl stage2 --tag ref_stage2 --save "${REF_STAGE2}"
+  fi
+}
 if [[ "$STAGE" == "1" ]]; then
   echo "=== AS=100, pair_blk=600: base vs new (shape check, seconds) ==="
   $B --as 100 --pair-blk 600 --impl base,new --tag s1_as100_pb600
@@ -63,6 +77,45 @@ if [[ "$STAGE" == "2" ]]; then
   $B --as 300 --pair-blk 2400 --impl new --tag s2_as300_pb2400
   echo "=== AS=300, planner widths, host-staged finals: new (NV216 write path) ==="
   $B --as 300 --impl new --force-host --tag s2_as300_auto_host
+fi
+if [[ "$STAGE" == "7" ]]; then
+  # Compare-only flow: the current kernel (R2C default) against the saved stage-2
+  # reference; no earlier kernel is recomputed.
+  export GPU_AO2MO_PROFILE=1
+  ensure_ref_stage2
+  echo "=== AS=300, planner widths: new vs stage2 reference ==="
+  $B --as 300 --impl new --tag s7_as300 --compare "${REF_STAGE2}"
+  echo "=== AS=300, pair_blk=1500 (NV216-like width): new vs stage2 reference ==="
+  $B --as 300 --pair-blk 1500 --impl new --tag s7_as300_pb1500 --compare "${REF_STAGE2}"
+  echo "=== AS=300, planner widths, host-staged: new vs stage2 reference ==="
+  $B --as 300 --impl new --force-host --tag s7_as300_host --compare "${REF_STAGE2}"
+fi
+if [[ "$STAGE" == "6" ]]; then
+  # Stage 6: fixed-size FFT sub-batches (one cached plan), task-level buffers,
+  # diagonal tile splitting, symmetrised R2C kernel, R2C budget 40 B/pt.
+  export GPU_AO2MO_PROFILE=1
+  echo "=== AS=300, planner widths: stage2 vs new_rfft ==="
+  $B --as 300 --impl stage2,new_rfft --tag s6_as300_rfft
+  echo "=== AS=300, planner widths: new (C2C) vs new_rfft (R2C) ==="
+  $B --as 300 --impl new,new_rfft --tag s6_as300_c2c_vs_r2c
+  echo "=== AS=300, pair_blk=1500 (NV216-like width): new_rfft ==="
+  $B --as 300 --pair-blk 1500 --impl new_rfft --tag s6_as300_pb1500
+  echo "=== AS=300, planner widths, host-staged: new_rfft ==="
+  $B --as 300 --impl new_rfft --force-host --tag s6_as300_rfft_host
+fi
+if [[ "$STAGE" == "5" ]]; then
+  # Non-GEMM overhead: fused codensity kernel (new) vs take+multiply (stage2), and
+  # the R2C Coulomb chain (new_rfft) vs C2C.  GPU_AO2MO_PROFILE syncs and times
+  # every strip phase (rho_outer / fft / rho_inner / gemm / scatter).
+  export GPU_AO2MO_PROFILE=1
+  echo "=== AS=300, planner widths: stage2 vs new (fused codensity, C2C) ==="
+  $B --as 300 --impl stage2,new --tag s5_as300_fused
+  echo "=== AS=300, planner widths: new (C2C) vs new_rfft (R2C) ==="
+  $B --as 300 --impl new,new_rfft --tag s5_as300_rfft
+  echo "=== AS=300, pair_blk=1500 (NV216-like width): new vs new_rfft ==="
+  $B --as 300 --pair-blk 1500 --impl new,new_rfft --tag s5_as300_pb1500
+  echo "=== AS=300, planner widths, host-staged: new_rfft ==="
+  $B --as 300 --impl new_rfft --force-host --tag s5_as300_rfft_host
 fi
 if [[ "$STAGE" == "3" ]]; then
   # cuBLAS fp64 fixed-point emulation needs cuBLAS >= 13.0u2; the project venv is

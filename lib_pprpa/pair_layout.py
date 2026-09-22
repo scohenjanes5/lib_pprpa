@@ -81,11 +81,60 @@ class PairLayout:
         strips = self.split(0, self.nA, blk)
         flop = 0.0
         for pa, pb in strips:
-            P0, P1 = self.pairs(pa, pb)
             for ra, rb in self.split(0, pb, blk):
-                Q0, Q1 = self.pairs(ra, rb)
-                flop += 2.0 * (P1 - P0) * (Q1 - Q0) * ngrid
+                for oa, ob, ia, ib in split_diagonal(pa, pb, ra, rb):
+                    P0, P1 = self.pairs(oa, ob)
+                    Q0, Q1 = self.pairs(ia, ib)
+                    flop += 2.0 * (P1 - P0) * (Q1 - Q0) * ngrid
         return flop
+
+
+def split_diagonal(pa, pb, ra, rb, depth=2):
+    """Sub-tiles ``(oa, ob, ia, ib)`` (outer rows, inner rows) of the strip pair
+    outer [pa, pb) x inner [ra, rb) that together cover its canonical ``r <= p``
+    elements exactly once.
+
+    A pair entirely below the diagonal (``rb <= pa``) is one tile.  One that
+    straddles it is halved ``depth`` times in both directions and the
+    sub-tiles with every ``r > p`` (``ia >= ob``) are dropped, so the GEMM
+    computes only ~1/2**depth of the unused upper triangle instead of all of
+    it (about 9% of the block's flops at wide strips).
+    """
+    pa, pb, ra, rb = int(pa), int(pb), int(ra), int(rb)
+    if rb <= pa:
+        return [(pa, pb, ra, rb)]
+    if ra >= pb:
+        return []
+    if depth <= 0 or pb - pa < 2 or rb - ra < 2:
+        return [(pa, pb, ra, rb)]
+    pm = (pa + pb) // 2
+    rm = (ra + rb) // 2
+    tiles = []
+    for oa, ob in ((pa, pm), (pm, pb)):
+        for ia, ib in ((ra, rm), (rm, rb)):
+            tiles.extend(split_diagonal(oa, ob, ia, ib, depth - 1))
+    return tiles
+
+
+def symmetric_half_kernel(w_flat, mesh):
+    """The flat real-space-FFT kernel ``w(G)`` on the R2C half mesh,
+    ``(nx, ny, nz//2 + 1)``, symmetrised as ``(w(G) + w(-G)) / 2``.
+
+    ``ifft(fft(rho) * w).real`` (pyscf's and the C2C path's convention) only
+    sees the even part of ``w``: the odd part yields a purely imaginary
+    contribution that ``.real`` drops.  ``w(G) = 4 pi / |G|^2`` is even except on
+    the Nyquist planes of an even mesh dimension in a non-orthogonal cell,
+    where ``-G`` is not representable and the fftfreq index aliases it.  The
+    C2R transform assumes a Hermitian spectrum, i.e. an even kernel, so feeding
+    it the symmetrised kernel reproduces the C2C result exactly (to rounding)
+    on every mesh instead of only on odd ones.  Works for numpy and cupy.
+    """
+    nx, ny, nz = (int(m) for m in mesh)
+    w = w_flat.reshape(nx, ny, nz)
+    ix, iy, iz = ((-np.arange(n)) % n for n in (nx, ny, nz))     # k -> -k mod n
+    w_mirror = w[ix][:, iy][:, :, iz]
+    ws = 0.5 * (w + w_mirror)
+    return ws[:, :, :nz // 2 + 1].copy()
 
 
 def write_tile(out, tile, layout, pa, pb, ra, rb):

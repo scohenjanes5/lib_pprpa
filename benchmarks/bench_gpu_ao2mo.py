@@ -100,6 +100,13 @@ def load_impl(name):
     if name == "new":
         import lib_pprpa.gpu_ao2mo as mod
         return mod
+    if name == "new_rfft":
+        import functools
+        import types
+        import lib_pprpa.gpu_ao2mo as mod
+        return types.SimpleNamespace(
+            gpu_ao2mo_blocks=functools.partial(mod.gpu_ao2mo_blocks, rfft=True),
+            get_last_telemetry=mod.get_last_telemetry)
     path = os.path.join(HERE, "gpu_ao2mo_base.py") if name == "base" else name
     if not os.path.isfile(path):
         path = os.path.join(HERE, name if name.endswith(".py") else f"gpu_ao2mo_{name}.py")
@@ -168,23 +175,32 @@ def main(argv=None):
         wall = time.perf_counter() - t0
         tel = mod.get_last_telemetry()
         blocks = {b["name"]: b for b in tel["blocks"]}
+        blocks_total = float(sum(b["seconds"] for b in blocks.values()))
         rec = {"tag": args.tag, "impl": name, "as": args.as_size, "nocc": nocc, "nvir": nvir,
                "ngrid": ng, "pair_blk_req": args.pair_blk, "force_host": bool(args.force_host),
-               "wall": wall, "mo_grid_seconds": tel["mo_grid_seconds"],
+               "wall": wall, "blocks_total": blocks_total, "mo_grid_seconds": tel["mo_grid_seconds"],
                "gpu": props["name"].decode(), "blocks": {}}
         for bn in ("vvvv", "oovv", "oooo"):
             b = blocks[bn]
             rec["blocks"][bn] = {k: b.get(k) for k in
-                                 ("seconds", "pair_blk", "final_pair_blk_per_slot", "output_location",
-                                  "compact", "gemms", "gemm_flop", "tflops", "scatter_seconds",
-                                  "retries")}
+                                 ("seconds", "pair_blk", "fft_blk", "final_pair_blk_per_slot",
+                                  "output_location", "compact", "rfft", "gemms", "gemm_flop",
+                                  "tflops", "scatter_seconds", "retries", "profile")}
             print(f"[bench] {name} {bn}: {b['seconds']:8.1f} s  pair_blk={b['pair_blk']} "
                   f"loc={b['output_location']}"
                   + (f"  {b['gemm_flop']/1e15:.3f} PFLOP  {b['tflops']:.1f} TFLOP/s  "
                      f"scatter {b['scatter_seconds']:.1f} s" if "tflops" in b else ""),
                   flush=True)
-        print(f"[bench] {name} total ao2mo wall {wall:.1f} s "
-              f"(mo grids {tel['mo_grid_seconds']:.1f} s)", flush=True)
+            if b.get("profile"):
+                print(f"[bench] {name} {bn} phases: "
+                      + "  ".join(f"{k}={v:.1f}s" for k, v in sorted(b["profile"].items())),
+                      flush=True)
+        # The wall includes the benchmark's own device->host copy of the finals
+        # (~80 GB at AS=300, pageable, slow and erratic on a shared node); the
+        # kernel cost is the sum of the block times, which production sees.
+        print(f"[bench] {name} blocks total {blocks_total:.1f} s  "
+              f"(wall incl. D2H copy {wall:.1f} s, mo grids {tel['mo_grid_seconds']:.1f} s)",
+              flush=True)
         results[name] = (rec, {"vvvv": vvvv, "oovv": oovv, "oooo": oooo})
         with open(args.results, "a") as fh:
             fh.write(json.dumps(rec) + "\n")
@@ -192,6 +208,12 @@ def main(argv=None):
             os.makedirs(args.save, exist_ok=True)
             for bn, arr in results[name][1].items():
                 np.save(os.path.join(args.save, f"{bn}.npy"), np.asarray(arr))
+            with open(os.path.join(args.save, "PROVENANCE.txt"), "w") as fh:
+                fh.write(json.dumps({"impl": name, "tag": args.tag, "geom": os.path.abspath(args.geom),
+                                     "ke": args.ke, "as": args.as_size, "nocc": nocc, "nvir": nvir,
+                                     "mesh": list(map(int, cell.mesh)), "pair_blk_req": args.pair_blk,
+                                     "lib_pprpa": os.path.dirname(lib_pprpa.__file__),
+                                     "blocks_total": blocks_total}, indent=1) + "\n")
             print(f"[bench] saved {name} tensors to {args.save}", flush=True)
         if args.compare:
             print(f"\n[bench] ===== consistency {name} vs {args.compare} =====", flush=True)
@@ -217,9 +239,9 @@ def main(argv=None):
             cmp[bn] = {"max_abs_diff": worst, "max_abs": scale, "rel": worst / max(scale, 1e-300)}
             print(f"[bench] {bn}: max|{a}-{b}| = {worst:.3e}   max|{a}| = {scale:.3e}   "
                   f"rel = {worst / max(scale, 1e-300):.3e}", flush=True)
-        wa = results[a][0]["wall"]
-        wb = results[b][0]["wall"]
-        print(f"[bench] speedup {a}/{b} = {wa / wb:.2f}x  ({wa:.0f} s -> {wb:.0f} s)", flush=True)
+        wa = results[a][0]["blocks_total"]
+        wb = results[b][0]["blocks_total"]
+        print(f"[bench] speedup {a}/{b} = {wa / wb:.2f}x  (blocks {wa:.0f} s -> {wb:.0f} s)", flush=True)
         with open(args.results, "a") as fh:
             fh.write(json.dumps({"tag": args.tag, "compare": [a, b], "as": args.as_size,
                                  "pair_blk_req": args.pair_blk, "force_host": bool(args.force_host),

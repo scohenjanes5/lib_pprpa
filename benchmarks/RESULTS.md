@@ -127,3 +127,72 @@ any two summation orders; the isolated GEMM test shows the emulated result is
 the one closer to the exact sum.  End to end on this cell: 2280.6 s (base)
 -> 123.1 s, **18.5x**, all three steps exact.  In the CUDA 12.8 production
 environment the first two steps give 2280.6 -> 231.1 s, **9.9x**.
+
+## Stage 5: where the non-GEMM time goes -- job 27101508
+
+`GPU_AO2MO_PROFILE=1` synchronises after every phase.  NV63, AS = 300,
+planner strips (4952 / 4200 / 4867 pairs), C2C chain, fused codensity kernel:
+
+| block | wall | fft | gemm | rho_inner | rho_outer | scatter | GEMM rate (gemm phase only) |
+|---|---|---|---|---|---|---|---|
+| vvvv | 102.5 s | 15.6 | 82.6 | 1.9 | 0.5 | 1.8 | 33.4 TFLOP/s |
+| oovv | 75.0 s | 12.7 | 59.7 | 2.0 | 0.5 | 0.1 | 33.5 |
+| oooo | 7.6 s | 3.1 | 4.0 | 0.1 | 0.1 | 0.3 | |
+
+So after the fused codensity kernel (`_CODENSITY_KERNEL`: one read of each
+factor, one write, no gathered temporaries) the GEMM runs at the B200's bare
+fp64 rate and the codensity rebuild is 2% of the block.  The Coulomb FFT
+chain is the remaining overhead, 15% of vvvv and 17% of oovv.
+
+stage2 (take + in-place multiply) -> fused: 228.8 s -> 190.9 s, rel. diff
+2.7e-14.
+
+R2C chain (`rfft=True`), same job: oovv fft 12.7 -> 7.7 s, oooo 3.5 -> 2.0 s,
+but vvvv did not improve and the planner run OOM'd and retried (the 24 B per
+pair-gridpoint estimate for the R2C chain omitted the cuFFT work area), and
+the compact blocks' variable strip lengths gave every FFT sub-batch a new
+remainder shape, so cuFFT re-planned constantly.  On the odd 107^3 mesh the
+R2C tensors matched C2C to 2e-14 (vvvv) / 2e-16 (oovv, oooo); on the even
+20^3 diamond test mesh they differed by 1e-8, which is the Nyquist-plane
+kernel asymmetry of a non-orthogonal cell -- the C2C path's `.real` only
+sees the even part of the kernel, so R2C needs the symmetrised half kernel
+(`pair_layout.symmetric_half_kernel`; numpy test to 1e-13 on even meshes).
+Stage 6 fixes all three.
+
+## Stage 6: FFT chain and tile bookkeeping -- job 27104981
+
+Changes: fused codensity kernel; R2C Coulomb chain with the symmetrised half
+kernel (now the default; the even-mesh diamond self-test agrees with pyscf to
+1.5e-13, same as C2C); FFT sub-batches of one fixed shape per block
+(zero-padded remainder, one cached cuFFT plan); potential / codensity / FFT
+buffers allocated once per task; diagonal-straddling strip pairs split into
+sub-tiles (depth 2) so the GEMM skips most of the unused upper triangle;
+R2C planner budget 40 B per pair-gridpoint (no OOM retries).
+
+NV63, AS = 300, planner strips (4952 / 4200 / 4864), block times and phases:
+
+| block | stage2 | new C2C | new R2C | R2C phases: fft / gemm / rho_in / rho_out / scatter |
+|---|---|---|---|---|
+| vvvv | 130.7 s | 97.8 s | 91.4 s | 9.1 / 78.2 / 1.8 / 0.3 / 1.6 |
+| oovv | 82.5 s | 73.5 s | 67.5 s | 7.8 / 57.1 / 1.5 / 0.2 / 0.5 |
+| oooo | 8.5 s | 6.7 s | 5.7 s | 1.8 / 3.3 / 0.1 / 0.1 / 0.3 |
+| blocks total | 221.7 s | 178.0 s | **164.6 s** | |
+
+Consistency: R2C vs C2C 2.5e-16 (all blocks); R2C vs stage2 2.7e-14 / 4.6e-14
+/ 4.0e-14.  GEMM flops 2.676 -> 2.566 PFLOP from the diagonal split; the
+gemm phase runs at 32.8 TFLOP/s, the B200's bare fp64 rate.  The FFT chain
+is down from 15.6 to 9.1 s (vvvv), the codensity rebuild from 5 to 1.8 s.
+What remains outside the GEMM is 13 s of 91 (14%): 9 s FFT, 2 s codensity,
+2 s scatter.
+
+At the NV216-like forced width 1500: 110.8 / 79.1 / 5.7 = 195.6 s (vs 226 s
+C2C stage 2 at the same width).
+
+Note on the "total ao2mo wall" lines in this job's log (480 s, 268 s): the
+benchmark returns the finals to the host (`return_gpu=False`), an 80 GB
+pageable device-to-host copy that took 100-300 s on the shared devel node
+while another run's tensors were still resident.  Production keeps the
+finals on the GPU; the block sums above are the kernel cost.  The bench now
+reports block totals and uses them for the speedup.
+
+Cumulative on this cell: 2280.6 s (7475b2f) -> 164.6 s, **13.9x**, exact.
