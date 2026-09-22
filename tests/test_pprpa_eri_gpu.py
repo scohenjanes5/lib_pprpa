@@ -51,8 +51,14 @@ def test_fits_resident_matches_ao2mo_rule():
 
 
 def _random_eri(rng, nocc, nvir):
-    vvvv = rng.standard_normal((nvir, nvir, nvir, nvir))
-    oooo = rng.standard_normal((nocc, nocc, nocc, nocc))
+    """Random blocks with the symmetry the real tensors have: <ab|cd> = <cd|ab>,
+    i.e. the flattened (n², n²) vvvv / oooo matrices are symmetric (the tiled
+    path streams row strips on that basis)."""
+    nv2, no2 = nvir * nvir, nocc * nocc
+    V = rng.standard_normal((nv2, nv2))
+    O = rng.standard_normal((no2, no2))
+    vvvv = ((V + V.T) * 0.5).reshape(nvir, nvir, nvir, nvir)
+    oooo = ((O + O.T) * 0.5).reshape(nocc, nocc, nocc, nocc)
     oovv = rng.standard_normal((nocc, nocc, nvir, nvir))
     return vvvv, oooo, oovv
 
@@ -168,6 +174,42 @@ def test_auto_selects_resident_when_vram_is_plenty():
 
 
 @_parametrize("multi", ("s", "t"))
+@_parametrize("ntri", (1, 7))
+def test_split_mvp_matches_resident_and_cpu(multi, ntri):
+    """Two virtual slots on one GPU hold row halves; partial sums == resident."""
+    _need_cupy()
+    from lib_pprpa.gpu_multi import DeviceGroup
+    from lib_pprpa.pprpa_davidson import _pprpa_contraction
+
+    rng = np.random.default_rng(9)
+    nocc, nvir = 5, 7
+    moe = rng.standard_normal(nocc + nvir)
+    vvvv, oooo, oovv = _random_eri(rng, nocc, nvir)
+    cpu = _make_solver(nocc, nvir, moe, vvvv, oovv, oooo, multi)
+    tv = rng.standard_normal((ntri, cpu.full_dim))
+    mv_cpu = _pprpa_contraction(cpu, tv)
+
+    gpu = _make_solver(nocc, nvir, moe, vvvv, oovv, oooo, multi)
+    attach_gpu_eri_contraction(gpu, vvvv, oovv, oooo, mode="resident")
+    mv_res = gpu.contraction(tv)
+    g2 = DeviceGroup([0, 0])
+    attach_gpu_eri_contraction(gpu, vvvv, oovv, oooo, mode="split", group=g2)
+    assert get_last_telemetry()["mode"] == "split"
+    mv_split = gpu.contraction(tv)
+    np.testing.assert_allclose(mv_res, mv_cpu, rtol=1e-11, atol=1e-11)
+    np.testing.assert_allclose(mv_split, mv_res, rtol=1e-11, atol=1e-11)
+    release_gpu_eri(gpu)
+    assert get_last_telemetry()["stream"]["mvps"] == 1
+    # auto: too big for one slot but the halves fit -> split
+    attach_gpu_eri_contraction(gpu, vvvv, oovv, oooo, mode="auto", group=g2,
+                               total_bytes=int(eri_bytes(nocc, nvir) / 0.75) - 8)
+    assert get_last_telemetry()["mode"] == "split"
+    mv_auto = gpu.contraction(tv)
+    np.testing.assert_allclose(mv_auto, mv_res, rtol=1e-11, atol=1e-11)
+    release_gpu_eri(gpu)
+
+
+@_parametrize("multi", ("s", "t"))
 @_parametrize("ntri", (1, 7, 16))
 @_parametrize("tile", (1, 5, 64))
 def test_tiled_mvp_matches_resident_and_cpu(multi, ntri, tile):
@@ -226,4 +268,7 @@ if __name__ == "__main__":
         for ntri in (1, 7, 16):
             for tile in (1, 5, 64):
                 ok &= _run(test_tiled_mvp_matches_resident_and_cpu, multi, ntri, tile)
+    for multi in ("s", "t"):
+        for ntri in (1, 7):
+            ok &= _run(test_split_mvp_matches_resident_and_cpu, multi, ntri)
     raise SystemExit(0 if ok else 1)

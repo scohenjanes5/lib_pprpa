@@ -492,6 +492,27 @@ def _make_strip_shrink(min_blk):
     return _shrink
 
 
+def _host_tensor(shape, name):
+    """Host buffer for a staged final: pinned (page-locked) when
+    ``GPU_AO2MO_PINNED`` allows (default on), so the tiled Davidson's uploads
+    -- and this kernel's own tile copies -- run at the link's full rate instead
+    of through the driver's pageable bounce buffer.  Falls back to pageable
+    memory if the page-locked allocation fails."""
+    nbytes = int(np.prod(shape)) * 8
+    if _env_flag("GPU_AO2MO_PINNED", True):
+        try:
+            import cupyx
+            t0 = time.perf_counter()
+            out = cupyx.empty_pinned(shape, dtype=np.float64)
+            print(f"{_ts()} [gpu_ao2mo] {name}: pinned host buffer {nbytes/1e9:.1f} GB "
+                  f"in {time.perf_counter() - t0:.1f} s", flush=True)
+            return out
+        except Exception as exc:  # noqa: BLE001
+            print(f"{_ts()} [gpu_ao2mo] {name}: pinned allocation failed "
+                  f"({type(exc).__name__}: {exc}); using pageable memory", flush=True)
+    return np.empty(shape, dtype=np.float64)
+
+
 def _block_direct(name, keyA, keyB, mesh, group, pair_blk=None, force_host=False,
                   fft_blk=None, rfft=False, profile=False):
     """Fill a final physicist ERI on GPU or directly on host when VRAM is tight.
@@ -529,7 +550,7 @@ def _block_direct(name, keyA, keyB, mesh, group, pair_blk=None, force_host=False
             _reclaim_gpu()
             on_gpu = False
     if not on_gpu:
-        out = np.empty((nA, nA, nB, nB), dtype=np.float64)
+        out = _host_tensor((nA, nA, nB, nB), name)
         blk, fblk = _plan_strips(npair, ngrid, layout.min_blk, pair_blk=pair_blk,
                                  fft_blk=fft_blk, free=group.min_free_bytes(), mesh=mesh,
                                  compact=compact, rfft=rfft)

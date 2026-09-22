@@ -294,6 +294,50 @@ grid (90 GB at NV216).  Expected at NV216: the 29 min exchange build becomes
 a few minutes.
 
 **Pairing force** (`gpu_pairing_force`), rank 428 (= nocc + nvir), 91,806
-pairs: 32.4 s -> 23.0 s (1.41x), rel. diff 1.0e-15.  Fused codensity + R2C
-chain; the strip planner now takes the chain's cost from `gpu_coulomb`
-(one OOM retry on the first strip in this run -> 20% slack added).
+pairs: 32.4 s -> 17.8 s (1.82x; job 27133118, strip 2058, no retries), rel.
+diff 1.0e-15.  Fused codensity + R2C chain; the strip planner takes the
+chain's cost from `gpu_coulomb` with 20% slack (the first run's 2573-pair
+strip OOM'd once and finished in 23.0 s after the retry).
+
+## Stage 10: the Davidson ERI stream -- job 27134027
+
+`pprpa_eri_gpu` streams the three host-staged tensors to the GPU on every
+Davidson matrix-vector product (MVP) when they do not fit resident: 78.7 GB
+per MVP on NV63 at AS=300, 194 GB at NV216.  Measured on the saved stage-2
+reference tensors, 32 trial vectors per MVP, best of 3, two B200s:
+
+| mode | host memory | MVP | effective rate | rel. diff vs resident |
+|---|---|---|---|---|
+| resident (fits on NV63) | -- | 0.026 s | -- | -- |
+| **split** (row halves on 2 GPUs, partials summed on the host) | pinned | 0.026 s | 0.1 GB/MVP of trial vectors | 1.5e-16 |
+| tiled, as before | pageable | 3.71 s (first MVP 19.8 s) | 8.6 GB/s | 1.5e-16 |
+| tiled | **pinned** | 1.39 s | 56.6 GB/s | 1.5e-16 |
+
+Three changes, all in `pprpa_eri_gpu` and `gpu_ao2mo._host_tensor`:
+
+* **Pinned staging.** ao2mo allocates a host-staged final with
+  `cupyx.empty_pinned` (`GPU_AO2MO_PINNED=0` for pageable; falls back on
+  failure).  The Davidson inherits it through the copy-free reshape, so its
+  uploads run at the link rate instead of through the driver's bounce
+  buffer: 6.6x on the stream (the memo's estimate was 2-2.5x).  At NV216,
+  194 GB/MVP: ~22 s -> ~3.4 s per MVP, ~10 min -> ~1.7 min per force at 30
+  MVPs.
+* **Row strips.** `vvvv` and `oooo` are symmetric physicist matrices, so the
+  tiled path now streams contiguous row strips (`V[P, :]` for `V[:, P].T`);
+  the old column slices made numpy materialise a strided copy before every
+  upload (part of the 19.8 s first MVP above).
+* **Split-resident mode.** With a multi-slot `DeviceGroup` each slot holds a
+  row range of every block; an MVP ships the trial vectors to each slot
+  (~25 MB) and sums the partial products on the host.  Auto-selected when the
+  whole set does not fit one slot but the per-slot shares do (NV216 on two
+  B200s: 97 GB each), so the 2-GPU production jobs stop streaming the ERIs
+  entirely: the 4-6 min Davidson phase becomes seconds.  Validated against
+  the resident and CPU contractions with two virtual slots (tests) and two
+  real devices (this job).
+
+Per-MVP bytes / seconds / GB/s are now in the telemetry and printed at
+`release_gpu_eri`, which is the measurement the memo asked for first.  The
+remaining memo items (sub-tile double buffering, deterministic tile size)
+are moot for the split mode and worth little for the pinned tiled one: the
+GEMM is a few percent of the transfer, and the tile only shrinks below a
+whole block on a contended card.

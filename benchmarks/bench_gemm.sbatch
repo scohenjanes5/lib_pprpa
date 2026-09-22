@@ -83,6 +83,13 @@ if [[ "$STAGE" == "2" ]]; then
   echo "=== AS=300, planner widths, host-staged finals: new (NV216 write path) ==="
   $B --as 300 --impl new --force-host --tag s2_as300_auto_host
 fi
+if [[ "$STAGE" == "10" ]]; then
+  # Davidson ERI stream: resident / split (2 GPUs or 2 virtual slots) / tiled with
+  # pageable vs pinned host tensors, from the saved stage-2 reference.  Submit with
+  # --gres=gpu:b200:2 to exercise the real two-device split.
+  python "${CHECKOUT}/tests/test_pprpa_eri_gpu.py"
+  python "${CHECKOUT}/benchmarks/bench_eri_stream.py" --ref "${REF_STAGE2}" --ntri 32 --repeat 3       --tag s10_eri_stream
+fi
 if [[ "$STAGE" == "9" ]]; then
   # Low-rank exchange (full K: frozen base vs new; K @ orbp: new ket path) and the
   # pairing force (frozen base vs new), NV63 AS=300, element-wise vs the frozen kernels.

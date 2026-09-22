@@ -1,12 +1,22 @@
 """GPU (cupy) ERI contraction for the pp-RPA Davidson ``use_eri`` path.
 
-Two modes, selected by ``attach_gpu_eri_contraction``:
+Three modes, selected by ``attach_gpu_eri_contraction``:
 
 * **resident** — keep ``vvvv`` / ``oooo`` / ``oovv`` on the GPU and GEMM all
   trial vectors at once (original path).
-* **tiled** — keep the tensors on the host and stream ``(blk, n²)`` slices for
-  the same GEMMs.  Auto-selected when the three tensors would not fit in 75% of
-  VRAM (``gpu_mem.fits_resident``, same rule as ao2mo).
+* **split** — with a multi-slot ``gpu_multi.DeviceGroup``, keep a row range of
+  every block resident on each slot and sum the partial products on the host:
+  nothing streams per MVP (194 GB at AS=300 otherwise), only the trial
+  vectors and the partials (~25 MB each way).  Auto-selected when the whole
+  set does not fit one slot but the per-slot shares do.
+* **tiled** — keep the tensors on the host and stream ``(blk, n²)`` row strips
+  for the same GEMMs.  Auto-selected when neither of the above fits.  The
+  strips are *rows*: ``vvvv`` and ``oooo`` are symmetric physicist matrices
+  (<ab|cd> = <cd|ab>), so ``V[:, P].T == V[P, :]`` and every upload is a
+  contiguous slice of the host array -- no numpy copy of a strided column
+  block in front of each transfer.  Host tensors staged in pinned memory by
+  ``gpu_ao2mo`` cross the link at full speed; the per-MVP volume, seconds and
+  rate are recorded in the telemetry and printed at ``release_gpu_eri``.
 
 Algebra is identical to ``lib_pprpa.pprpa_davidson._pprpa_contraction`` (z.T
 flattening, 1/sqrt(2) diagonal scaling, hh-block sign, physicist matmul
@@ -21,6 +31,7 @@ from __future__ import annotations
 
 import math
 import os
+import time
 
 import numpy as np
 
@@ -66,8 +77,17 @@ def _is_oom(exc):
             or "cudaerrormemoryallocation" in msg)
 
 
+def _is_pinned(arr):
+    """Best-effort: was this numpy array allocated with ``cupyx.empty_pinned``?"""
+    base = arr
+    while isinstance(base, np.ndarray) and base.base is not None:
+        base = base.base
+    return "Pinned" in type(base).__name__
+
+
 def _flatten_host(block, n0, n1):
-    """``(n0, n0, n1, n1)`` or ``(n0*n0, n1*n1)`` → C-contiguous ``(n0², n1²)`` numpy."""
+    """``(n0, n0, n1, n1)`` or ``(n0*n0, n1*n1)`` → C-contiguous ``(n0², n1²)`` numpy.
+    A reshape of a pinned array stays pinned (no copy is made)."""
     arr = np.asarray(cp.asnumpy(block) if _is_cupy(block) else block)
     if arr.ndim == 4:
         arr = arr.reshape(n0 * n0, n1 * n1)
@@ -88,11 +108,13 @@ def eri_mvp_tiled(zvvT, zooT, vvvv, oovv, oooo, tile, xp=np):
     the accumulators (``numpy`` or ``cupy``).  Each inner slice is uploaded with
     ``xp.asarray`` so a numpy host ERI + cupy ``xp`` streams tiles to the GPU.
 
-    Every block crosses the link exactly once per call: ``vvvv`` and ``oooo`` as
-    column strips, ``oovv`` as row strips that serve *both* of its products (see
-    below).  That is the whole transfer budget, 194.4 GB at AS=300, and the path
-    is transfer-bound (intensity ntri/4 flop per byte), so a redundant pass costs
-    real wall time.
+    Every block crosses the link exactly once per call, always as *row strips*
+    (contiguous in the C-ordered host arrays, so no numpy copy precedes an
+    upload): ``vvvv`` and ``oooo`` are symmetric physicist matrices, so
+    ``V[:, P].T == V[P, :]``; ``oovv`` row strips serve both of its products
+    (see below).  That is the whole transfer budget, 194.4 GB at AS=300, and
+    the path is transfer-bound (intensity ntri/4 flop per byte), so a redundant
+    pass costs real wall time.
     """
     tile = max(1, int(tile))
     ntri, nv2 = zvvT.shape
@@ -102,14 +124,14 @@ def eri_mvp_tiled(zvvT, zooT, vvvv, oovv, oooo, tile, xp=np):
 
     for p0 in range(0, nv2, tile):
         p1 = min(p0 + tile, nv2)
-        Vt = xp.asarray(vvvv[:, p0:p1])
-        prod_vv = prod_vv + zvvT[:, p0:p1] @ Vt.T
+        Vt = xp.asarray(vvvv[p0:p1, :])              # == vvvv[:, p0:p1].T (symmetric)
+        prod_vv = prod_vv + zvvT[:, p0:p1] @ Vt
         Vt = None
 
     for p0 in range(0, no2, tile):
         p1 = min(p0 + tile, no2)
-        Ot = xp.asarray(oooo[:, p0:p1])
-        prod_oo = prod_oo + zooT[:, p0:p1] @ Ot.T
+        Ot = xp.asarray(oooo[p0:p1, :])
+        prod_oo = prod_oo + zooT[:, p0:p1] @ Ot
         Ot = None
 
     # One pass over oovv serves both of its products.  A row strip
@@ -155,7 +177,7 @@ def _choose_mode(nocc, nvir, vvvv, oovv, oooo, mode, total_bytes):
     if env:
         mode = env.strip().lower()
     mode = (mode or "auto").strip().lower()
-    if mode not in ("auto", "resident", "tiled"):
+    if mode not in ("auto", "resident", "split", "tiled"):
         raise ValueError(f"unknown ERI mode {mode!r}")
     if mode != "auto":
         return mode
@@ -165,25 +187,91 @@ def _choose_mode(nocc, nvir, vvvv, oovv, oooo, mode, total_bytes):
         nocc, nvir, extra_bytes=0, total_bytes=total_bytes) else "tiled"
 
 
+def _split_fits(nocc, nvir, group, frac=0.75):
+    """Do the per-slot row shares of the three blocks fit each slot's free VRAM?"""
+    share = eri_bytes(nocc, nvir) / group.nslots
+    try:
+        free_min = group.min_free_bytes()
+    except Exception:
+        return False
+    return share <= frac * free_min
+
+
+def _split_upload(group, vvvv, oovv, oooo, nocc, nvir):
+    """Put rows [r0, r1) of every block on each slot (contiguous host slices)."""
+    nv2, no2 = nvir * nvir, nocc * nocc
+    V = _flatten_host(vvvv, nvir, nvir)
+    O = _flatten_host(oooo, nocc, nocc)
+    OV = _flatten_host(oovv, nocc, nvir)
+    n = group.nslots
+
+    def _rows(total, rank):
+        a = (total * rank) // n
+        b = (total * (rank + 1)) // n
+        return a, b
+
+    def _up(ctx):
+        st = ctx.state
+        v0, v1 = _rows(nv2, ctx.rank)
+        o0, o1 = _rows(no2, ctx.rank)
+        st["eri_v_rows"] = (v0, v1)
+        st["eri_o_rows"] = (o0, o1)
+        st["eri_V"] = cp.asarray(V[v0:v1])
+        st["eri_O"] = cp.asarray(O[o0:o1])
+        st["eri_OV"] = cp.asarray(OV[o0:o1])
+        cp.cuda.Device().synchronize()          # uploads from pinned memory are asynchronous
+    group.each(_up)
+    return V, O, OV
+
+
+def _split_partial(ctx, zvvT_h, zooT_h):
+    """This slot's contribution: rows P of vvvv/oooo and rows Q of oovv."""
+    st = ctx.state
+    v0, v1 = st["eri_v_rows"]
+    o0, o1 = st["eri_o_rows"]
+    zvvT = cp.asarray(zvvT_h)
+    zooT = cp.asarray(zooT_h)
+    # row strips P of the symmetric vvvv / oooo give full-width partial sums;
+    # the oovv rows Q give prod_vv's partial sum and prod_oo's disjoint columns Q
+    prod_vv = zvvT[:, v0:v1] @ st["eri_V"]
+    prod_vv += zooT[:, o0:o1] @ st["eri_OV"]
+    prod_oo = zooT[:, o0:o1] @ st["eri_O"]
+    prod_oo[:, o0:o1] += zvvT @ st["eri_OV"].T
+    out = (cp.asnumpy(prod_vv), cp.asnumpy(prod_oo))
+    prod_vv = prod_oo = zvvT = zooT = None
+    return out
+
+
 def attach_gpu_eri_contraction(pprpa, vvvv, oovv, oooo, mode="auto",
-                               tile=None, total_bytes=None):
-    """Route Davidson MVP through cupy.  ``mode`` is auto/resident/tiled.
+                               tile=None, total_bytes=None, group=None):
+    """Route Davidson MVP through cupy.  ``mode`` is auto/resident/split/tiled.
 
     Requires cupy.
 
     ``total_bytes`` overrides live VRAM for auto-select (tests).  ``tile``
     forces the tiled GEMM strip length; otherwise ``DAVIDSON_ERI_TILE`` or
-    an analytic estimate from free VRAM is used.
+    an analytic estimate from free VRAM is used.  ``group`` (a
+    ``gpu_multi.DeviceGroup``; default ``LIB_PPRPA_GPUS`` slots) enables the
+    split-resident mode when it has more than one slot.
     """
     _require_cupy()
     global LAST_TELEMETRY
+    from lib_pprpa.gpu_multi import default_group
+    group = group or default_group()
     pprpa._use_eri = True
+    pprpa._eri_group = group
     nvir = pprpa.nvir
     nocc = pprpa.nocc
     chosen = _choose_mode(nocc, nvir, vvvv, oovv, oooo, mode, total_bytes)
+    if chosen == "tiled" and mode in ("auto", None) and group.nslots > 1 \
+            and not os.environ.get("PPRPA_ERI_MODE") and _split_fits(nocc, nvir, group):
+        chosen = "split"
+    if chosen == "split" and group.nslots < 2:
+        chosen = "resident"
     nbytes = eri_bytes(nocc, nvir)
+    pprpa._eri_stream = {"mvps": 0, "bytes": 0.0, "seconds": 0.0, "ntri": 0}
 
-    def _finish(chosen_mode, tile_used):
+    def _finish(chosen_mode, tile_used, pinned=None):
         pprpa.vvvv = np.empty(0, dtype=np.float64)
         pprpa.oovv = None
         pprpa.oooo = None
@@ -194,14 +282,30 @@ def attach_gpu_eri_contraction(pprpa, vvvv, oovv, oooo, mode="auto",
             "eri_bytes": int(nbytes),
             "nocc": int(nocc),
             "nvir": int(nvir),
+            "pinned_host": pinned,
+            "gpu_slots": list(group.devices),
         })
         print(
             f"{_ts()} [pprpa_eri_gpu] mode={chosen_mode}"
             f"{'' if tile_used is None else f' tile={tile_used}'}"
-            f" eri={nbytes/1e9:.2f} GB no={nocc} nv={nvir}",
+            f"{'' if pinned is None else f' pinned_host={pinned}'}"
+            f" eri={nbytes/1e9:.2f} GB no={nocc} nv={nvir} slots={group.nslots}",
             flush=True,
         )
         return pprpa
+
+    if chosen == "split":
+        t0 = time.perf_counter()
+        V, O, OV = _split_upload(group, vvvv, oovv, oooo, nocc, nvir)
+        pinned = bool(_is_pinned(V) and _is_pinned(O) and _is_pinned(OV))
+        pprpa._host_vvvv = pprpa._host_oooo = pprpa._host_oovv = None
+        pprpa._gpu_vvvv = pprpa._gpu_oooo = pprpa._gpu_oovv = None
+        pprpa._gpu_mo_energy = cp.asarray(pprpa.mo_energy)
+        pprpa._eri_tile = None
+        pprpa.contraction = lambda tri_vec: _gpu_eri_contraction_split(pprpa, tri_vec)
+        print(f"{_ts()} [pprpa_eri_gpu] split upload {nbytes/1e9:.1f} GB over {group.nslots} slots "
+              f"in {time.perf_counter() - t0:.1f} s", flush=True)
+        return _finish("split", None, pinned)
 
     if chosen == "resident":
         try:
@@ -228,18 +332,32 @@ def attach_gpu_eri_contraction(pprpa, vvvv, oovv, oooo, mode="auto",
     pprpa._host_vvvv = _flatten_host(vvvv, nvir, nvir)
     pprpa._host_oooo = _flatten_host(oooo, nocc, nocc)
     pprpa._host_oovv = _flatten_host(oovv, nocc, nvir)
+    pinned = bool(all(_is_pinned(a) for a in (pprpa._host_vvvv, pprpa._host_oooo, pprpa._host_oovv)))
     pprpa._gpu_vvvv = pprpa._gpu_oooo = pprpa._gpu_oovv = None
     pprpa._gpu_mo_energy = cp.asarray(pprpa.mo_energy)
     n2 = max(nocc * nocc, nvir * nvir)
     pprpa._eri_tile = estimate_eri_tile(n2, tile=tile)
     pprpa.contraction = lambda tri_vec: _gpu_eri_contraction_tiled(pprpa, tri_vec)
-    return _finish("tiled", pprpa._eri_tile)
+    return _finish("tiled", pprpa._eri_tile, pinned)
 
 
 def release_gpu_eri(pprpa, *extra):
     """Drop GPU and host MO-ERI tensors held by attach_gpu_eri_contraction."""
     _require_cupy()
     import gc
+    st = getattr(pprpa, "_eri_stream", None)
+    if st and st["mvps"]:
+        rate = st["bytes"] / max(st["seconds"], 1e-9) / 1e9
+        LAST_TELEMETRY["stream"] = dict(st, gb_per_s=rate)
+        print(f"{_ts()} [pprpa_eri_gpu] {st['mvps']} MVPs, {st['ntri']} trial vectors: "
+              f"streamed {st['bytes']/1e9:.1f} GB in {st['seconds']:.1f} s "
+              f"({rate:.1f} GB/s effective)", flush=True)
+    group = getattr(pprpa, "_eri_group", None)
+    if group is not None and group.nslots > 1:
+        try:
+            group.free(["eri_V", "eri_O", "eri_OV", "eri_v_rows", "eri_o_rows"])
+        except Exception:
+            pass
     for attr in ("_gpu_vvvv", "_gpu_oooo", "_gpu_oovv", "_gpu_mo_energy",
                  "_host_vvvv", "_host_oooo", "_host_oovv"):
         if hasattr(pprpa, attr):
@@ -320,10 +438,27 @@ def _gpu_eri_contraction(pprpa, tri_vec):
     return _finish_mv(pprpa, T, prod_vv, prod_oo, tro, tco, trv, tcv, di_o, di_v)
 
 
+def _gpu_eri_contraction_split(pprpa, tri_vec):
+    T, zooT, zvvT, tro, tco, trv, tcv, di_o, di_v = _prepare_z(pprpa, tri_vec)
+    t0 = time.perf_counter()
+    zvvT_h = cp.asnumpy(zvvT)
+    zooT_h = cp.asnumpy(zooT)
+    parts = pprpa._eri_group.each(lambda ctx: _split_partial(ctx, zvvT_h, zooT_h))
+    prod_vv = cp.asarray(sum(p[0] for p in parts))
+    prod_oo = cp.asarray(sum(p[1] for p in parts))
+    st = pprpa._eri_stream
+    st["mvps"] += 1
+    st["ntri"] += int(T.shape[0])
+    st["bytes"] += 2.0 * (zvvT_h.nbytes + zooT_h.nbytes) * pprpa._eri_group.nslots
+    st["seconds"] += time.perf_counter() - t0
+    return _finish_mv(pprpa, T, prod_vv, prod_oo, tro, tco, trv, tcv, di_o, di_v)
+
+
 def _gpu_eri_contraction_tiled(pprpa, tri_vec):
     T, zooT, zvvT, tro, tco, trv, tcv, di_o, di_v = _prepare_z(pprpa, tri_vec)
     n2 = max(pprpa.nocc * pprpa.nocc, pprpa.nvir * pprpa.nvir)
     tile = max(1, int(getattr(pprpa, "_eri_tile", 0) or estimate_eri_tile(n2)))
+    t0 = time.perf_counter()
     while True:
         try:
             prod_vv, prod_oo = eri_mvp_tiled(
@@ -331,6 +466,13 @@ def _gpu_eri_contraction_tiled(pprpa, tri_vec):
                 pprpa._host_vvvv, pprpa._host_oovv, pprpa._host_oooo,
                 tile, xp=cp,
             )
+            cp.cuda.Device().synchronize()
+            st = pprpa._eri_stream
+            st["mvps"] += 1
+            st["ntri"] += int(T.shape[0])
+            st["bytes"] += float(pprpa._host_vvvv.nbytes + pprpa._host_oooo.nbytes
+                                 + pprpa._host_oovv.nbytes)
+            st["seconds"] += time.perf_counter() - t0
             break
         except Exception as exc:
             if not _is_oom(exc) or tile <= 1:
