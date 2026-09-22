@@ -20,13 +20,8 @@ Memory strategy
   W = (vol/ngrid) F^-1 diag(coulG) F, so it block-factorises exactly:
   E[I,J] = (rho_I W) rho_J^T.  Pair strips are streamed accordingly and the
   full (npair, ngrid) codensity is never built (2.9 TB at nv=300, 159^3).
-* pair_blk is chosen analytically from live free memory (``_plan_strips``), not
-  by probing.  The Coulomb potential of an outer strip is formed in FFT
-  sub-batches (``fft_blk``, ~15% of the budget at 56 B per pair-gridpoint of
-  complex transients) into a real strip buffer, so the GEMM strip width is
-  set only by its own operands (24 B per pair-gridpoint) plus the b x b tile.
-  The tall-skinny tile GEMM (M = N = b, K = ngrid) runs far below peak at
-  b = 300-600 and much closer to it at b ~ 2000, which the decoupling allows.
+* pair_blk is chosen analytically from live free memory (``_estimate_pair_blk``:
+  64 B per pair-gridpoint of transients plus the b x b tile), not by probing.
 * The Gram matrix is symmetric, so only its lower-triangle tiles are formed
   (``pair_layout``); each tile is scattered together with its transpose.  For
   vvvv / oooo the same MO set sits on both sides of the pair, so the pair
@@ -38,10 +33,10 @@ Memory strategy
   by default; LIB_PPRPA_GPUS=2 opts in).  MO grids are replicated per slot; an
   OOM shrinks only that slot's sub-strip and redoes the failing strip instead
   of restarting the whole tensor.  With >1 slot the finals are host-staged.
-* The FFT sub-batch is capped at ``gpu_mem.max_fft_batch(ngrid)`` transforms:
-  cuFFT returns CUFFT_INVALID_SIZE (not an OOM) for batched plans above 2^31
-  elements on Bluestein-sized meshes (e.g. 151^3).  That error is treated as
-  retryable; the GEMM strip itself is not bound by the plan limit any more.
+* Strips are also capped at ``gpu_mem.max_fft_batch(ngrid)`` rows: cuFFT
+  returns CUFFT_INVALID_SIZE (not an OOM) for batched plans above 2^31
+  elements on Bluestein-sized meshes (e.g. 151^3), which a roomy B200 would
+  otherwise trigger with pair_blk=1200.  That error is treated as retryable.
 * After assembly, the three finals are uploaded only if they still fit in
   75% of VRAM (``gpu_mem.fits_resident``). Otherwise they stay on the host
   for tiled Davidson contraction.
@@ -278,15 +273,8 @@ def _codensity_pairs(moA, moB, p0, p1):
 
 
 def _codensity(moA, moB, pidx, qidx, P0, P1):
-    """Codensity strip for ``PairLayout`` pairs [P0:P1] -> (P1-P0, ngrid).
-
-    Gather the first factor into the result and multiply in place, so the
-    transient peak is two (blk, ngrid) arrays (16 B per pair-gridpoint), not
-    three.
-    """
-    rho = cp.take(moA, pidx[P0:P1], axis=0)
-    rho *= cp.take(moB, qidx[P0:P1], axis=0)
-    return rho
+    """Codensity strip for ``PairLayout`` pairs [P0:P1] -> (P1-P0, ngrid)."""
+    return moA[pidx[P0:P1]] * moB[qidx[P0:P1]]
 
 
 def _cushion_bytes():
@@ -298,75 +286,44 @@ def _cushion_bytes():
 
 
 
-# Bytes per pair-gridpoint alive while one FFT sub-batch is transformed: real
-# rho (8) + complex FFT (16) + vG (16) + complex vR (16).  Its .real lands in
-# the strip's potential buffer, which the GEMM term below accounts for.
-_FFT_BYTES_PER_POINT = 56
-# Share of the strip budget handed to the FFT sub-batch; the transform is
-# ~0.1% of the flops, so it only needs to be big enough to keep cuFFT busy.
-_FFT_BUDGET_FRAC = 0.15
-_FFT_BLK_FLOOR = 16
-# Bytes per pair-gridpoint of the GEMM operands: the real potential strip vR
-# (8) and the inner codensity strip at its build peak (16, see _codensity).
-_GEMM_BYTES_PER_POINT = 24
+def _estimate_pair_blk(npair, ngrid, nB, pair_blk=None, free=None, mesh=None,
+                       compact=False):
+    """Estimate a fast strip size from live driver memory.
 
-
-def _plan_strips(npair, ngrid, nB, pair_blk=None, fft_blk=None, free=None, mesh=None,
-                 compact=False):
-    """Plan ``(pair_blk, fft_blk)``: the GEMM strip width and the FFT sub-batch.
-
-    The Coulomb potential of an outer strip is formed in FFT sub-batches of
-    ``fft_blk`` pairs into a real (pair_blk, ngrid) buffer, so the GEMM tile
-    width is no longer tied to the cuFFT plan limit or to the 64 B per
-    pair-gridpoint of complex transients -- only to the 24 B of its own
-    operands.  Wider tiles run the tall-skinny Gram GEMM much closer to peak.
-
-    The final ERI tensor has already been allocated when this is called.
-    ``free`` (bytes) overrides the current-device query (multi-GPU: plan from
-    the slot with the least free memory).  Strips are whole rows of the pair
-    layout: multiples of ``nB`` pairs for the full index; for the compact
-    ``p >= q`` index only the floor of one longest row applies and
-    ``PairLayout.split`` packs whole rows into the budget.  ``pair_blk`` /
-    ``fft_blk`` (argument or ``GPU_AO2MO_FFT_BLK``) force the values; the FFT
-    batch is always capped at the cuFFT plan limit and at the strip width.
+    The final ERI tensor has already been allocated when this is called.  The
+    estimate budgets the remaining memory for rho, FFT output/workspace, vR,
+    rho_q and the GEMM tile.  Strips are whole rows of the pair layout: with
+    the full pair index that means multiples of ``nB`` pairs; with the
+    compact ``p >= q`` index (``compact=True``) rows have variable length, so
+    only the floor of one longest row (``nB`` pairs) applies and
+    ``PairLayout.split`` packs whole rows into the budget.  ``free`` (bytes)
+    overrides the current-device query (multi-GPU: plan from the slot with
+    the least free memory).
     """
-    if free is None:
-        free = _free_bytes()
-    reserve = max(_cushion_bytes(), int(0.06 * free))
-    budget = max(0, free - reserve)
-    cap = max_fft_batch(ngrid, mesh=mesh)
-    if fft_blk is None:
-        env = os.environ.get("GPU_AO2MO_FFT_BLK")
-        fft_blk = int(env) if env else None
-    if fft_blk is None:
-        fblk = int(budget * _FFT_BUDGET_FRAC) // max(1, _FFT_BYTES_PER_POINT * ngrid)
-        fblk = max(_FFT_BLK_FLOOR, fblk)
-    else:
-        fblk = max(1, int(fft_blk))
-    fblk = max(1, min(fblk, cap, npair))
     if pair_blk is not None:
         raw = max(1, min(int(pair_blk), npair))
     else:
-        remaining = max(0, budget - _FFT_BYTES_PER_POINT * ngrid * fblk)
-        linear = max(_GEMM_BYTES_PER_POINT * ngrid, 1)
-        # Solve 8*b^2 + linear*b <= remaining (b x b tile plus the two operand strips).
-        raw = int((-linear + math.sqrt(linear * linear + 32 * remaining)) / 16)
+        if free is None:
+            free = _free_bytes()
+        reserve = max(_cushion_bytes(), int(0.06 * free))
+        budget = max(0, free - reserve)
+        # rho_p (8) + complex FFT copy (16) + vG (16) + vR (16) + rho_q (8) bytes
+        # per pair-gridpoint; 40 was optimistic (216-atom vvvv OOMed at 900 and
+        # fell back to 300 while 600 ran fine).
+        linear = max(ngrid * 64, 1)
+        # Solve 8*b^2 + linear*b <= budget (tile plus grid temporaries).
+        raw = int((-linear + math.sqrt(linear * linear + 32 * budget)) / 16)
         raw = max(1, min(raw, npair))
         env_cap = os.environ.get("GPU_AO2MO_MAX_PAIR_BLK")
         if env_cap:
             raw = min(raw, max(1, int(env_cap)))
+    # One strip is one batched cuFFT plan: keep it under the cuFFT element limit
+    # (strict 2^31 on Bluestein meshes, relaxed on direct-path meshes).
+    raw = min(raw, max_fft_batch(ngrid, mesh=mesh))
     raw = max(nB, raw)
     if not compact:
         raw = max(nB, (raw // nB) * nB)
-    blk = min(raw, npair)
-    return blk, min(fblk, blk)
-
-
-def _estimate_pair_blk(npair, ngrid, nB, pair_blk=None, free=None, mesh=None,
-                       compact=False):
-    """GEMM strip width alone (see ``_plan_strips``)."""
-    return _plan_strips(npair, ngrid, nB, pair_blk=pair_blk, free=free, mesh=mesh,
-                        compact=compact)[0]
+    return min(raw, npair)
 
 
 def _strip_task(ctx, task, keyA, keyB, mesh, out, on_gpu, layout):
@@ -374,30 +331,25 @@ def _strip_task(ctx, task, keyA, keyB, mesh, out, on_gpu, layout):
     ``sub_blk`` pairs.
 
     For each outer sub-strip the Coulomb potential of its codensities is
-    formed once -- in FFT sub-batches of the slot's ``fft_blk`` pairs into a
-    real (strip, ngrid) buffer -- and contracted against every inner strip of
-    rows below the sub-strip's end (the lower triangle of the symmetric Gram
-    matrix).  ``write_tile`` scatters each tile and its symmetry images into
-    disjoint elements of ``out``, so a retry is idempotent and slots never
-    write the same element.  Returns ``(gemm_flop, scatter_seconds)``.
+    formed once (FFT) and contracted against every inner strip of rows below
+    the sub-strip's end -- the lower triangle of the symmetric Gram matrix.
+    ``write_tile`` scatters each tile and its symmetry images into disjoint
+    elements of ``out``, so a retry is idempotent and slots never write the
+    same element.  Returns ``(gemm_flop, scatter_seconds)``.
     """
     st = ctx.state
     moA, moB, wcoulG = st[keyA], st[keyB], st["wcoulG"]
     pidx, qidx = st["pidx"], st["qidx"]
     ngrid = moA.shape[1]
     blk = int(st["sub_blk"])
-    fblk = max(1, min(int(st["fft_blk"]), blk))
     p0, p1 = task
     flop = 0.0
     t_scatter = 0.0
     for pa, pb in layout.split(p0, p1, blk):
         P0, P1 = layout.pairs(pa, pb)
-        vR = cp.empty((P1 - P0, ngrid), dtype=cp.float64)
-        for f0 in range(P0, P1, fblk):
-            f1 = min(P1, f0 + fblk)
-            rho_p = _codensity(moA, moB, pidx, qidx, f0, f1)
-            vR[f0 - P0:f1 - P0] = gtools.ifft(gtools.fft(rho_p, mesh) * wcoulG, mesh).real
-            rho_p = None
+        rho_p = _codensity(moA, moB, pidx, qidx, P0, P1)
+        vR = gtools.ifft(gtools.fft(rho_p, mesh) * wcoulG, mesh).real
+        rho_p = None
         for ra, rb in layout.split(0, pb, blk):
             Q0, Q1 = layout.pairs(ra, rb)
             rho_q = _codensity(moA, moB, pidx, qidx, Q0, Q1)
@@ -415,25 +367,16 @@ def _strip_task(ctx, task, keyA, keyB, mesh, out, on_gpu, layout):
 
 
 def _make_strip_shrink(min_blk):
-    """Halve the GEMM strip first (it holds most of the memory), then the FFT
-    sub-batch once the strip is already a single row."""
     def _shrink(ctx, task, exc):
         blk = int(ctx.state["sub_blk"])
-        fblk = int(ctx.state["fft_blk"])
-        if blk > min_blk:
-            blk = max(min_blk, ((blk // 2) // min_blk) * min_blk)
-            ctx.state["sub_blk"] = blk
-            ctx.state["fft_blk"] = min(fblk, blk)
-            return True
-        if fblk > 1:
-            ctx.state["fft_blk"] = max(1, fblk // 2)
-            return True
-        return False
+        if blk <= min_blk:
+            return False
+        ctx.state["sub_blk"] = max(min_blk, ((blk // 2) // min_blk) * min_blk)
+        return True
     return _shrink
 
 
-def _block_direct(name, keyA, keyB, mesh, group, pair_blk=None, force_host=False,
-                  fft_blk=None):
+def _block_direct(name, keyA, keyB, mesh, group, pair_blk=None, force_host=False):
     """Fill a final physicist ERI on GPU or directly on host when VRAM is tight.
 
     ``keyA``/``keyB`` name the MO grids in every slot's ``state`` (see
@@ -461,17 +404,17 @@ def _block_direct(name, keyA, keyB, mesh, group, pair_blk=None, force_host=False
                 f"gpu_ao2mo: final {name} tensor ({out_bytes/1e9:.2f} GB) "
                 f"does not fit (free≈{free_before/1e9:.2f} GB)") from exc
         _reclaim_gpu()
-        blk, fblk = _plan_strips(npair, ngrid, layout.min_blk, pair_blk=pair_blk,
-                                 fft_blk=fft_blk, mesh=mesh, compact=compact)
-        # A retained result must leave enough space for useful GEMM strips.
+        blk = _estimate_pair_blk(npair, ngrid, layout.min_blk, pair_blk=pair_blk,
+                                 mesh=mesh, compact=compact)
+        # A retained result must leave enough space for useful FFT strips.
         if pair_blk is None and blk <= min(npair, 4 * layout.min_blk):
             del out
             _reclaim_gpu()
             on_gpu = False
     if not on_gpu:
         out = np.empty((nA, nA, nB, nB), dtype=np.float64)
-        blk, fblk = _plan_strips(npair, ngrid, layout.min_blk, pair_blk=pair_blk,
-                                 fft_blk=fft_blk, free=group.min_free_bytes(), mesh=mesh,
+        blk = _estimate_pair_blk(npair, ngrid, layout.min_blk, pair_blk=pair_blk,
+                                 free=group.min_free_bytes(), mesh=mesh,
                                  compact=compact)
     stats = {
         "name": name,
@@ -480,7 +423,6 @@ def _block_direct(name, keyA, keyB, mesh, group, pair_blk=None, force_host=False
         "output_bytes": int(out_bytes),
         "requested_pair_blk": None if pair_blk is None else int(pair_blk),
         "pair_blk": int(blk),
-        "fft_blk": int(fblk),
         "retries": 0,
         "output_location": ("gpu" if on_gpu else
                             ("host_staged" if force_host else "host_direct")),
@@ -502,14 +444,13 @@ def _block_direct(name, keyA, keyB, mesh, group, pair_blk=None, force_host=False
     print(
         f"{_ts()} [gpu_ao2mo]   {'compact p>=q pairs, ' if compact else ''}lower-triangle "
         f"tiles: strips={nblk} tiles={ntiles} GEMM={planned_flop/1e15:.2f} PFLOP; "
-        f"pair_blk={blk} fft_blk={fblk} on {group.nslots} slot(s)", flush=True)
+        f"pair_blk={blk} on {group.nslots} slot(s)", flush=True)
     stats["nstrips"] = nblk
     stats["gemms"] = ntiles
     stats["gemm_flop_planned"] = float(planned_flop)
 
     def _init(ctx):
         ctx.state["sub_blk"] = blk
-        ctx.state["fft_blk"] = fblk
         pi, qi = layout.index_arrays()
         ctx.state["pidx"] = cp.asarray(pi)
         ctx.state["qidx"] = cp.asarray(qi)
@@ -544,7 +485,6 @@ def _block_direct(name, keyA, keyB, mesh, group, pair_blk=None, force_host=False
     stats["tflops"] = stats["gemm_flop"] / max(stats["seconds"], 1e-9) / 1e12
     stats["retries"] = int(sum(run_stats["retries_per_slot"]))
     stats["final_pair_blk_per_slot"] = [int(c.state["sub_blk"]) for c in group.ctxs]
-    stats["final_fft_blk_per_slot"] = [int(c.state["fft_blk"]) for c in group.ctxs]
     stats["min_free_bytes"] = int(min(
         [b for b in run_stats["min_free_bytes_per_slot"] if b is not None] + [stats["min_free_bytes"]]))
     stats["multi_gpu"] = run_stats
@@ -556,14 +496,12 @@ def _block_direct(name, keyA, keyB, mesh, group, pair_blk=None, force_host=False
     return out, stats
 
 
-def gpu_ao2mo_blocks(cell, cocc, cvir, mesh, pair_blk=None, return_gpu=False, group=None,
-                     fft_blk=None):
+def gpu_ao2mo_blocks(cell, cocc, cvir, mesh, pair_blk=None, return_gpu=False, group=None):
     """Return direct-assembled vvvv, oovv, oooo tensors in physicist layout.
 
     ``group`` (``lib_pprpa.gpu_multi.DeviceGroup``, default LIB_PPRPA_GPUS slots)
     dispatches both the MO-grid chunks and the pair strips over GPUs; the MO
-    grids are then replicated to every slot.  ``pair_blk`` / ``fft_blk`` force
-    the GEMM strip width and the FFT sub-batch (default: ``_plan_strips``).
+    grids are then replicated to every slot.
     """
     global LAST_TELEMETRY
     from lib_pprpa.gpu_multi import default_group
@@ -603,14 +541,11 @@ def gpu_ao2mo_blocks(cell, cocc, cvir, mesh, pair_blk=None, return_gpu=False, gr
         print(f"{_ts()} [gpu_ao2mo] staging all final ERIs on host until MO grids are released",
               flush=True)
     vvvv, stat_v = _block_direct(
-        "vvvv", "moV", "moV", mesh, group, pair_blk=pair_blk, force_host=stage_host,
-        fft_blk=fft_blk)
+        "vvvv", "moV", "moV", mesh, group, pair_blk=pair_blk, force_host=stage_host)
     oooo, stat_o = _block_direct(
-        "oooo", "moO", "moO", mesh, group, pair_blk=pair_blk, force_host=stage_host,
-        fft_blk=fft_blk)
+        "oooo", "moO", "moO", mesh, group, pair_blk=pair_blk, force_host=stage_host)
     oovv, stat_ov = _block_direct(
-        "oovv", "moO", "moV", mesh, group, pair_blk=pair_blk, force_host=stage_host,
-        fft_blk=fft_blk)
+        "oovv", "moO", "moV", mesh, group, pair_blk=pair_blk, force_host=stage_host)
 
     group.free(["moO", "moV", "wcoulG"])
     del coulG, wcoulG

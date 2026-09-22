@@ -58,19 +58,32 @@ def test_bluestein_detection_and_mesh_aware_cap():
     assert max_fft_batch(151 ** 3, mesh=[151, 151, 151]) == 623
 
 
-def test_estimate_pair_blk_respects_cap():
+def test_plan_strips_caps_the_fft_batch_not_the_gemm_strip():
     _need_gpu_modules()
-    from lib_pprpa.gpu_ao2mo import _estimate_pair_blk
+    from lib_pprpa.gpu_ao2mo import _plan_strips, _estimate_pair_blk
     ng = 151 ** 3
-    # explicit request above the cap is clamped and re-aligned to nB rows
-    blk = _estimate_pair_blk(npair=90000, ngrid=ng, nB=300, pair_blk=1200, mesh=[151] * 3)
-    assert blk == 600 and blk * ng <= CUFFT_MAX_PLAN_ELEMENTS
-    # direct-path mesh (216-atom cell): whole 600-pair strips are allowed again
-    blk = _estimate_pair_blk(npair=90000, ngrid=159 ** 3, nB=300, pair_blk=1200, mesh=[159] * 3)
-    assert blk == 600
-    # unknown mesh: conservative strict cap (534 -> 300 after row alignment)
-    blk = _estimate_pair_blk(npair=90000, ngrid=159 ** 3, nB=300, pair_blk=1200)
-    assert blk == 300
+    free = 150e9
+    # The GEMM strip is decoupled from the cuFFT plan: an explicit 1200-pair
+    # request stands, while the FFT sub-batch that fills its potential stays
+    # under the plan limit (Bluestein mesh: strict 2^31 -> 623 transforms).
+    blk, fblk = _plan_strips(npair=90000, ngrid=ng, nB=300, pair_blk=1200, mesh=[151] * 3,
+                             free=free)
+    assert blk == 1200 and fblk <= 623 and fblk * ng <= CUFFT_MAX_PLAN_ELEMENTS
+    assert _estimate_pair_blk(npair=90000, ngrid=ng, nB=300, pair_blk=1200, mesh=[151] * 3,
+                              free=free) == 1200
+    # a forced FFT batch above the cap is clamped, and never exceeds the strip
+    _blk, fblk = _plan_strips(npair=90000, ngrid=ng, nB=300, pair_blk=300, fft_blk=5000,
+                              mesh=[151] * 3, free=free)
+    assert fblk == 300
+    # planner: full-index strips are whole nB rows; compact strips need no alignment
+    blk, fblk = _plan_strips(npair=90000, ngrid=159 ** 3, nB=300, mesh=[159] * 3, free=free)
+    assert blk % 300 == 0 and blk >= 300 and fblk >= 1
+    blkc, _f = _plan_strips(npair=45150, ngrid=159 ** 3, nB=300, mesh=[159] * 3, free=free,
+                            compact=True)
+    assert blkc >= 300
+    # the FFT sub-batch is a minor share of the budget, so the GEMM strip is far
+    # wider than the old 64 B/pair-gridpoint plan allowed (600 at ~170 GB free)
+    assert blk >= 1200
 
 
 def test_is_oom_treats_cufft_size_errors_as_retryable():
@@ -88,6 +101,6 @@ if __name__ == "__main__":
     test_cap_mesh_159_and_small()
     test_bluestein_detection_and_mesh_aware_cap()
     print("OK  pure-python caps")
-    test_estimate_pair_blk_respects_cap()
+    test_plan_strips_caps_the_fft_batch_not_the_gemm_strip()
     test_is_oom_treats_cufft_size_errors_as_retryable()
     print("OK  planner + retry classification")
