@@ -45,6 +45,7 @@ Requirements / scope
   vs finite difference 2.9e-7 (C2, off-grid).  Runs on the 63-atom NV cell.
 """
 import os
+import threading
 import time
 import numpy as np
 import cupy as cp
@@ -116,8 +117,17 @@ def _hcore_force(gg, cell, kpts, mf, is_ks, T, group):
         ctx.state["T"] = cp.asarray(T)[None]
     group.each(_setup)
 
+    done = [0]
+    lock = threading.Lock()
+    every = max(1, natm // 8)
+
     def _work(ctx, ia):
         h = cp.einsum('kxij,kji->x', ctx.state["hcore_deriv"](ia), ctx.state["T"]).real
+        with lock:
+            done[0] += 1
+            k = done[0]
+        if natm > 16 and (k % every == 0 or k == natm):
+            _prog(f"hcore derivative: {k}/{natm} atoms")
         return cp.asnumpy(h)
 
     results, stats = group.run(range(natm), _work, label="hcore")
