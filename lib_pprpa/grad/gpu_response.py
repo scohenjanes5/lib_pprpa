@@ -67,7 +67,12 @@ def _grid_chunk(nao, ncomp, ngrid, frac=0.3, floor=4096):
 
 class GammaResponse:
     """Callable ``vresp(dm) -> numpy (nao, nao)`` for Gamma RKS with an LDA/GGA
-    functional; ``dm`` is a symmetric numpy/cupy density matrix (hermi=1)."""
+    functional; ``dm`` is a symmetric numpy/cupy density matrix (hermi=1).
+
+    Per-slot state lives under ``resp_*`` keys: the ``DeviceGroup`` state dict
+    is shared by every kernel using the group, and the exchange build that
+    runs between this object's construction and its first call frees generic
+    keys such as ``gchunk``."""
 
     def __init__(self, cell, mf, group=None, mesh=None, gchunk=None, verbose=True):
         from gpu4pyscf.pbc import dft as gdft
@@ -113,10 +118,10 @@ class GammaResponse:
         def _setup(ctx):
             st = ctx.state
             g0, g1 = self.ranges[ctx.rank]
-            st["rng"] = (g0, g1)
-            st["opt0"] = gnumint._GTOvalOpt(self.cell, _KPTS0, deriv=0)
-            st["opt1"] = gnumint._GTOvalOpt(self.cell, _KPTS0, deriv=1) if self.gga else st["opt0"]
-            st["gchunk"] = (int(self._gchunk) if self._gchunk
+            st["resp_rng"] = (g0, g1)
+            st["resp_opt0"] = gnumint._GTOvalOpt(self.cell, _KPTS0, deriv=0)
+            st["resp_opt1"] = gnumint._GTOvalOpt(self.cell, _KPTS0, deriv=1) if self.gga else st["resp_opt0"]
+            st["resp_gchunk"] = (int(self._gchunk) if self._gchunk
                             else _grid_chunk(self.nao, self.ncomp, g1 - g0))
             dmg = cp.asarray(dm0)
             nvar = 4 if self.gga else 1
@@ -127,17 +132,17 @@ class GammaResponse:
                 fxc[:, :, c0 - g0:c1 - g0] = self.ni.eval_xc_eff(
                     self.xc, rho0, deriv=2, xctype=self.xctype)[2]
                 ao = rho0 = None
-            st["fxc"] = fxc
+            st["resp_fxc"] = fxc
             _reclaim_gpu()
         self.group.each(_setup)
 
     def _chunks(self, ctx):
-        g0, g1 = ctx.state["rng"]
-        step = int(ctx.state["gchunk"])
+        g0, g1 = ctx.state["resp_rng"]
+        step = int(ctx.state["resp_gchunk"])
         return [(a, min(g1, a + step)) for a in range(g0, g1, step)]
 
     def _ao(self, ctx, c0, c1, deriv1):
-        opt = ctx.state["opt1"] if deriv1 else ctx.state["opt0"]
+        opt = ctx.state["resp_opt1"] if deriv1 else ctx.state["resp_opt0"]
         return gnumint.eval_ao_kpts(self.cell, self.coords[c0:c1], kpts=_KPTS0,
                                     deriv=1 if deriv1 else 0, opt=opt)[0]
 
@@ -165,7 +170,7 @@ class GammaResponse:
         # pass 1: density of dm on the grid (values only) for the Coulomb term
         def _pass1(ctx):
             st = ctx.state
-            g0, g1 = st["rng"]
+            g0, g1 = st["resp_rng"]
             dmg = cp.asarray(dm_h)
             out = cp.empty(g1 - g0, dtype=cp.float64)
             for c0, c1 in self._chunks(ctx):
@@ -188,10 +193,10 @@ class GammaResponse:
 
         def _pass2(ctx):
             st = ctx.state
-            g0, g1 = st["rng"]
+            g0, g1 = st["resp_rng"]
             dmg = cp.asarray(dm_h)
             vR = cp.asarray(vR_h[g0:g1])
-            fxc = st["fxc"]
+            fxc = st["resp_fxc"]
             vmat = cp.zeros((self.nao, self.nao), dtype=cp.float64)
             for c0, c1 in self._chunks(ctx):
                 ao = self._ao(ctx, c0, c1, gga)
@@ -234,12 +239,12 @@ class GammaResponse:
                 try:
                     return fn(ctx)
                 except Exception as exc:  # noqa: BLE001 - classified below
-                    if not _is_oom(exc) or int(ctx.state["gchunk"]) <= 1:
+                    if not _is_oom(exc) or int(ctx.state["resp_gchunk"]) <= 1:
                         raise
                     _reclaim_gpu()
-                    ctx.state["gchunk"] = max(1, int(ctx.state["gchunk"]) // 2)
+                    ctx.state["resp_gchunk"] = max(1, int(ctx.state["resp_gchunk"]) // 2)
                     ctx.log(f"gpu_response: {type(exc).__name__}; retrying with "
-                            f"gchunk={ctx.state['gchunk']}")
+                            f"gchunk={ctx.state['resp_gchunk']}")
         return self.group.each(_guarded)
 
     # -------------------------------------------------------------- telemetry
@@ -256,7 +261,7 @@ class GammaResponse:
                 f"fxc cache {st['init_seconds']:.1f} s; {self.group.nslots} slot(s)")
 
     def release(self):
-        self.group.free(["fxc", "opt0", "opt1", "rng", "gchunk"])
+        self.group.free(["resp_fxc", "resp_opt0", "resp_opt1", "resp_rng", "resp_gchunk"])
         self._w_half = None
 
 

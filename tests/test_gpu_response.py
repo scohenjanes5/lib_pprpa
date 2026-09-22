@@ -86,6 +86,27 @@ def test_lda_matches_dense():
     _check("lda,vwn", _two_slots())
 
 
+def test_survives_other_kernels_on_the_shared_group():
+    """The exchange build runs on the same DeviceGroup between construction and
+    the first call and frees its own state keys; ours must not be among them."""
+    _need_cupy()
+    from lib_pprpa.grad.pprpa_gamma_gpu import make_gpu_vresp
+    from lib_pprpa.grad.gpu_response import GammaResponse
+    from lib_pprpa.gpu_fft_k import get_k_lowrank
+    from lib_pprpa.gpu_multi import DeviceGroup
+    cell, mf = _cell_and_mf("pbe")
+    g = DeviceGroup(_two_slots())
+    resp = GammaResponse(cell, mf, group=g, verbose=False)
+    rng = np.random.default_rng(8)
+    L = rng.standard_normal((cell.nao, 3))
+    get_k_lowrank(cell, cell.mesh, (L, L), ket=L, group=g, verbose=False)   # frees "gchunk" etc.
+    dm = _random_sym_dm(cell.nao, rng)
+    v_ref = make_gpu_vresp(cell, mf)(dm)
+    v_new = resp(dm)
+    assert np.abs(v_new - v_ref).max() < 1e-10 * np.abs(v_ref).max()
+    resp.release()
+
+
 def test_factory_falls_back_for_unsupported_functional():
     _need_cupy()
     import os
@@ -107,5 +128,7 @@ if __name__ == "__main__":
     print("OK  test_gga_matches_dense_two_slots_small_chunks")
     test_lda_matches_dense()
     print("OK  test_lda_matches_dense")
+    test_survives_other_kernels_on_the_shared_group()
+    print("OK  test_survives_other_kernels_on_the_shared_group")
     test_factory_falls_back_for_unsupported_functional()
     print("OK  test_factory_falls_back_for_unsupported_functional")
