@@ -200,13 +200,20 @@ def grad_elec(pprpa_grad, xy, mult, atmlst=None):
           f" + CPHF solve; free≈{free_started/1e9:.2f} GB")
     kmf_cpu = _cpu.rhf_to_krhf(mf)
     kg_cpu = kmf_cpu.nuc_grad_method()
+    vresp = None
     if is_ks:
-        vresp = make_gpu_vresp(cell, mf)   # GPU grid response for the CPHF solve
-    else:
-        vresp = None
+        # grid response for the CPHF solve: cached fxc, J folded into the XC
+        # pass, grid split over the device group (PPRPA_RESPONSE=dense: old path)
+        from lib_pprpa.grad.gpu_response import make_gpu_vresp_grouped
+        vresp = make_gpu_vresp_grouped(cell, mf, group=default_group())
+        if vresp is None:
+            vresp = make_gpu_vresp(cell, mf)
     P_mo, W_mo = make_rdm1_relaxed_rhf_pprpa(
         pprpa, mf, xy=xy, mult=mult, cphf_max_cycle=pprpa_grad.cphf_max_cycle,
         cphf_conv_tol=pprpa_grad.cphf_conv_tol, vresp=vresp)
+    if hasattr(vresp, "summary"):
+        _prog(vresp.summary())
+        vresp.release()
     W = mo @ W_mo @ mo.T \
         - kg_cpu.make_rdm1e(kmf_cpu.mo_energy, kmf_cpu.mo_coeff, kmf_cpu.mo_occ)[0]
     P = mo @ P_mo @ mo.T

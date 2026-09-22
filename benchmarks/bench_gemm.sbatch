@@ -83,6 +83,12 @@ if [[ "$STAGE" == "2" ]]; then
   echo "=== AS=300, planner widths, host-staged finals: new (NV216 write path) ==="
   $B --as 300 --impl new --force-host --tag s2_as300_auto_host
 fi
+if [[ "$STAGE" == "12" ]]; then
+  # CPHF response: dense GPU implementation vs the grouped one (1 and 2 slots).
+  python "${CHECKOUT}/tests/test_gpu_response.py"
+  python "${CHECKOUT}/benchmarks/bench_gpu_response.py" --geom "${GEOM}" --ke 300 --ncalls 3 \
+      --tag s12_response
+fi
 if [[ "$STAGE" == "10" ]]; then
   # Davidson ERI stream: resident / split (2 GPUs or 2 virtual slots) / tiled with
   # pageable vs pinned host tensors, from the saved stage-2 reference.  Submit with

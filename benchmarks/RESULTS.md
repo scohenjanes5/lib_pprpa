@@ -376,3 +376,23 @@ block.  The 194 GB pinned host set uploaded to the two cards in 1.7 s.  The
 CPHF is now the largest phase: one GPU, and each of its ~25 iterations
 re-evaluates the GGA AOs on the full grid and rebuilds both densities densely
 (see the note at the end of stage 10's section for the fix).
+
+## Stage 12: the CPHF response -- job 27145780
+
+`lib_pprpa/grad/gpu_response.py`: the ground-state XC kernel is cached per
+slot, the Coulomb potential of the perturbing density is folded into the XC
+weights (one GEMM for J + fxc instead of three dense contractions and a second
+90 GB AO grid), and the grid is split over the device group.  NV63, PBE,
+CPHF-shaped perturbing density, best of 3 calls, two B200s:
+
+| response | per call | breakdown | rel. diff vs dense |
+|---|---|---|---|
+| dense (`make_gpu_vresp`, 1 GPU) | 0.93 s | | -- |
+| grouped, 1 slot | 0.52 s | pass1 0.14 / Coulomb 0.04 / pass2 0.38 | 1.2e-12 |
+| grouped, 2 slots | 0.27 s | pass1 0.07 / Coulomb 0.03 / pass2 0.20 | 1.2e-12 |
+
+The dense call scales as nao^2 x ngrid, which puts NV216 at 39x NV63 -- the
+36 s per CPHF iteration measured in stage 11 is exactly that -- so the
+grouped response on two cards should make the 15 min CPHF about 4.5 min.
+Tests: LDA and GGA against the dense response, one and two virtual slots,
+small forced chunks, and the `PPRPA_RESPONSE=dense` fallback.
