@@ -109,3 +109,21 @@ in.  The `performant` heuristic declines the b <= 1200 calls.  Nothing in
 lib_pprpa has to change: the switch is the environment variable, read when
 the cuBLAS handle is created.  What does have to change is the environment:
 CUDA 13 runtime, cupy-cuda13x and a gpu4pyscf built for CUDA 13.
+
+## Stage 4: full ao2mo with fp64 emulation -- job 27091748
+
+Same NV63 / AS = 300 run from the CUDA 13 scratch venv (pip gpu4pyscf-cuda13x
+1.8.1, cupy 14.2.0, cuBLAS 13.8), same cached SCF orbitals; the native run
+writes its tensors to disk and the emulated runs compare element-wise.
+
+| mode | vvvv | oovv | oooo | total | rel. diff vs native |
+|---|---|---|---|---|---|
+| native fp64 | 130.3 s (20.5 TFLOP/s) | 83.1 s (23.3) | 9.5 s | 238.6 s | -- |
+| emulation, eager | 64.2 s (41.3) | 50.3 s (38.1) | 5.5 s | 127.0 s | 2.6e-14 / 3.0e-14 / 4.0e-14 |
+| emulation, performant | 60.4 s (44.3) | 50.7 s (38.1) | 5.2 s | 123.1 s | 2.5e-14 / 2.4e-14 / 4.0e-14 |
+
+The emulated tensors differ from native fp64 by the same 1e-14 that separates
+any two summation orders; the isolated GEMM test shows the emulated result is
+the one closer to the exact sum.  End to end on this cell: 2280.6 s (base)
+-> 123.1 s, **18.5x**, all three steps exact.  In the CUDA 12.8 production
+environment the first two steps give 2280.6 -> 231.1 s, **9.9x**.
