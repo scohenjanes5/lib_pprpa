@@ -84,6 +84,14 @@ def test_plan_strips_caps_the_fft_batch_not_the_gemm_strip():
     # the FFT sub-batch is a minor share of the budget, so the GEMM strip is far
     # wider than the old 64 B/pair-gridpoint plan allowed (600 at ~170 GB free)
     assert blk >= 1200
+    # ... but never past the measured cuBLAS sweet spot (explicit requests may)
+    from lib_pprpa.gpu_ao2mo import _PAIR_BLK_CAP
+    blk_big, _f = _plan_strips(npair=45150, ngrid=107 ** 3, nB=300, mesh=[107] * 3, free=180e9,
+                               compact=True)
+    assert blk_big <= _PAIR_BLK_CAP
+    blk_forced, _f = _plan_strips(npair=45150, ngrid=107 ** 3, nB=300, pair_blk=7000,
+                                  mesh=[107] * 3, free=180e9, compact=True)
+    assert blk_forced == 7000
 
 
 def test_is_oom_treats_cufft_size_errors_as_retryable():

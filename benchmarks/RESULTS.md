@@ -196,3 +196,72 @@ finals on the GPU; the block sums above are the kernel cost.  The bench now
 reports block totals and uses them for the speedup.
 
 Cumulative on this cell: 2280.6 s (7475b2f) -> 164.6 s, **13.9x**, exact.
+
+## Stage 7: compare-only flow against a saved reference -- job 27106768
+
+The stage-2 tensors are now stored once on scratch
+(`/nfs/roberts/scratch/pi_tz324/sc3352/ao2mo_refs/nv63_ke300_as300_stage2`,
+80 GB, with PROVENANCE.txt) and every later run compares against them with
+`--compare`; no earlier kernel is recomputed.
+
+Current kernel (R2C default, fused codensity, diagonal split), AS = 300:
+
+| run | vvvv | oovv | oooo | blocks total | rel. diff vs stage2 ref |
+|---|---|---|---|---|---|
+| planner (4952 / 4200 / 4864) | 91.0 s | 66.6 s | 5.6 s | **163.3 s** | 2.7e-14 / 4.6e-14 / 4.0e-14 |
+| forced 1500 (NV216-like) | 109.3 s | 77.7 s | 6.3 s | 193.2 s | 2.6e-14 / 3.0e-14 / 3.8e-14 |
+| planner, host-staged (7581 / 7500) | 159.7 s | 79.7 s | 7.1 s | 246.5 s | 2.8e-14 / 3.0e-14 / 2.9e-14 |
+
+Two problems in the host-staged run, both from the very wide strips the
+unconstrained planner picked when nothing else was on the card:
+
+* the bare tile GEMM is not monotonic in the strip width (K = 1.2e6):
+  3300 -> 26.7, 4950 -> 34.1, 6000 -> 26.8, 7600 -> 27.5 TFLOP/s; the vvvv
+  gemm phase went from 77.6 s at 4952 to 94.6 s at 7581;
+* 41 s of the 159.7 s vvvv block were outside every timed phase: the two
+  73 GB operand buffers were allocated per task, and near the card's
+  capacity the pool had to free and re-map them every time.
+
+Stage 8 caps the planner at 5000 pairs (`_PAIR_BLK_CAP`; explicit
+`pair_blk` and `GPU_AO2MO_MAX_PAIR_BLK` still override) and allocates the
+three strip buffers once per block per slot.
+
+## Stage 8: strip cap and per-block buffers (commit below) -- job 27115393
+
+`_PAIR_BLK_CAP = 5000` and the three strip buffers allocated once per block
+per slot.  Compared against the saved stage-2 reference only.
+
+| run | vvvv (phases: fft / gemm / rho_in / rho_out / scatter) | oovv | oooo | blocks total | rel. diff |
+|---|---|---|---|---|---|
+| planner, resident (4952 / 4200 / 4864) | 90.7 s (9.0 / 77.6 / 1.8 / 0.3 / 2.1) | 66.7 s | 5.6 s | **163.1 s** | 2.7e-14 / 4.6e-14 / 4.0e-14 |
+| forced 1500 (NV216-like) | 110.0 s (11.0 / 92.3 / 4.5 / 0.3 / 1.8) | 77.4 s | 5.6 s | 193.0 s | 2.6e-14 / 3.0e-14 / 3.8e-14 |
+| planner, host-staged (5000 / 4800) | 102.9 s (9.5 / 78.0 / 1.8 / 0.3 / 13.3) | 66.8 s | 7.8 s | **177.5 s** | 2.7e-14 / 6.4e-14 / 4.0e-14 |
+
+The host-staged run is back at the resident GEMM rate (78.0 s vs 94.6 s at
+7581-wide strips) and has no untimed time left (102.9 s vs 104.9 s of
+phases); the 13 s host scatter of the 65 GB vvvv tensor is the only cost of
+staging, and it does not grow with the cell (the tensor size is set by the
+active space, so at NV216 it is the same 13 s against hours of GEMM).
+
+## Where this leaves the kernel
+
+NV63, AS = 300, one B200, block totals:
+
+| kernel | resident | host-staged |
+|---|---|---|
+| 7475b2f (all tiles, full pair index, strip 600) | 2280.6 s | -- |
+| stage 1 symmetric tiles, strip 600 | 874.5 s | 436.3 s (planner) |
+| stage 2 strip decoupled from FFT | 231.1 s | 226.7 s |
+| stage 6 fused codensity, R2C, diagonal split | 164.6 s | 246.5 s (7581 strips) |
+| stage 8 strip cap, per-block buffers | **163.1 s** | **177.5 s** |
+
+Every step is exact (<= 6.4e-14 relative against the previous kernel, and
+the module's own check against pyscf stays at 1.5e-13).  The vvvv block is
+now 86% tile GEMM at the B200's fp64 rate (77.6 s of 90.7); the FFT chain is
+9 s, the codensity rebuild 2 s, the scatter 2 s.  The next factor of two is
+the cuBLAS fp64 emulation (stage 4: 239 -> 123 s on the same cell), which
+needs the CUDA 13 environment.  Overlapping the FFT of the next strip with
+the running GEMMs on a second stream would hide most of the 9 s, but it
+needs a second potential buffer (24 instead of 16 B per pair-gridpoint) and
+at NV216 memory that narrows the strips from ~2200 to ~1500 pairs, where the
+GEMM loses more than the FFT would gain; it was not pursued.

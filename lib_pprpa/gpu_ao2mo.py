@@ -366,6 +366,12 @@ _FFT_BLK_FLOOR = 16
 # Bytes per pair-gridpoint of the GEMM operands: the real potential strip vR
 # (8) and the inner codensity strip (8; the fused kernel has no temporaries).
 _GEMM_BYTES_PER_POINT = 16
+# Widest strip the planner will choose.  The bare fp64 tile GEMM on a B200
+# (cuBLAS 12.8, K ~ 1e6) peaks at ~34 TFLOP/s around b = 4800-4950 and falls
+# back to ~27 at 6000-7600, and the two operand buffers pass 70 GB each there,
+# so wider strips are both slower and harder on the pool.  GPU_AO2MO_MAX_PAIR_BLK
+# still overrides.
+_PAIR_BLK_CAP = 5000
 
 
 def _plan_strips(npair, ngrid, nB, pair_blk=None, fft_blk=None, free=None, mesh=None,
@@ -409,7 +415,7 @@ def _plan_strips(npair, ngrid, nB, pair_blk=None, fft_blk=None, free=None, mesh=
         linear = max(_GEMM_BYTES_PER_POINT * ngrid, 1)
         # Solve 8*b^2 + linear*b <= remaining (b x b tile plus the two operand strips).
         raw = int((-linear + math.sqrt(linear * linear + 32 * remaining)) / 16)
-        raw = max(1, min(raw, npair))
+        raw = max(1, min(raw, npair, _PAIR_BLK_CAP))
         env_cap = os.environ.get("GPU_AO2MO_MAX_PAIR_BLK")
         if env_cap:
             raw = min(raw, max(1, int(env_cap)))
@@ -469,9 +475,7 @@ def _strip_task(ctx, task, keyA, keyB, mesh, out, on_gpu, layout):
         return t1
 
     p0, p1 = task
-    vR_buf = cp.empty((blk, ngrid), dtype=cp.float64)
-    rho_buf = cp.empty((blk, ngrid), dtype=cp.float64)
-    rho_f = cp.empty((fblk, ngrid), dtype=cp.float64)
+    vR_buf, rho_buf, rho_f = _work_buffers(st, blk, fblk, ngrid)
     flop = 0.0
     t_scatter = 0.0
     t = time.perf_counter()
@@ -505,6 +509,23 @@ def _strip_task(ctx, task, keyA, keyB, mesh, out, on_gpu, layout):
                 t = lap("scatter", t)
     vR = vR_buf = rho_buf = rho_f = None
     return flop, t_scatter
+
+
+def _work_buffers(st, blk, fblk, ngrid):
+    """The slot's three strip buffers, allocated once per block and reused by
+    every task (a fresh 70 GB pair per task made the pool free and re-map
+    them each time -- 41 s of a 160 s block).  Re-allocated smaller only
+    after a shrink."""
+    bufs = st.get("bufs")
+    if bufs is None or bufs[0].shape[0] != blk or bufs[2].shape[0] != fblk:
+        st["bufs"] = None
+        bufs = None
+        _reclaim_gpu()
+        bufs = (cp.empty((blk, ngrid), dtype=cp.float64),
+                cp.empty((blk, ngrid), dtype=cp.float64),
+                cp.empty((fblk, ngrid), dtype=cp.float64))
+        st["bufs"] = bufs
+    return bufs
 
 
 def _make_strip_shrink(min_blk):
@@ -637,7 +658,7 @@ def _block_direct(name, keyA, keyB, mesh, group, pair_blk=None, force_host=False
             stats["profile"] = prof
             print(f"{_ts()} [gpu_ao2mo]   {name} phases (s): "
                   + "  ".join(f"{k}={v:.1f}" for k, v in sorted(prof.items())), flush=True)
-        group.free(["pidx", "qidx", "prof"])
+        group.free(["pidx", "qidx", "prof", "bufs"])
     if not on_gpu and not force_host:
         uploaded = cp.asarray(out)
         del out
