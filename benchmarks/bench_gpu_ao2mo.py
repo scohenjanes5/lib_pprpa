@@ -42,6 +42,10 @@ def parse(argv=None):
     p.add_argument("--cache", default="bench_mo_cache.npz")
     p.add_argument("--results", default="bench_results.jsonl")
     p.add_argument("--tag", default="")
+    p.add_argument("--save", default=None, metavar="DIR",
+                   help="write the (single) impl's tensors as .npy into DIR")
+    p.add_argument("--compare", default=None, metavar="DIR",
+                   help="compare the (single) impl's tensors with the .npy files in DIR")
     return p.parse_args(argv)
 
 
@@ -184,6 +188,23 @@ def main(argv=None):
         results[name] = (rec, {"vvvv": vvvv, "oovv": oovv, "oooo": oooo})
         with open(args.results, "a") as fh:
             fh.write(json.dumps(rec) + "\n")
+        if args.save:
+            os.makedirs(args.save, exist_ok=True)
+            for bn, arr in results[name][1].items():
+                np.save(os.path.join(args.save, f"{bn}.npy"), np.asarray(arr))
+            print(f"[bench] saved {name} tensors to {args.save}", flush=True)
+        if args.compare:
+            print(f"\n[bench] ===== consistency {name} vs {args.compare} =====", flush=True)
+            cmp = {}
+            for bn, arr in results[name][1].items():
+                ref = np.load(os.path.join(args.compare, f"{bn}.npy"), mmap_mode="r")
+                worst, scale = max_abs_diff(ref, np.asarray(arr))
+                cmp[bn] = {"max_abs_diff": worst, "max_abs": scale, "rel": worst / max(scale, 1e-300)}
+                print(f"[bench] {bn}: max|ref-{name}| = {worst:.3e}   max|ref| = {scale:.3e}   "
+                      f"rel = {worst / max(scale, 1e-300):.3e}", flush=True)
+            with open(args.results, "a") as fh:
+                fh.write(json.dumps({"tag": args.tag, "compare_dir": args.compare, "impl": name,
+                                     "as": args.as_size, "blocks": cmp}) + "\n")
         del vvvv, oovv, oooo
         cp.get_default_memory_pool().free_all_blocks()
 

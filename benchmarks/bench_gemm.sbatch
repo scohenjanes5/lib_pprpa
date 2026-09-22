@@ -81,4 +81,23 @@ if [[ "$STAGE" == "3" ]]; then
     done
   done
 fi
+if [[ "$STAGE" == "4" ]]; then
+  # Full ao2mo in the CUDA 13 venv (pip gpu4pyscf-cuda13x): native fp64 vs cuBLAS
+  # fp64 emulation, same SCF orbitals (cached), element-wise comparison via .npy.
+  CU13_VENV="${CU13_VENV:-/nfs/roberts/project/pi_tz324/sc3352/venv_cu13}"
+  P13="${CU13_VENV}/bin/python"
+  export CUPY_ACCELERATORS=cub
+  B13="$P13 ${CHECKOUT}/benchmarks/bench_gpu_ao2mo.py --geom ${GEOM} --ke 300"
+  REF="$(pwd)/s4_native_ref"
+  "$P13" -c "import gpu4pyscf, cupy; print('[s4] gpu4pyscf', gpu4pyscf.__version__, 'cupy', cupy.__version__, 'cuBLAS', cupy.cuda.cublas.getVersion(cupy.cuda.device.get_cublas_handle()))"
+  echo "=== AS=300, CUDA 13 venv, native fp64: new (saves reference) ==="
+  CUBLAS_EMULATE_DOUBLE_PRECISION=0 $B13 --as 300 --impl new --tag s4_cu13_native --save "$REF"
+  echo "=== AS=300, CUDA 13 venv, fp64 emulation (eager): new vs native ==="
+  CUBLAS_EMULATE_DOUBLE_PRECISION=1 CUBLAS_EMULATION_STRATEGY=eager \
+    $B13 --as 300 --impl new --tag s4_cu13_emul_eager --compare "$REF"
+  echo "=== AS=300, CUDA 13 venv, fp64 emulation (performant): new vs native ==="
+  CUBLAS_EMULATE_DOUBLE_PRECISION=1 CUBLAS_EMULATION_STRATEGY=performant \
+    $B13 --as 300 --impl new --tag s4_cu13_emul_perf --compare "$REF"
+  rm -rf "$REF"
+fi
 echo "[job] done"
