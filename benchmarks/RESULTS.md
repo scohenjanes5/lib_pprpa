@@ -396,3 +396,25 @@ The dense call scales as nao^2 x ngrid, which puts NV216 at 39x NV63 -- the
 grouped response on two cards should make the 15 min CPHF about 4.5 min.
 Tests: LDA and GGA against the dense response, one and two virtual slots,
 small forced chunks, and the `PPRPA_RESPONSE=dense` fallback.
+
+## Stage 13: NV216 force on two B200s with the grouped response -- job 27147836
+
+Same setup as stage 11 (`bench/gemm_opt_2gpu/`).  E_state -1226.51751887 Ha,
+|F| 3.08748e-02, max|F| 1.02903e-02 a.u., max|dF| vs reference 5.1e-09 eV/A
+(2.6e-08 relative).  The old-tree regression job 27006823 finished the same
+day and also reproduced the reference on 1 and 2 GPUs (max|dF| 5.5e-9 /
+2.1e-8 eV/A), so the Sep 18 failure was transient.
+
+| phase | stage 11 | stage 13 |
+|---|---|---|
+| relaxed density | 17.4 min | 7.2 min (K 1.9, CPHF 5.1) |
+| CPHF response | 36 s/call, 1 GPU | 4.49 s/call, 68 calls, 2 GPUs (pass1 1.33 / Coulomb 0.01 / pass2 3.15) |
+| total force wall | 49.6 min | **39.4 min** |
+
+Note the solver made 68 response calls, not the ~25 assumed from the phase
+time -- the old response was ~13 s per call, not 36; the per-call speedup is
+2.9x on two cards (3.5x on NV63) and the CPHF phase went 15.0 -> 5.1 min.
+Against the reference 2-GPU force of the old tree (4 h 09 min) the full
+force is now 6.3x faster; against the 1-GPU old tree (8 h 08 min), 12.4x.
+The hcore derivative (11.5 min, 215 `hcore_generator` calls over two cards)
+is now the largest phase.
