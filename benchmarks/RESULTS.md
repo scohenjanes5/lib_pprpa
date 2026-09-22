@@ -341,3 +341,38 @@ remaining memo items (sub-tile double buffering, deterministic tile size)
 are moot for the split mode and worth little for the pinned tiled one: the
 GEMM is a few percent of the transfer, and the tile only shrinks below a
 whole block on a contended card.
+
+## Stage 11: the full NV216 force on two B200s -- job 27138544
+
+`work/pprpa/NV216/gpu_ke300/bench/gemm_opt_2gpu/`, the exactly-C3v
+`opt/input.vasp`, ke = 300 Ha, gth-dzvp, hh / triplet / AS = 300, driver =
+the pair_blk A/B `calc_forces_gpu.py`, `LIB_PPRPA_GPUS=2`, gpu_devel
+(256 GB host cap held).  Reference: the 1-GPU Sep 9 / 11 force.
+
+| | this run | reference |
+|---|---|---|
+| E_state | -1226.51751887 Ha | -1226.51751887 Ha |
+| \|F\| | 3.08748e-02 a.u. | 3.08750e-02 a.u. |
+| max\|F\| | 1.02903e-02 a.u. | 1.02900e-02 a.u. |
+| max\|dF\| vs reference | 2.08e-08 eV/A (8.4e-08 relative) | |
+
+(The Sep 18 regression run at the same geometry gave |F| = 5.06e-02.)
+
+Phases, against the previous 2-GPU run of the old tree (job 25938090):
+
+| phase | old tree, 2 GPUs | gemm-opt, 2 GPUs |
+|---|---|---|
+| SCF | 4 min | 4.0 min |
+| ao2mo (3 blocks) | 3 h 16 min | 14.6 min |
+| Davidson (17 iterations) | 4 min | 2.75 s (split-resident) |
+| relaxed density (K build + CPHF) | 30 min | 17.4 min (K 1.9 min, CPHF 15.0 min) |
+| hcore derivative | 11 min | 11.5 min |
+| J, pairing K, Vxc/fxc, overlap | ~3 min | 1.6 min |
+| **total** | **4 h 09 min** | **49.6 min** |
+
+ao2mo blocks: vvvv 154.6 s at 53.6 TFLOP/s over both cards (2118-pair
+strips, 8.29 PFLOP), oooo and oovv likewise; host scatter 18.7 s per staged
+block.  The 194 GB pinned host set uploaded to the two cards in 1.7 s.  The
+CPHF is now the largest phase: one GPU, and each of its ~25 iterations
+re-evaluates the GGA AOs on the full grid and rebuilds both densities densely
+(see the note at the end of stage 10's section for the fix).
