@@ -265,3 +265,35 @@ the running GEMMs on a second stream would hide most of the 9 s, but it
 needs a second potential buffer (24 instead of 16 B per pair-gridpoint) and
 at NV216 memory that narrows the strips from ~2200 to ~1500 pairs, where the
 GEMM loses more than the FFT would gain; it was not pursued.
+
+## Stage 9: the other two FFT kernels -- job 27132757
+
+The shared FFT chain moved to `lib_pprpa/gpu_coulomb.py` (fused codensity
+kernel, R2C potential with the symmetrised half kernel, per-point costs,
+`plan_fft_batch`); each kernel keeps its own planner for what it contracts
+with the potentials.  NV63, AS = 300, one B200, element-wise against the
+frozen kernels (commit 3f56e5f copies in benchmarks/).
+
+**Low-rank exchange** (`gpu_fft_k`), the two production sets X (rank 300) and
+Y (rank 128), quantity compared = `mo_coeff.T @ K @ orbp`:
+
+| variant | transforms | blocks | time | rel. diff vs base |
+|---|---|---|---|---|
+| base (full K, AO grid resident, 64 B/pt plan) | nao x r | row_blk 6 / 15, one rank chunk | 123.0 s | -- |
+| new, full K (`ket=None`) | nao x r | row_blk 103, fft_blk 1500 (5 rows) | 81.6 s | 4.2e-11 / 6.0e-11 |
+| new, `ket=orbp` (K @ orbp) | nact x r | row_blk 54, fft_blk 1500 | **42.6 s** | 7.5e-12 / 2.0e-11 |
+
+The 1e-11 (not 1e-14) agreement is the expected rounding of moving the
+Coulomb operator from the bra to the ket codensity: W is symmetric on an odd
+mesh, so the two orders are equal in exact arithmetic, but the sums over
+3.7e8 terms per element cancel heavily; both agree with dense
+`fft_jk.get_k` inside the tests' 1e-9.  The ket path is what the gradient
+uses (`grad/pprpa.py` now asks for `K @ orbp`); it needs r x nact instead of
+r x nao transforms (1.9x fewer here, 4.7x at NV216) and never holds the AO
+grid (90 GB at NV216).  Expected at NV216: the 29 min exchange build becomes
+a few minutes.
+
+**Pairing force** (`gpu_pairing_force`), rank 428 (= nocc + nvir), 91,806
+pairs: 32.4 s -> 23.0 s (1.41x), rel. diff 1.0e-15.  Fused codensity + R2C
+chain; the strip planner now takes the chain's cost from `gpu_coulomb`
+(one OOM retry on the first strip in this run -> 20% slack added).

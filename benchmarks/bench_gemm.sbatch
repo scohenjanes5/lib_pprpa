@@ -37,6 +37,11 @@ python "${CHECKOUT}/tests/test_pair_layout.py"
 python "${CHECKOUT}/tests/test_gpu_ao2mo_multi.py"
 python "${CHECKOUT}/tests/test_fft_batch_cap.py"
 python "${CHECKOUT}/lib_pprpa/gpu_ao2mo.py"      # __main__: element-wise vs pyscf, two strip sizes
+if [[ "${STAGE}" == "9" ]]; then
+  python "${CHECKOUT}/tests/test_gpu_fft_k_plan_blocks.py"
+  python "${CHECKOUT}/tests/test_gpu_fft_k_lowrank.py"
+  python "${CHECKOUT}/tests/test_gpu_pairing_force.py"
+fi
 
 B="python ${CHECKOUT}/benchmarks/bench_gpu_ao2mo.py --geom ${GEOM} --ke 300"
 # Reference tensors (vvvv/oovv/oooo .npy, ~80 GB at AS=300) live on scratch and are
@@ -77,6 +82,12 @@ if [[ "$STAGE" == "2" ]]; then
   $B --as 300 --pair-blk 2400 --impl new --tag s2_as300_pb2400
   echo "=== AS=300, planner widths, host-staged finals: new (NV216 write path) ==="
   $B --as 300 --impl new --force-host --tag s2_as300_auto_host
+fi
+if [[ "$STAGE" == "9" ]]; then
+  # Low-rank exchange (full K: frozen base vs new; K @ orbp: new ket path) and the
+  # pairing force (frozen base vs new), NV63 AS=300, element-wise vs the frozen kernels.
+  python "${CHECKOUT}/benchmarks/bench_gpu_fft_kernels.py" --geom "${GEOM}" --ke 300 --as 300 \
+      --what k,pairing --tag s9_as300
 fi
 if [[ "$STAGE" == "7" ]]; then
   # Compare-only flow: the current kernel (R2C default) against the saved stage-2

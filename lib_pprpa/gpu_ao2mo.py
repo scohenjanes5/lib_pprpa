@@ -37,7 +37,7 @@ Memory strategy
   cuFFT keeps a single cached plan, and the strip buffers are allocated once
   per task so the pool never fragments.
 * The codensity strips come from one fused gather-multiply kernel
-  (``_CODENSITY_KERNEL``), and strip pairs that straddle the diagonal are cut
+  (``gpu_coulomb.codensity``), and strip pairs that straddle the diagonal are cut
   into sub-tiles (``pair_layout.split_diagonal``) so most of the unused upper
   triangle of the Gram matrix is never computed.
 * The Gram matrix is symmetric, so only its lower-triangle tiles are formed
@@ -70,12 +70,14 @@ import time
 
 import numpy as np
 import cupy as cp
-import cupyx.scipy.fft as cufft
 from gpu4pyscf.pbc import tools as gtools
 from gpu4pyscf.pbc.dft import numint as gnumint
 
+from lib_pprpa.gpu_coulomb import (FFT_BYTES_C2C, FFT_BYTES_R2C, codensity as _codensity,
+                                   coulomb_potential as _coulomb_potential, env_flag as _env_flag,
+                                   half_kernel as _half_kernel, use_rfft)
 from lib_pprpa.gpu_mem import eri_bytes, fits_resident, max_fft_batch
-from lib_pprpa.pair_layout import PairLayout, split_diagonal, symmetric_half_kernel, write_tile
+from lib_pprpa.pair_layout import PairLayout, split_diagonal, write_tile
 from lib_pprpa.pprpa_util import tstamp as _ts
 
 
@@ -291,58 +293,6 @@ def _codensity_pairs(moA, moB, p0, p1):
     return moA[idx // nB] * moB[idx % nB]
 
 
-# rho[P, g] = moA[pidx[P], g] * moB[qidx[P], g] in one pass: two reads and one
-# write per element (24 B) and no gathered temporaries, against 48 B and a
-# second (blk, ngrid) array for take + in-place multiply.
-_CODENSITY_KERNEL = cp.ElementwiseKernel(
-    "raw float64 moA, raw float64 moB, raw int32 pidx, raw int32 qidx, int64 ngrid, int64 P0",
-    "float64 rho",
-    """
-    const long long row = i / ngrid;
-    const long long g = i - row * ngrid;
-    const long long P = P0 + row;
-    rho = moA[(long long)pidx[P] * ngrid + g] * moB[(long long)qidx[P] * ngrid + g];
-    """,
-    "pprpa_codensity")
-
-
-def _codensity(moA, moB, pidx, qidx, P0, P1, out=None):
-    """Codensity strip for ``PairLayout`` pairs [P0:P1] -> (P1-P0, ngrid),
-    written into ``out`` when given (a contiguous (P1-P0, ngrid) view)."""
-    ngrid = moA.shape[1]
-    if out is None:
-        out = cp.empty((P1 - P0, ngrid), dtype=cp.float64)
-    _CODENSITY_KERNEL(moA, moB, pidx, qidx, ngrid, P0, out)
-    return out
-
-
-def _coulomb_potential(rho, mesh, w, rfft):
-    """``vR = ifft(fft(rho) * w)`` for a batch of real codensities, (f, ngrid) -> (f, ngrid).
-
-    C2C (``rfft=False``): gpu4pyscf's fft / ifft chain -- real -> complex cast,
-    two complex transforms, a complex product and a ``.real`` copy, ~56 B per
-    pair-gridpoint at its peak.  R2C (``rfft=True``): real input to the half
-    spectrum, in-place multiply by the half-mesh kernel, C2R straight back to
-    real: no cast, no ``.real`` copy, half the spectral traffic, ~24 B per
-    pair-gridpoint.  ``w`` must be the *symmetrised* half kernel
-    (``pair_layout.symmetric_half_kernel``): C2R assumes a Hermitian spectrum,
-    and the C2C path's ``.real`` only ever sees the even part of the kernel,
-    so with that kernel the two paths agree to rounding on every mesh.
-    """
-    if not rfft:
-        return gtools.ifft(gtools.fft(rho, mesh) * w, mesh).real
-    f = rho.shape[0]
-    vG = cufft.rfftn(rho.reshape(f, *mesh), axes=(1, 2, 3))
-    vG *= w                                   # w: (nx, ny, nz//2 + 1), real
-    vR = cufft.irfftn(vG, s=tuple(int(m) for m in mesh), axes=(1, 2, 3), overwrite_x=True)
-    return vR.reshape(f, -1)
-
-
-def _half_kernel(wcoulG, mesh):
-    """The symmetrised Coulomb kernel on the R2C half mesh, (nx, ny, nz//2 + 1)."""
-    return cp.ascontiguousarray(symmetric_half_kernel(wcoulG, mesh))
-
-
 def _cushion_bytes():
     """VRAM to hold back from the strip estimate so assembly is not razor-tight.
 
@@ -351,14 +301,10 @@ def _cushion_bytes():
     return max(512 * 1024 ** 2, int(0.02 * _free_bytes()))
 
 
-
-# Bytes per pair-gridpoint alive while one FFT sub-batch is transformed.
-# C2C: real rho (8) + complex FFT (16) + vG (16) + complex vR (16); its .real
-# lands in the strip's potential buffer.  R2C: rho (8) + half spectrum (8,
-# multiplied in place) + real vR (8) + cuFFT work area for the batched R2C and
-# C2R plans (~16); 24 was measured too tight (OOM + retry on the B200).
-_FFT_BYTES_PER_POINT = 56
-_RFFT_BYTES_PER_POINT = 40
+# Bytes per pair-gridpoint alive while one FFT sub-batch is transformed
+# (gpu_coulomb: C2C 56, R2C 40 including the cuFFT work area).
+_FFT_BYTES_PER_POINT = FFT_BYTES_C2C
+_RFFT_BYTES_PER_POINT = FFT_BYTES_R2C
 # Share of the strip budget handed to the FFT sub-batch; the transform is
 # ~0.1% of the flops, so it only needs to be big enough to keep cuFFT busy.
 _FFT_BUDGET_FRAC = 0.15
@@ -682,13 +628,6 @@ def _block_direct(name, keyA, keyB, mesh, group, pair_blk=None, force_host=False
     return out, stats
 
 
-def _env_flag(name, default=False):
-    v = os.environ.get(name)
-    if v is None or not v.strip():
-        return default
-    return v.strip().lower() in ("1", "true", "yes")
-
-
 def gpu_ao2mo_blocks(cell, cocc, cvir, mesh, pair_blk=None, return_gpu=False, group=None,
                      fft_blk=None, rfft=None, profile=None):
     """Return direct-assembled vvvv, oovv, oooo tensors in physicist layout.
@@ -705,7 +644,7 @@ def gpu_ao2mo_blocks(cell, cocc, cvir, mesh, pair_blk=None, return_gpu=False, gr
     from lib_pprpa.gpu_multi import default_group
     group = group or default_group()
     if rfft is None:
-        rfft = _env_flag("GPU_AO2MO_RFFT", True)
+        rfft = _env_flag("GPU_AO2MO_RFFT", use_rfft(None))
     if profile is None:
         profile = _env_flag("GPU_AO2MO_PROFILE", False)
     _free_pool()

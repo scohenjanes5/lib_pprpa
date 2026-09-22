@@ -226,16 +226,20 @@ def make_rdm1_relaxed_rhf_pprpa(pprpa, mf, xy=None, mult='t', istate=0, cphf_max
         if get_k_lowrank is not None:
             # X_ao = orba x orba^T and Y_ao = orbi y orbi^T have rank <= the active
             # space.  Hand over the factors (D = L R^T) so the exchange build never
-            # holds dense nao x nao densities or nao x nao x ngrid intermediates
+            # holds dense nao x nao densities or nao x nao x ngrid intermediates,
+            # and ask for K @ orbp directly: only the active-orbital columns are
+            # ever used, which cuts the transforms from rank x nao to rank x nact
             # (see lib_pprpa.gpu_fft_k.get_k_lowrank).
             X_eri, Y_eri = get_k_lowrank(
-                ((orba @ vir_x_mat, orba), (orbi @ occ_y_mat, orbi)), hermi=hermi)
+                ((orba @ vir_x_mat, orba), (orbi @ occ_y_mat, orbi)), hermi=hermi, ket=orbp)
+            X_eri = mf.mo_coeff.T @ X_eri
+            Y_eri = mf.mo_coeff.T @ Y_eri
         else:
             X_ao = orba @ vir_x_mat @ orba.T
             Y_ao = orbi @ occ_y_mat @ orbi.T
             X_eri, Y_eri = mf.get_k(dm=np.stack((X_ao, Y_ao)), hermi=hermi)
-        X_eri = mf.mo_coeff.T @ X_eri @ orbp
-        Y_eri = mf.mo_coeff.T @ Y_eri @ orbp
+            X_eri = mf.mo_coeff.T @ X_eri @ orbp
+            Y_eri = mf.mo_coeff.T @ Y_eri @ orbp
     else:
         if nfrozen_occ > 0 or nfrozen_vir > 0 or pprpa.Lpq is None:
             _, mo_ene_full, Lpq_full = pyscf_util.get_pyscf_input_mol(mf)

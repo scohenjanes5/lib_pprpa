@@ -41,17 +41,16 @@ import cupy as cp
 from gpu4pyscf.pbc import tools as gtools
 from gpu4pyscf.pbc.dft import numint as gnumint
 
-from lib_pprpa.gpu_coulomb import (codensity, coulomb_potential, fft_bytes_per_point,
-                                   half_kernel, plan_fft_batch, use_rfft)
+from lib_pprpa.gpu_mem import max_fft_batch
 from lib_pprpa.gpu_multi import DeviceGroup, _free_bytes, _reclaim_gpu, default_group, log
 
 
 LAST_TELEMETRY = {}
 
 _KPTS0 = np.zeros((1, 3))           # one object: eval_ao_kpts asserts `kpts is opt.kpts`
-# bytes per (pair, grid point) in one strip: the FFT chain (gpu_coulomb: 40 R2C
-# / 56 C2C, codensity included) plus the accumulation scratch (8)
-_SCRATCH_BYTES_PER_POINT = 8
+# transient bytes per (pair, grid point) in one strip: gathers (2x8), complex
+# fft copy (16), vG (16), V (16), scratch (8) -- with a reserve on top
+_BYTES_PER_PAIR_POINT = 64
 
 
 def get_last_telemetry():
@@ -152,11 +151,8 @@ def _segments(p0, p1, n_idx, m_idx, row_start):
         q = q1
 
 
-def plan_strip(ngrid, npair, free=None, reserve_frac=0.15, mesh=None, rfft=True):
-    """Pairs per FFT strip from free VRAM, the cuFFT plan cap and an env override.
-
-    The strip here is only an FFT batch plus its (blk, ngrid) accumulation
-    scratch; there is no contraction block to size separately."""
+def plan_strip(ngrid, npair, free=None, reserve_frac=0.15, mesh=None):
+    """Pairs per FFT strip from free VRAM, the cuFFT plan cap and an env override."""
     env = os.environ.get("PPRPA_PAIRING_BLK")
     if env:
         return max(1, min(npair, int(env)))
@@ -164,12 +160,8 @@ def plan_strip(ngrid, npair, free=None, reserve_frac=0.15, mesh=None, rfft=True)
         free = _free_bytes()
     reserve = max(1024 ** 3, int(free * reserve_frac))
     usable = max(0, free - reserve)
-    per = fft_bytes_per_point(rfft) + _SCRATCH_BYTES_PER_POINT
-    # the chain's share of the usable memory, with 20% slack: the whole strip
-    # is one FFT batch here, so there is no other block to absorb an optimistic
-    # per-point estimate (2573 pairs at 176 GB free OOM'd once on a B200)
-    budget = 0.8 * usable * fft_bytes_per_point(rfft) / per
-    return plan_fft_batch(budget, ngrid, mesh, rfft, npair, floor=1)
+    blk = usable // (_BYTES_PER_PAIR_POINT * ngrid)
+    return int(max(1, min(npair, blk, max_fft_batch(ngrid, mesh=mesh))))
 
 
 def pairing_strip(ctx, task, n_idx, m_idx, row_start, mesh, symmetric=True):
@@ -181,10 +173,7 @@ def pairing_strip(ctx, task, n_idx, m_idx, row_start, mesh, symmetric=True):
     unfinished sub-strip and never double counts.
     """
     st = ctx.state
-    phiR, phiL, W = st["phiR"], st["phiL"], st["W"]
-    rfft = bool(st["rfft"])
-    w = st["w_half"] if rfft else st["coulG"]
-    n_dev, m_dev = st["n_idx"], st["m_idx"]
+    phiR, phiL, coulG, W = st["phiR"], st["phiL"], st["coulG"], st["W"]
     scratch, rowbuf = st["scratch"], st["rowbuf"]
     progress = st.setdefault("progress", {})
     p0, p1 = task
@@ -192,9 +181,16 @@ def pairing_strip(ctx, task, n_idx, m_idx, row_start, mesh, symmetric=True):
     while q0 < p1:
         q1 = min(p1, q0 + int(st["blk"]))
         # ---- phase 1: codensity potentials (may OOM; W untouched) ----------
-        rho = codensity(phiR, phiR, n_dev, m_dev, q0, q1)
-        Vr = coulomb_potential(rho, mesh, w, rfft)   # real (q1-q0, ngrid)
+        ni = cp.asarray(n_idx[q0:q1])
+        mi = cp.asarray(m_idx[q0:q1])
+        rho = phiR[ni]
+        rho *= phiR[mi]
+        vG = gtools.fft(rho, mesh)
         rho = None
+        vG *= coulG
+        V = gtools.ifft(vG, mesh)
+        vG = None
+        Vr = V.real                              # strided view, no copy
         # ---- phase 2: W updates into preallocated scratch --------------------
         for n, s, ma, mb in _segments(q0, q1, n_idx, m_idx, row_start):
             k = mb - ma
@@ -206,7 +202,7 @@ def pairing_strip(ctx, task, n_idx, m_idx, row_start, mesh, symmetric=True):
                     cp.multiply(phiL[ma + off:mb], Vr[s][off:], out=scratch[:k - off])
                     cp.sum(scratch[:k - off], axis=0, out=rowbuf)
                     W[n] += rowbuf
-        Vr = None
+        V = Vr = None
         q0 = q1
         progress[task] = q0
     progress.pop(task, None)
@@ -224,7 +220,7 @@ def _shrink_strip(ctx, task, exc):
 # driver
 # --------------------------------------------------------------------------
 def pairing_k_force_lowrank(cell, mesh, L, R, aoslices=None, exxdiv=None, blk=None,
-                            gchunk=None, group=None, symmetric=True, verbose=True, rfft=None):
+                            gchunk=None, group=None, symmetric=True, verbose=True):
     """Pairing-exchange contribution to the pp-RPA gradient for X = L @ R.T.
 
     Returns numpy (natm, 3) in the convention of ``grad_elec`` (dE/dR; the
@@ -232,13 +228,11 @@ def pairing_k_force_lowrank(cell, mesh, L, R, aoslices=None, exxdiv=None, blk=No
     dropped), matching the AFT path it replaces.  ``blk`` overrides the pairs
     per FFT strip; ``symmetric=False`` enumerates all r^2 ordered pairs (2x the
     FFTs; debugging aid).  ``group`` is a ``gpu_multi.DeviceGroup`` (default:
-    ``LIB_PPRPA_GPUS`` slots).  ``rfft`` selects the real-to-complex Coulomb
-    chain (default on, ``GPU_FFT_RFFT=0`` for the complex one).
+    ``LIB_PPRPA_GPUS`` slots).
     """
     assert exxdiv is None, "pairing_k_force_lowrank: only exxdiv=None is supported"
     started = time.perf_counter()
     group = group or default_group()
-    rfft = use_rfft(rfft)
     L = np.asarray(L, dtype=np.float64)
     R = np.asarray(R, dtype=np.float64)
     assert L.shape == R.shape and L.shape[0] == cell.nao, (L.shape, R.shape)
@@ -264,14 +258,10 @@ def pairing_k_force_lowrank(cell, mesh, L, R, aoslices=None, exxdiv=None, blk=No
         _reclaim_gpu()
         st["phiL"], st["phiR"] = lr_on_grid(cell, mesh, coords, L, R, gchunk)
         st["coulG"] = cp.asarray(gtools.get_coulG(cell, k=np.zeros(3), exx=None, mesh=mesh))
-        st["w_half"] = half_kernel(st["coulG"], mesh)
-        st["rfft"] = rfft
-        st["n_idx"] = cp.asarray(n_idx.astype(np.int32))
-        st["m_idx"] = cp.asarray(m_idx.astype(np.int32))
         st["W"] = cp.zeros((r, ngrid))
         st["rowbuf"] = cp.empty(ngrid)
         _reclaim_gpu()
-        return (plan_strip(ngrid, npair, mesh=mesh, rfft=rfft) if blk is None
+        return (plan_strip(ngrid, npair, mesh=mesh) if blk is None
                 else max(1, min(npair, int(blk))))
 
     t0 = time.perf_counter()
@@ -287,8 +277,7 @@ def pairing_k_force_lowrank(cell, mesh, L, R, aoslices=None, exxdiv=None, blk=No
     tasks = [(p0, min(npair, p0 + blk_global)) for p0 in range(0, npair, blk_global)]
     if verbose:
         _log(f"rank={r} pairs={npair} ({'n<=m' if symmetric else 'all'}) ngrid={ngrid} "
-             f"nao={nao} natm={natm} | strip={blk_global} pairs {'r2c' if rfft else 'c2c'} "
-             f"-> {len(tasks)} strips on "
+             f"nao={nao} natm={natm} | strip={blk_global} pairs -> {len(tasks)} strips on "
              f"{group.nslots} slot(s); residents/slot={3*r*ngrid*8/1e9:.1f} GB; "
              f"setup {setup_seconds:.0f} s")
 
@@ -317,8 +306,7 @@ def pairing_k_force_lowrank(cell, mesh, L, R, aoslices=None, exxdiv=None, blk=No
 
     def _grad(ctx):
         st = ctx.state
-        for key in ("phiL", "phiR", "scratch", "coulG", "w_half", "rowbuf", "progress",
-                    "n_idx", "m_idx"):
+        for key in ("phiL", "phiR", "scratch", "coulG", "rowbuf", "progress"):
             st.pop(key, None)
         _reclaim_gpu()
         G = grad_ao_pass(cell, mesh, coords, st["W"], gchunk)
@@ -336,7 +324,6 @@ def pairing_k_force_lowrank(cell, mesh, L, R, aoslices=None, exxdiv=None, blk=No
     LAST_TELEMETRY.update({
         "rank": int(r), "npair": int(npair), "symmetric": bool(symmetric),
         "ngrid": ngrid, "nao": int(nao), "strip": blk_global, "nstrips": len(tasks),
-        "rfft": bool(rfft),
         "setup_seconds": setup_seconds, "strip_seconds": strip_seconds,
         "grad_seconds": grad_seconds, "total_seconds": total,
         "multi_gpu": run_stats,
