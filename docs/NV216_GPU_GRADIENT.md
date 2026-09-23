@@ -317,7 +317,7 @@ against 223.8 at 22.9 -- and then `Calculate d_prime`, the Z-vector/CPHF
 solve, ran for over 60 minutes against 53 s in every other mode, with the GPU
 at 88 % utilization drawing 193 W of a ~1 kW part. That is a flood of tiny
 emulated GEMMs whose fixed-point decomposition costs far more than the
-arithmetic; the run was cancelled. The stage-3 table in `benchmarks/RESULTS.md`
+arithmetic; the run was cancelled. The stage-3 table in `docs/RESULTS.md`
 already shows eager losing to native at b = 600, and the MO-space GEMMs in the
 Z-vector solve are very much smaller than that.
 
@@ -485,7 +485,7 @@ Every stage was checked element-wise against the kernel before it (the
 reference tensors are kept once on scratch,
 `/nfs/roberts/scratch/pi_tz324/sc3352/ao2mo_refs/`, and later runs compare
 against them instead of recomputing an earlier kernel); the per-stage numbers
-and job ids are in `benchmarks/RESULTS.md`, and `benchmarks/bench_gemm.sbatch`
+and job ids are in `docs/RESULTS.md`, and `benchmarks/bench_gemm.sbatch`
 reruns any of them.
 
 ### 15. The hcore derivative in density space
@@ -1006,7 +1006,7 @@ symmetric tile scatter, diagonal split, symmetrised half kernel; numpy-only,
 tested without a GPU), `lib_pprpa/gpu_coulomb.py` (fused codensity kernel,
 R2C Coulomb chain, FFT batch planner), `lib_pprpa/grad/gpu_response.py` (the
 CPHF response), `benchmarks/` (frozen copies of every superseded kernel, the
-benchmark drivers, `bench_gemm.sbatch` with one stage per section, and
-`RESULTS.md`); `gpu_fft_k.py` rewritten, `pprpa_eri_gpu.py` gains the split
+benchmark drivers and `bench_gemm.sbatch` with one stage per section --
+*not tracked*, see the note at the top of `docs/RESULTS.md`); `gpu_fft_k.py` rewritten, `pprpa_eri_gpu.py` gains the split
 mode. Tests: `test_pair_layout.py`, `test_gpu_response.py`, and the
 exchange / Davidson tests extended for the ket path and the split mode.

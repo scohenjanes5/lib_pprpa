@@ -1,5 +1,12 @@
 # gpu_ao2mo tile-GEMM work: measurements
 
+
+> The harness these numbers came from -- `benchmarks/`: the bench drivers,
+> `bench_gemm.sbatch`, the frozen copies of every superseded kernel and the
+> job logs -- is development-only and **not tracked in git**.  Paths below
+> that start with `benchmarks/` will not exist in a fresh clone; they refer
+> to the working copies on the machine the runs were done on.
+
 System for every run: the 63-atom NV cell (`work/pprpa/NV63/grace_opt.xyz`),
 gth-dzvp / gth-pbe, PBE, charge -3, ke = 300 Ha -> nao = 819, mesh 107^3,
 ngrid = 1,225,043.  One NVIDIA B200 (gpu_devel), cupy 14.1.1, cuBLAS 12.8.

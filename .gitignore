@@ -141,3 +141,7 @@ tmp/
 gs_mps/
 cps_mps/
 *.npz
+
+# development-only benchmark harness (frozen kernels, drivers, job logs);
+# the measurement record it produced lives in docs/RESULTS.md
+benchmarks/

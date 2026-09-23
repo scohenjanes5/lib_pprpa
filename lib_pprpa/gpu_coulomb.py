@@ -13,7 +13,7 @@ kernel, the real-to-complex potential chain and the per-point memory cost of
 one FFT batch -- and every kernel keeps its own planner for the rest.  An
 earlier design shared one planner and, with it, one byte-per-point guess and
 one coupling of "contraction block = FFT batch"; that held the ao2mo GEMM at
-a third of the card's rate (see benchmarks/RESULTS.md).
+a third of the card's rate (see docs/RESULTS.md).
 
 The R2C chain must use the *symmetrised* half-mesh kernel
 (``pair_layout.symmetric_half_kernel``): pyscf's convention
