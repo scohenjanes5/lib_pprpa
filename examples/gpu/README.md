@@ -163,3 +163,49 @@ The 216-atom force took 23 h on one B200: pairing-K force 16.4 h (AFT
 Tests: `tests/test_gpu_multi.py`, `tests/test_gpu_pairing_force.py`,
 `tests/test_gpu_ao2mo_multi.py`, `tests/test_gpu_grad_pairing_e2e.py`
 (1-GPU node suffices; a `--gres=gpu:2` job exercises real peer copies).
+
+## The hcore force in density space, and SCF checkpointing (2026-09-23)
+
+After the CPHF response the hcore derivative was the largest phase of the
+216-atom force (11.5 min of 39.4).  `hcore_generator` builds the full AO matrix
+of the local-PP derivative for one atom and the force then traces it against the
+density -- `natm * 3 * nao^2 * ngrid`, with the AO grid re-evaluated inside every
+one of the 215 calls.  But the AO indices are contracted on both sides by the
+same grid point, so the trace collapses to `sum_g vloc_R^x_A(g) rho_T(g)`, and by
+Parseval to a reduction over G with no FFT per atom.
+
+gpu4pyscf already has that reduction -- `multigrid.eval_vpplocG_SI_gradient`,
+which `krhf.grad_elec` uses on its `multigrid_v2` branch while the default
+`KNumInt` branch still loops over atoms.  So `lib_pprpa/grad/gpu_hcore_force.py`
+(109 lines) is just the wiring: `rho_T(G)` from `KNumInt.get_rho`, that
+reduction, and `contract_h1e_dm(..., hermi=0)` for the AO-derivative half.
+`PPRPA_HCORE=dense` restores the per-atom generator.
+
+Measured on one B200 -- NV63 ke=600: **52.7 s -> 6.0 s**, agreeing with the
+per-atom path to 6.3e-15 relative.  NV216 ke=300: **21.8 min -> 17.8 s** (74x;
+the per-atom side sampled over 8 of 215 atoms, agreeing to 9.3e-14).  What is
+left is 14.9 s of `krhf.get_hcore`, the AO-derivative term.
+
+`lib_pprpa/scf_chk.py` carries a converged SCF density between runs at nearby
+geometries -- optimization steps, and the 200+ phonopy displacements that each
+sit one atom away from the same optimized geometry.  Call `scf_chk.run_scf(kg,
+cell)` in place of `kg.kernel()` (both opt examples now do) and set a path:
+
+| variable | effect |
+|---|---|
+| `PPRPA_SCF_CHK` | read and write -- a rolling checkpoint, for an optimization |
+| `PPRPA_SCF_CHK_IN` | read only -- every displacement reads the optimized geometry's checkpoint and none of them write |
+| `PPRPA_SCF_CHK_OUT` | write only |
+
+Unset, nothing happens.  A checkpoint whose cell does not match (atoms, lattice,
+basis, pseudo, charge, spin) is refused with a log line, never an exception; a
+different *geometry* is the point, so only the displacement is reported.  An
+unconverged SCF is never written.  Nothing about the converged result changes --
+only the path the SCF takes to it.
+
+Tests: `tests/test_gpu_hcore_force.py` (GPU), `tests/test_scf_chk.py` (CPU only).
+`benchmarks/bench_hcore_force.py` runs both hcore paths on a real cell and
+reports the difference and the speedup.
+
+A chronological account of every fix needed for the 216-atom cell, with measured
+timings, is in [docs/NV216_GPU_GRADIENT.md](../../docs/NV216_GPU_GRADIENT.md).

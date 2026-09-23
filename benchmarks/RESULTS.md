@@ -418,3 +418,100 @@ Against the reference 2-GPU force of the old tree (4 h 09 min) the full
 force is now 6.3x faster; against the 1-GPU old tree (8 h 08 min), 12.4x.
 The hcore derivative (11.5 min, 215 `hcore_generator` calls over two cards)
 is now the largest phase.
+
+## Stage 14: the hcore derivative in density space -- job 27160009
+
+`lib_pprpa/grad/gpu_hcore_force.py`.  After stage 13 the hcore derivative was
+the largest phase of the NV216 force (11.5 min of 39.4).  The per-atom
+`hcore_generator` builds the full AO matrix of the local-PP derivative and the
+force then traces it against the density; since the AO indices are contracted
+on both sides by the same grid point, the trace collapses to
+`sum_g vloc_R^x_A(g) rho_T(g)` and, by Parseval, to a reduction over G with no
+FFT per atom.  `rho_T` is built once, transformed once, and each atom becomes
+three dot products over G:
+`natm * 3 * nao^2 * ngrid` -> `nao^2 * ngrid + natm * 3 * ngrid`.
+The derivation is section 15 of `docs/NV216_GPU_GRADIENT.md`;
+`PPRPA_HCORE=dense` restores the per-atom path.
+
+Correctness, four independent checks:
+
+| check | agreement |
+|---|---|
+| pyscf's *CPU* `hcore_generator`, distorted diamond, symmetric T | 1.8e-15 rel. |
+| same, non-symmetric T | 8.5e-16 rel. |
+| gpu4pyscf `hcore_generator`, NV63 ke=600 (nao 819, mesh 151^3) | 6.06e-15 rel. |
+| full `grad_elec`, default vs `PPRPA_HCORE=dense` (C2 diamond) | 2.77e-15 rel. |
+
+(The CPU generator returns `[3, nkpts, nao, nao]`; gpu4pyscf returns
+`[nkpts, 3, nao, nao]`.  Only the second convention is what the force assembly
+contracts.)
+
+Tests: `tests/test_gpu_hcore_force.py` -- pseudo and all-electron branches, one
+and two slots, forced grid chunks, forced atom batches (including a partial
+last batch on a 4-atom supercell), grid ordering, and the end-to-end dispatch.
+`tests/test_scf_chk.py` (CPU only) covers the SCF checkpoint of section 16.
+Job 27160009: 8 + 7 + 90 tests passed, no regressions.
+
+NV63, ke=600, nao 819, mesh 151^3, one GPU (RTX PRO 6000 Blackwell):
+
+| path | wall | per atom |
+|---|---|---|
+| per-atom `hcore_generator` | 786.1 s | 12.48 s |
+| density-space | 21.8 s | -- |
+| | **36.0x** | |
+
+max abs diff 1.596e-14 (6.06e-15 relative against max\|de\| = 2.63 a.u.),
+rms 5.13e-15.
+
+The breakdown confirms the cost model term by term: `rho 4.8 / G-space 3.0 /
+AO-derivative 14.0`.  The G-space atom reduction is 3.0 s for *all 63 atoms*;
+the 14.0 s AO-derivative term is `krhf.get_hcore`, one array rather than
+per-atom work, and costs almost exactly one atom of the old loop (12.48 s).
+So the 63-atom phase now costs ~1.7 atoms' worth, and what remains is dominated
+by the one term that was never per-atom.
+
+Note on hardware: this job landed on an RTX PRO 6000 Blackwell, whose fp64 rate
+is ~1/64 of its fp32.  The per-atom path is an fp64 GEMM wall, so its *absolute*
+numbers here are far worse than a B200's (which is why the NV216 step of 27160009
+ran out of walltime -- 12.48 s/atom at NV63 extrapolates to ~10 h at NV216 on
+that card).  The 36x ratio is measured on one card for both paths and both are
+fp64-GEMM bound, so it transfers; the absolute times do not.
+
+NV216 density-path timing: job 27225292 (pending).  The per-atom reference is
+deliberately *not* re-run there -- its timing is already in this file (stage 11:
+11.5 min on two B200s) and in the table of `docs/NV216_GPU_GRADIENT.md` (24 min
+on one), and its value is validated by the four checks above.  What that job adds
+is the one thing smaller cells cannot reach: the G-space reduction batches atoms
+by free VRAM and every cell so far fits in a single batch (NV63 is 63 atoms
+against a cap of 64), so `--selfcheck` re-runs the reduction with a forced small
+atom batch and grid chunk and requires the two to agree.
+
+## Stage 14: the hcore derivative in density space -- allocation 27259554
+
+`lib_pprpa/grad/gpu_hcore_force.py`.  The per-atom `hcore_generator` loop is
+replaced by one grid density, one FFT and gpu4pyscf's own
+`multigrid.eval_vpplocG_SI_gradient` (the reduction `krhf.grad_elec` already
+uses on its `multigrid_v2` branch), plus `contract_h1e_dm(..., hermi=0)` for the
+AO-derivative half.  109 lines, 38 of them executable; a first version that
+re-derived the reduction was 340.
+
+One B200, `benchmarks/bench_hcore_force.py`:
+
+| cell | per-atom generator | density space | agreement | speedup |
+|---|---|---|---|---|
+| NV63, ke=600, nao 819, mesh 151^3 | 52.7 s (0.84 s/atom) | 6.0 s | 6.33e-15 rel. | 8.8x |
+| NV216, ke=300, nao 2795, mesh 159^3 | 6.10 s/atom -> 21.8 min (8/215 sampled) | 17.8 s | 9.28e-14 rel. | 74x |
+
+Breakdown at NV216: rho 2.8 s, G-space reduction 0.1 s, AO-derivative
+(`krhf.get_hcore`) 14.9 s.  The sampled per-atom rate extrapolates to 21.8 min
+against the 24 min recorded for one GPU in stage 11's table, so the sample is
+not flattering itself.
+
+An RTX PRO 6000 Blackwell (fp64 ~1/64 of a B200) gives 786.1 s -> 21.8 s at
+NV63 (job 27160009) and 189.6 s at NV216 (job 27225292); same ratios, slower
+card, not the numbers quoted above.
+
+Tests (`tests/test_gpu_hcore_force.py`, 6 passed): pseudo and all-electron
+against `hcore_generator`, a non-symmetric density (which is what `hermi=0`
+buys), the device group being inert, the `PPRPA_HCORE=dense` switch, and the
+whole force through `grad_elec` both ways (3.90e-15).
