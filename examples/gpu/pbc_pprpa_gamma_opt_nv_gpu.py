@@ -56,6 +56,7 @@ from lib_pprpa.pprpa_eri_gpu import attach_gpu_eri_contraction, release_gpu_eri
 from lib_pprpa.grad import pprpa_gamma          # noqa: F401 (attaches .Gradients)
 from lib_pprpa.grad import pprpa_gamma_gpu as gpugrad
 from lib_pprpa.grad import ase_utils
+from lib_pprpa import scf_chk
 
 # Optional flags (strip before positional parsing).
 _NET_FORCE_CHECK = "--net-force-check" in sys.argv
@@ -146,7 +147,10 @@ def _pipeline(cell, want_grad):
     kg = gdft.KRKS(cell, kpts=GAMMA, xc=XC)
     kg.exxdiv = None
     kg.conv_tol = 1e-9
-    kg.kernel()
+    # PPRPA_SCF_CHK / _IN / _OUT: reuse a nearby geometry's converged density as
+    # the initial guess (rolling across optimization steps; the optimized
+    # geometry's checkpoint for every displacement).  A no-op when unset.
+    scf_chk.run_scf(kg, cell)
     mo = cp.asnumpy(kg.mo_coeff[0])
     moe = cp.asnumpy(kg.mo_energy[0])
     mo_occ = cp.asnumpy(kg.mo_occ[0])

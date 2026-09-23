@@ -34,6 +34,7 @@ from lib_pprpa.grad.ase_utils import pprpaobj, kernel as ase_opt
 from lib_pprpa.pprpa_davidson_gpu import attach_gpu_contraction
 from lib_pprpa.grad import pprpa_gamma          # noqa: F401  (attaches .Gradients)
 from lib_pprpa.grad import pprpa_gamma_gpu as gpugrad
+from lib_pprpa import scf_chk
 
 # ---------------- settings ----------------
 XC       = "pbe"          # functional for the KS reference (use "hf" for HF)
@@ -87,7 +88,10 @@ def _pipeline(cell, want_grad):
     kg = gdft.KRKS(cell, kpts=KPTS, xc=XC)
     kg.exxdiv = None
     kg.conv_tol = 1e-9
-    kg.kernel()
+    # PPRPA_SCF_CHK / _IN / _OUT: reuse a nearby geometry's converged density as
+    # the initial guess (rolling across optimization steps; the optimized
+    # geometry's checkpoint for every displacement).  A no-op when unset.
+    scf_chk.run_scf(kg, cell)
 
     # 2) lightweight CPU RKS shell carrying the GPU orbitals (pprpaobj reads numpy)
     mf = cdft.RKS(cell, xc=XC)
