@@ -8,7 +8,12 @@ overlap, J/K, Vxc, fxc, pseudo-potential) also runs on the GPU.
 
 Term -> gpu4pyscf primitive map (D=KS ref dm, P=relaxed corr dm, T=D+P,
 W=energy-weighted dm, X=pp-RPA 2-RDM amplitude density):
-  hcore   : krhf_g.hcore_generator, einsum('kxij,kji->x', h1ao, T)
+  hcore   : lib_pprpa.grad.gpu_hcore_force -- the local-PP/nuclear-attraction
+            half is contracted in density space (rho_T on the grid, one FFT,
+            then gpu4pyscf's own multigrid.eval_vpplocG_SI_gradient) instead of
+            building h1ao per atom; the AO-derivative half is get_hcore +
+            contract_h1e_dm.  Single-device, as those kernels are.
+            PPRPA_HCORE=dense restores krhf_g.hcore_generator + einsum
   ovlp    : krhf_g.contract_h1e_dm(s1, W)            (note +=, W carries -dme0)
   J ref   : polarization Q(T)-Q(P) via jk_energy_per_atom(j=1,sr=lr=hyb), FFTDF
   hyb K   : Q(T)-Q(P) via jk_energy_per_atom(j=0,sr=lr=hyb), AFTDF   (only if hyb)
@@ -28,7 +33,7 @@ Key conventions / gpu4pyscf quirks (see also grad_utils_gpu_pbc):
   routine carries the SCF's 0.5 exchange factor while pp-RPA pairing is the full
   bare exchange.  The default low-rank FFT variant needs none of this: it
   evaluates the CPU-reference term for X = L R^T directly (rank <= nocc+nvir).
-* Multi-GPU: the strip loops (ao2mo, low-rank K, pairing force, hcore per atom)
+* Multi-GPU: the strip loops (ao2mo, low-rank K, pairing force)
   run on ``lib_pprpa.gpu_multi.default_group()`` — one slot unless the job
   exports LIB_PPRPA_GPUS=2 (see the 2-GPU sbatch files).  ``Gradients.gpu_group``
   overrides it.
@@ -102,7 +107,10 @@ def _make_kmf(cell, kpts, mf, is_ks):
 
 
 def _hcore_force(gg, cell, kpts, mf, is_ks, T, group):
-    """sum over atoms of einsum('kxij,kji->x', hcore_deriv(ia), T) as numpy (natm, 3).
+    """Per-atom reference path, kept for PPRPA_HCORE=dense and as the kernel that
+    ``gpu_hcore_force`` is validated against (tests/test_gpu_hcore_force.py).
+
+    sum over atoms of einsum('kxij,kji->x', hcore_deriv(ia), T) as numpy (natm, 3).
 
     Atoms are dispatched over the device group; every non-zero slot builds its
     own gradient object + ``hcore_generator`` inside its device thread because
@@ -264,7 +272,12 @@ def grad_elec(pprpa_grad, xy, mult, atmlst=None):
     # hcore (kinetic + local PP) contracted with the total density, atoms
     # dispatched over the device group
     _prog("hcore × density")
-    h_atoms, hcore_stats = _hcore_force(gg, cell, kpts, mf, is_ks, T, group)
+    # gpu4pyscf is imported lazily here, as gpu_response is above
+    from lib_pprpa.grad import gpu_hcore_force as _hcf
+    if _hcf.use_density_path():
+        h_atoms, hcore_stats = _hcf.hcore_force(cell, kpts, T, group=group)
+    else:
+        h_atoms, hcore_stats = _hcore_force(gg, cell, kpts, mf, is_ks, T, group)
     de += cp.asarray(h_atoms)
 
     timings["hcore_seconds"] = _timer_stop(phase_started)
@@ -372,6 +385,8 @@ class Gradients(_cpu.Gradients):
     ``pairing_k_method``: "lowrank" (default, FFT on the L R^T factors) or "aft"
     (dense AFTDF kernel; env PPRPA_PAIRING_K overrides).  ``gpu_group``: a
     ``lib_pprpa.gpu_multi.DeviceGroup`` (default: LIB_PPRPA_GPUS slots).
+    ``PPRPA_HCORE=dense``: per-atom ``hcore_generator`` instead of the
+    density-space hcore force.
     """
     pairing_k_method = "lowrank"
     gpu_group = None
