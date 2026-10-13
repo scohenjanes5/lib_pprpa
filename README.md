@@ -34,6 +34,20 @@ Method 2 is recommended for new users, as it is [standard practice](https://docs
 Consult [the pip documentation](https://pip.pypa.io/en/stable/cli/pip_install/) for further information
 about command-line options for pip.
 
+#### GPU support
+The GPU modules (`lib_pprpa.gpu_*`, `lib_pprpa.pprpa_eri_gpu`, `lib_pprpa.grad.pprpa_gamma_gpu`)
+need an NVIDIA GPU and [GPU4PySCF](https://github.com/pyscf/gpu4pyscf) 1.8 or higher, which comes
+as one wheel per CUDA major version. Install `lib_pprpa` with the extra that matches your CUDA
+toolkit and driver (`nvidia-smi` shows the highest CUDA version the driver supports):
+```
+pip install -e ".[gpu]"          # CUDA 12
+pip install -e ".[gpu-cuda13]"   # CUDA 13
+```
+CuPy and GPU4PySCF's libxc come with it. cuBLAS's fp64 emulation (`lib_pprpa.gpu_emulation`) needs
+CUDA 13; with CUDA 12 those GEMMs run in plain fp64. Check the installation with
+`python -c "import gpu4pyscf, cupy; print(cupy.cuda.runtime.getDeviceCount())"` and run the GPU
+tests with `pytest tests`.
+
 Features
 --------
 

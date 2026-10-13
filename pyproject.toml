@@ -24,6 +24,9 @@ classifiers = [
 [project.optional-dependencies]
 ase = ["ase"]
 socutils = ["socutils"]
+# the GPU modules; gpu4pyscf ships one wheel per CUDA major version
+gpu = ["gpu4pyscf-cuda12x>=1.8"]
+gpu-cuda13 = ["gpu4pyscf-cuda13x>=1.8"]
 
 [tool.setuptools.packages.find]
 where = ["."]
