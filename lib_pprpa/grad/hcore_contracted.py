@@ -46,7 +46,7 @@ def hcore_deriv_contracted(cell, kpts, dm):
     kpts = np.asarray(kpts).reshape(-1, 3)
     if len(kpts) != 1 or abs(kpts).max() > 0:
         raise NotImplementedError("hcore_deriv_contracted is Gamma-point only")
-    natm, nao = cell.natm, cell.nao
+    natm = cell.natm
     mesh = cell.mesh
     ngrids = int(np.prod(mesh))
     dm = cp.asarray(dm)
