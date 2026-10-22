@@ -53,7 +53,8 @@ def pair_operator_bytes(nocc, nvir, multi):
 
 class PairOperator:
     """The pair-space operator of one multiplicity as row strips [(kind, R0, R1, S)],
-    kind 'oo', 'vv' or 'ov' (B); see the module docstring."""
+    kind 'oo', 'vv' or 'ov' (B), on the host or (``pprpa_eri_gpu.gdf_pair_operator``
+    resident) on the device; see the module docstring."""
 
     def __init__(self, nocc, nvir, multi, strips):
         self.nocc, self.nvir, self.multi, self.strips = int(nocc), int(nvir), multi, strips
