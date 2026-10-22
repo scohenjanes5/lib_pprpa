@@ -5,7 +5,8 @@ Pipeline:
   CPU GDF auxiliary basis (pyscf.pbc.df.GDF, with_j3c=False)
     -> GPU mirror of the same fitting + GPU KRKS SCF (gpu4pyscf)
     -> CPU reference object carrying the converged GPU orbitals
-    -> Davidson pp-RPA on the GDF factors (lib_pprpa.pbc_gdf.make_pprpa_gdf)
+    -> active-space GDF factors on the GPU, no AO cderi (make_pprpa_gdf(gpu=True))
+    -> Davidson pp-RPA on those factors
 
 Two details are easy to get wrong.
 
@@ -131,7 +132,7 @@ mf.converged = True
 # mu = 0 keeps the eigenvalues as plain two-electron addition/removal energies.
 pp = make_pprpa_gdf(mf, channel=channel, nocc_act=as_size, nvir_act=as_size,
                     mu=0.0, nroot=nroot, residue_thresh=1e-9,
-                    max_iter=400, max_vec=1000, trial='identity')
+                    max_iter=400, max_vec=1000, trial='identity', gpu=True)
 pp.kernel(mult)
 
 omega = np.asarray(pp.exci_s if mult == 's' else pp.exci_t)

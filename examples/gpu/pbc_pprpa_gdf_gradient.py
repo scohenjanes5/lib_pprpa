@@ -102,7 +102,7 @@ mf.converged = True
 
 pp = make_pprpa_gdf(mf, channel=channel, nocc_act=as_size, nvir_act=as_size,
                     mu=0.0, nroot=max(8, state + 1), residue_thresh=1e-9,
-                    max_iter=400, max_vec=1000, trial='identity')
+                    max_iter=400, max_vec=1000, trial='identity', gpu=True)
 pp.kernel(mult)
 
 omega = np.asarray(pp.exci_s if mult == 's' else pp.exci_t)

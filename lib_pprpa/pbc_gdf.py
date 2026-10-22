@@ -19,7 +19,7 @@ from typing import Any
 import numpy as np
 
 from lib_pprpa.pprpa_davidson import ppRPA_Davidson
-from lib_pprpa.pyscf_util import get_pyscf_input_sc
+from lib_pprpa.pyscf_util import calculate_dipole_moment_MO, get_pyscf_input_sc
 
 
 @dataclass(frozen=True)
@@ -183,25 +183,47 @@ def validate_gdf_context(pprpa, mf):
 
 
 def get_pyscf_input_sc_gdf(
-        mf, nocc_act=None, nvir_act=None, dump_file=None, with_dip=False):
-    """Build the Gamma-point GDF ``Lpq`` factors used by the ppRPA operator."""
-    validate_gdf_mf(mf)
-    return get_pyscf_input_sc(
-        mf, nocc_act=nocc_act, nvir_act=nvir_act, dump_file=dump_file,
-        cholesky=False, with_dip=with_dip)
+        mf, nocc_act=None, nvir_act=None, dump_file=None, with_dip=False, gpu=False):
+    """Build the Gamma-point GDF ``Lpq`` factors used by the ppRPA operator.
+
+    With ``gpu`` the active factors are built on the GPU without the AO cderi
+    (:func:`lib_pprpa.gpu_gdf.gdf_active_factors`), so ``mf.with_df`` needs only its
+    auxcell (``with_df.build(with_j3c=False)``); ``Lpq`` is then a pinned NumPy array.
+    """
+    with_df = validate_gdf_mf(mf)
+    if not gpu:
+        return get_pyscf_input_sc(
+            mf, nocc_act=nocc_act, nvir_act=nvir_act, dump_file=dump_file,
+            cholesky=False, with_dip=with_dip)
+    if dump_file is not None:
+        raise NotImplementedError("dump_file is written by the CPU (gpu=False) path only")
+    from lib_pprpa.gpu_gdf import gdf_active_factors
+
+    nocc = int(np.sum(mf.mo_occ) / 2)
+    nvir = len(mf.mo_energy) - nocc
+    nocc_act = nocc if nocc_act is None else min(nocc, nocc_act)
+    nvir_act = nvir if nvir_act is None else min(nvir, nvir_act)
+    window = slice(nocc - nocc_act, nocc + nvir_act)
+    lpq = gdf_active_factors(with_df, np.asarray(mf.mo_coeff)[:, window], verbose=mf.verbose)
+    mo_energy = np.asarray(mf.mo_energy)[window]
+    if with_dip:
+        mo_dip = calculate_dipole_moment_MO(mf, nocc_act=nocc_act, nvir_act=nvir_act)
+        return nocc_act, mo_energy, lpq, mo_dip
+    return nocc_act, mo_energy, lpq
 
 
 def make_pprpa_gdf(
         mf, channel="pp", nocc_act=None, nvir_act=None, dump_file=None,
-        mu=None, **davidson_kwargs):
+        mu=None, gpu=False, **davidson_kwargs):
     """Construct a Davidson ppRPA solver from the reference's periodic GDF.
 
     The returned object is tagged with the exact mean-field/GDF provenance.
     Run ``pprpa.kernel('s')`` or ``pprpa.kernel('t')`` as usual, then evaluate
-    the matching gradient with ``pprpa_gamma_gdf_gpu.Gradients``.
+    the matching gradient with ``pprpa_gamma_gdf_gpu.Gradients``.  ``gpu`` builds
+    the factors on the GPU (see :func:`get_pyscf_input_sc_gdf`).
     """
     nocc, mo_energy, lpq = get_pyscf_input_sc_gdf(
-        mf, nocc_act=nocc_act, nvir_act=nvir_act, dump_file=dump_file)
+        mf, nocc_act=nocc_act, nvir_act=nvir_act, dump_file=dump_file, gpu=gpu)
     pprpa = ppRPA_Davidson(
         nocc, mo_energy, lpq, channel=channel, **davidson_kwargs)
     if mu is not None:
