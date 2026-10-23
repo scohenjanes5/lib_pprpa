@@ -29,6 +29,7 @@ from lib_pprpa.grad.hcore_contracted import hcore_deriv_contracted
 from lib_pprpa.grad.pprpa import make_rdm1_relaxed_warm
 from lib_pprpa.grad.pprpa_gamma_gpu import make_gpu_vresp
 from lib_pprpa.gpu_mem import pooled
+from lib_pprpa.pprpa_util import start_clock, stop_clock
 from lib_pprpa.pbc_gdf import validate_gdf_context, validate_gdf_mf
 
 
@@ -234,7 +235,9 @@ def grad_elec(pprpa_grad, xy, mult, atmlst=None):
     # hcore_generator closure re-evaluates every AO on the full uniform mesh
     # for each atom; form the trace against the density once on the mesh and
     # contract it in reciprocal space instead.
+    start_clock('Calculate hcore derivative')
     de += hcore_deriv_contracted(cell, gpu_mf.kpts, tg)
+    stop_clock('Calculate hcore derivative')
 
     # All reference-density Coulomb/exchange terms use the same GDF metric as
     # the ppRPA operator.  Q(D+P)-Q(P) isolates Q(D)+the D/P cross derivative.
@@ -252,17 +255,23 @@ def grad_elec(pprpa_grad, xy, mult, atmlst=None):
     if float(cp.max(cp.abs(xs))) > 1e-10:
         terms.append((xs, 1, 0.0, 2.0, None, -1.0))
     # one pass of the three-center derivative integrals for all of them
+    start_clock('Calculate GDF Coulomb and exchange derivatives')
     de += gdf_deriv.jk_sum(terms)
+    stop_clock('Calculate GDF Coulomb and exchange derivatives')
 
     # XC potential skeleton and its response to the relaxed density.  This
     # helper contains no Coulomb/exchange term; those are entirely GDF above.
     if is_ks:
+        start_clock('Calculate XC derivative')
         de += _xcg_gpu(gpu_mf, mf.xc, pg, dm0=dg)
+        stop_clock('Calculate XC derivative')
 
     # Pulay overlap and nonlocal pseudopotential terms.
+    start_clock('Calculate overlap and nonlocal PP derivatives')
     s1 = gpu_grad.get_ovlp(cell, gpu_mf.kpts)
     de += krhf_g.contract_h1e_dm(cell, s1, wg[None], hermi=1)
     de += vppnl_nuc_grad(cell, total[None], kpts=gpu_mf.kpts)
+    stop_clock('Calculate overlap and nonlocal PP derivatives')
 
     return de[list(atmlst)]
 
