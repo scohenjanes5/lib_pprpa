@@ -7,6 +7,9 @@ compressed AO cderi (naux x nao_pairs) in host memory; here the short-range inte
 block of raw auxiliary functions at a time are scattered into a dense AO slab and transformed to
 the active orbitals, the long-range part is transformed to the active orbitals in blocks of G
 vectors, and the metric is applied last.  Real orbitals, 3D cells, Gamma point only.
+
+When a gpu4pyscf GDF object already holds that cderi (the GPU SCF built it),
+:func:`cderi_active_factors` transforms it instead of evaluating the integrals again.
 '''
 
 import copy
@@ -17,6 +20,7 @@ from cupy import cublas
 from pyscf import lib
 from pyscf.lib import logger
 from pyscf.pbc.df.df import make_auxcell
+from pyscf.pbc.lib.kpts_helper import is_zero
 from gpu4pyscf.pbc.df import ft_ao
 from gpu4pyscf.pbc.df.int3c2e import POOL_SIZE, SRInt3c2eOpt
 from gpu4pyscf.pbc.df.rsdf_builder import (_guess_omega, _precontract_j2c_aux_coeff,
@@ -24,21 +28,22 @@ from gpu4pyscf.pbc.df.rsdf_builder import (_guess_omega, _precontract_j2c_aux_co
 
 from lib_pprpa.gpu_mem import empty_pinned, free_bytes, plan_budget
 
-__all__ = ['gdf_active_factors']
+__all__ = ['cderi_active_factors', 'gdf_active_factors']
 
 # G vectors per long-range block are a multiple of this (gpu4pyscf's Gblksize alignment).
 _G_ALIGN = 32
 
-# src[P, k] (AO pair P of a batch, function or G vector k) into the symmetric AO slab
-# slab[k, i, j] = slab[k, j, i], (i, j) = (rows[P], cols[P])
+# src[P * sp + k * sk] (AO pair P of a batch; function or G vector k) into the symmetric AO
+# slab slab[k, i, j] = slab[k, j, i], (i, j) = (rows[P], cols[P]); one thread per (k, P)
 _SCATTER = cp.ElementwiseKernel(
-    'raw T src, raw int64 rows, raw int64 cols, int64 nk, int64 nao',
+    'raw T src, raw int64 rows, raw int64 cols, int64 npair, int64 sp, int64 sk, int64 nao',
     'raw T slab',
     '''
-    const long long P = i / nk;
-    const long long base = (i - P * nk) * nao * nao;
-    slab[base + rows[P] * nao + cols[P]] = src[i];
-    slab[base + cols[P] * nao + rows[P]] = src[i];
+    const long long k = i / npair;
+    const long long P = i - k * npair;
+    const long long base = k * nao * nao;
+    slab[base + rows[P] * nao + cols[P]] = src[P * sp + k * sk];
+    slab[base + cols[P] * nao + rows[P]] = src[P * sp + k * sk];
     ''',
     'pprpa_gdf_scatter_pairs')
 
@@ -167,11 +172,80 @@ def gdf_active_factors(with_df, mo_act, max_memory=None, verbose=None):
     return out
 
 
-def _scatter_pairs(slab, src, rows, cols):
-    '''Write the AO pairs of ``src`` (npair, ..., nk) into slab[k], k < nk, both triangles.'''
+def cderi_active_factors(gpu_df, mo_act, max_memory=None, verbose=None):
+    '''GDF factors of the active orbitals ``mo_act`` (nao, n) from the compressed AO cderi of a
+    built gpu4pyscf Gamma-point GDF object ``gpu_df`` (``gpu_df.build()``, as its SCF does).
+
+    The integrals are not evaluated again: rows of the host cderi (metric applied) go to the
+    device a block at a time, are unpacked into a dense AO slab as gpu4pyscf's
+    ``loop_gamma_point`` does, and are transformed per function.
+
+    Kwargs:
+        max_memory : device bytes the blocks may fill (default: the free device memory).
+    Returns:
+        A pinned NumPy array (naux, n, n), as :func:`gdf_active_factors`.
+    '''
+    log = logger.new_logger(gpu_df.cell, verbose)
+    t0 = log.init_timer()
+    naux = _cderi(gpu_df, 'cderi_active_factors').shape[0]
+    C = cp.asarray(mo_act, dtype=np.float64)
+    n = C.shape[1]
+    out = empty_pinned((naux, n, n))
+    # per function besides its cderi row and slab: its factor
+    for p0, p1, blk in _cderi_blocks(gpu_df, 8 * n * n, max_memory, 'GDF active factors from cderi',
+                                     log):
+        _mo_transform(blk, C).get(out=out[p0:p1])
+    log.timer('GDF active factors from cderi', *t0)
+    return out
+
+
+def _scatter_pairs(slab, src, rows, cols, pair_major=True):
+    '''Write the AO pairs of ``src`` into slab[k], both triangles: src (npair, ..., nk) pair-major
+    (an int3c2e or Fourier batch) or (nk, npair) function-major (cderi rows).'''
     src = cp.ascontiguousarray(src)
-    nk = src.size // rows.size
-    _SCATTER(src, rows, cols, nk, slab.shape[-1], slab, size=src.size)
+    npair = rows.size
+    nk = src.size // npair
+    sp, sk = (nk, 1) if pair_major else (1, npair)
+    _SCATTER(src, rows, cols, npair, sp, sk, slab.shape[-1], slab, size=src.size)
+
+
+def _cderi(gpu_df, what):
+    '''The compressed Gamma-point cderi (naux, nao_pairs) of the built gpu4pyscf GDF ``gpu_df``.'''
+    if gpu_df._cderi is None:
+        raise ValueError('gpu_df holds no cderi (gpu_df.build())')
+    if gpu_df.cell.dimension != 3 or not is_zero(gpu_df.kpts):
+        raise NotImplementedError(f'{what} supports 3D Gamma-point cells only')
+    return gpu_df._cderi[0]
+
+
+def _cderi_blocks(gpu_df, per_aux, max_memory, what, log):
+    '''(p0, p1, slab) over the cderi of ``gpu_df``: its rows [p0, p1) unpacked into dense AO
+    slabs slab[k] (nao, nao) on the device, as gpu4pyscf's ``loop_gamma_point`` does.  A block
+    has as many functions as fit ``max_memory`` (default: the free device memory) with their
+    rows, their slabs and ``per_aux`` more bytes each; the slab buffer is reused.'''
+    cderi = _cderi(gpu_df, what)
+    naux, npair = cderi.shape
+    nao = gpu_df.cell.nao
+    rows, cols = cp.divmod(cp.asarray(gpu_df._cderi_idx[0], dtype=np.int64), nao)
+    budget = plan_budget(free_bytes()) if max_memory is None else int(max_memory)
+    aux_blk = min(naux, budget // (8 * (npair + nao * nao) + per_aux))
+    if aux_blk < 1:
+        raise MemoryError(f'{what}: no room for one aux function')
+    log.debug('%s: naux=%d nao_pairs=%d, blocks of %d', what, naux, npair, aux_blk)
+    slab = cp.empty((aux_blk, nao, nao))
+    for p0, p1 in lib.prange(0, naux, aux_blk):
+        blk = slab[:p1 - p0]
+        blk.fill(0)
+        _scatter_pairs(blk, cp.asarray(cderi[p0:p1]), rows, cols, pair_major=False)
+        yield p0, p1, blk
+
+
+def _mo_transform(slabs, C):
+    '''C^T slabs[k] C (nk, n, n) on the device.'''
+    out = cp.empty((len(slabs), C.shape[1], C.shape[1]))
+    for k in range(len(slabs)):
+        out[k] = C.T @ (slabs[k] @ C)
+    return out
 
 
 def _aux_blocks(aux_offsets, aux_blk):

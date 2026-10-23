@@ -99,3 +99,31 @@ def test_gpu_factors_need_no_ao_cderi():
     solver = make_pprpa_gdf(mf, channel="pp", nocc_act=8, nvir_act=8, nroot=1, gpu=True)
     assert mf.with_df._cderi is None
     assert solver.Lpq.shape[1:] == (16, 16)
+
+
+def test_cderi_factors_match_streamed(diamond):
+    from lib_pprpa.grad.pprpa_gamma_gdf_gpu import make_gpu_gdf_mf
+    from lib_pprpa.gpu_gdf import cderi_active_factors, gdf_active_factors
+
+    gpu_df = make_gpu_gdf_mf(diamond).with_df
+    mo = diamond.mo_coeff[:, 4:26]
+    ref = gdf_active_factors(diamond.with_df, mo)
+    lpq = cderi_active_factors(gpu_df, mo)
+    assert lpq.shape == ref.shape and lpq.flags.c_contiguous
+    np.testing.assert_allclose(_eri(lpq), _eri(ref), rtol=0.0, atol=1e-12)
+    # a budget of a few MB splits the cderi rows into several blocks
+    small = cderi_active_factors(gpu_df, mo, max_memory=2_000_000)
+    np.testing.assert_allclose(small, lpq, rtol=0.0, atol=1e-14)
+
+
+def test_make_pprpa_gdf_reads_gpu_df(diamond):
+    from lib_pprpa.grad.pprpa_gamma_gdf_gpu import make_gpu_gdf_mf
+    from lib_pprpa.pbc_gdf import make_pprpa_gdf, validate_gdf_context
+
+    gpu_df = make_gpu_gdf_mf(diamond).with_df
+    solver = make_pprpa_gdf(diamond, channel="pp", nocc_act=8, nvir_act=8, nroot=1,
+                            gpu_df=gpu_df)
+    streamed = make_pprpa_gdf(diamond, channel="pp", nocc_act=8, nvir_act=8, nroot=1,
+                              gpu=True)
+    np.testing.assert_allclose(_eri(solver.Lpq), _eri(streamed.Lpq), rtol=0.0, atol=1e-12)
+    validate_gdf_context(solver, diamond)

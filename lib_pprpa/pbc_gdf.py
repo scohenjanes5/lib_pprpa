@@ -182,29 +182,54 @@ def validate_gdf_context(pprpa, mf):
     return context
 
 
+def _check_gpu_df(with_df, gpu_df):
+    """Reject a gpu4pyscf GDF that does not mirror ``with_df`` (the checks of
+    ``pprpa_gamma_gdf_gpu.make_gpu_gdf_mf`` for a supplied one, plus a built cderi)."""
+    mesh = with_df.mesh if with_df.mesh is not None else with_df.cell.mesh
+    if (gpu_df.cell is not with_df.cell
+            or not np.array_equal(np.asarray(gpu_df.mesh, dtype=int),
+                                  np.asarray(mesh, dtype=int))
+            or gpu_df.linear_dep_threshold != with_df.linear_dep_threshold):
+        raise ValueError("gpu_df does not match mf.with_df "
+                         "(cell, mesh or linear_dep_threshold differ)")
+    if gpu_df._cderi is None:
+        raise ValueError("gpu_df holds no cderi (gpu_df.build())")
+
+
 def get_pyscf_input_sc_gdf(
-        mf, nocc_act=None, nvir_act=None, dump_file=None, with_dip=False, gpu=False):
+        mf, nocc_act=None, nvir_act=None, dump_file=None, with_dip=False, gpu=False,
+        gpu_df=None):
     """Build the Gamma-point GDF ``Lpq`` factors used by the ppRPA operator.
 
     With ``gpu`` the active factors are built on the GPU without the AO cderi
     (:func:`lib_pprpa.gpu_gdf.gdf_active_factors`), so ``mf.with_df`` needs only its
     auxcell (``with_df.build(with_j3c=False)``); ``Lpq`` is then a pinned NumPy array.
+    ``gpu_df``, a built gpu4pyscf GDF mirroring ``mf.with_df`` (the GPU SCF's), implies
+    ``gpu``: the factors are then transformed from its cderi
+    (:func:`lib_pprpa.gpu_gdf.cderi_active_factors`) instead of evaluated again.
     """
     with_df = validate_gdf_mf(mf)
+    if gpu_df is not None:
+        _check_gpu_df(with_df, gpu_df)
+        gpu = True
     if not gpu:
         return get_pyscf_input_sc(
             mf, nocc_act=nocc_act, nvir_act=nvir_act, dump_file=dump_file,
             cholesky=False, with_dip=with_dip)
     if dump_file is not None:
         raise NotImplementedError("dump_file is written by the CPU (gpu=False) path only")
-    from lib_pprpa.gpu_gdf import gdf_active_factors
+    from lib_pprpa.gpu_gdf import cderi_active_factors, gdf_active_factors
 
     nocc = int(np.sum(mf.mo_occ) / 2)
     nvir = len(mf.mo_energy) - nocc
     nocc_act = nocc if nocc_act is None else min(nocc, nocc_act)
     nvir_act = nvir if nvir_act is None else min(nvir, nvir_act)
     window = slice(nocc - nocc_act, nocc + nvir_act)
-    lpq = gdf_active_factors(with_df, np.asarray(mf.mo_coeff)[:, window], verbose=mf.verbose)
+    mo_act = np.asarray(mf.mo_coeff)[:, window]
+    if gpu_df is None:
+        lpq = gdf_active_factors(with_df, mo_act, verbose=mf.verbose)
+    else:
+        lpq = cderi_active_factors(gpu_df, mo_act, verbose=mf.verbose)
     mo_energy = np.asarray(mf.mo_energy)[window]
     if with_dip:
         mo_dip = calculate_dipole_moment_MO(mf, nocc_act=nocc_act, nvir_act=nvir_act)
@@ -214,16 +239,18 @@ def get_pyscf_input_sc_gdf(
 
 def make_pprpa_gdf(
         mf, channel="pp", nocc_act=None, nvir_act=None, dump_file=None,
-        mu=None, gpu=False, **davidson_kwargs):
+        mu=None, gpu=False, gpu_df=None, **davidson_kwargs):
     """Construct a Davidson ppRPA solver from the reference's periodic GDF.
 
     The returned object is tagged with the exact mean-field/GDF provenance.
     Run ``pprpa.kernel('s')`` or ``pprpa.kernel('t')`` as usual, then evaluate
     the matching gradient with ``pprpa_gamma_gdf_gpu.Gradients``.  ``gpu`` builds
-    the factors on the GPU (see :func:`get_pyscf_input_sc_gdf`).
+    the factors on the GPU, ``gpu_df`` from that GDF's cderi (see
+    :func:`get_pyscf_input_sc_gdf`).
     """
     nocc, mo_energy, lpq = get_pyscf_input_sc_gdf(
-        mf, nocc_act=nocc_act, nvir_act=nvir_act, dump_file=dump_file, gpu=gpu)
+        mf, nocc_act=nocc_act, nvir_act=nvir_act, dump_file=dump_file, gpu=gpu,
+        gpu_df=gpu_df)
     pprpa = ppRPA_Davidson(
         nocc, mo_energy, lpq, channel=channel, **davidson_kwargs)
     if mu is not None:
