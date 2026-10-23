@@ -17,12 +17,12 @@ KS references in three-dimensional cells.
 from __future__ import annotations
 
 import copy
-import inspect
 
 import cupy as cp
 import numpy as np
 
 from lib_pprpa.grad import pprpa_gamma as _cpu
+from lib_pprpa.grad.gdf_jk_deriv import ejk_derivatives
 from lib_pprpa.grad.grad_utils import get_xy_full
 from lib_pprpa.grad.grad_utils_gpu_pbc import relaxed_xc_gradient as _xcg_gpu
 from lib_pprpa.grad.hcore_contracted import hcore_deriv_contracted
@@ -133,30 +133,9 @@ class _GDFDerivativeEngine:
     """One reusable GPU4PySCF three-center derivative engine (Gamma point)."""
 
     def __init__(self, gpu_mf):
-        # the Gamma-point form: pbc.df.grad.krhf sends only symmetric densities there and
-        # runs an antisymmetric one through its complex k-point path
-        from gpu4pyscf.pbc.df.grad.rhf import _jk_energy_per_atom
         from gpu4pyscf.pbc.df.int3c2e import SRInt3c2eOpt
         from gpu4pyscf.pbc.df.rsdf_builder import _guess_omega
         from gpu4pyscf.pbc.tools.k2gamma import kpts_to_kmesh
-
-        required = {
-            "hermi", "j_factor", "k_factor", "exxdiv", "omega",
-            "linear_dep_threshold",
-        }
-        try:
-            parameters = set(inspect.signature(_jk_energy_per_atom).parameters)
-        except (TypeError, ValueError) as exc:
-            raise RuntimeError(
-                "cannot inspect GPU4PySCF's periodic GDF derivative API") from exc
-        if not callable(_jk_energy_per_atom) or not required.issubset(parameters):
-            missing = ", ".join(sorted(required - parameters))
-            raise RuntimeError(
-                "the installed GPU4PySCF does not provide the GDF derivative "
-                "interface required by ppRPA (including hermi=2); missing "
-                f"parameters: {missing or 'callable implementation'}. Install "
-                "the exact compatible GPU4PySCF revision documented in the "
-                "GDF validation report.")
 
         self.gpu_mf = gpu_mf
         self.kpts = np.asarray(gpu_mf.kpts).reshape(-1, 3)
@@ -169,22 +148,23 @@ class _GDFDerivativeEngine:
         self.opt = SRInt3c2eOpt(
             cell, with_df.auxcell, _guess_omega(cell), kmesh).build()
         self.linear_dep_threshold = with_df.linear_dep_threshold
-        self._jk_energy_per_atom = _jk_energy_per_atom
 
-    def jk(self, dm, *, hermi, j_factor, k_factor, exxdiv=None):
-        """Derivative of ``j_factor*E_J - k_factor/2*E_K`` per atom."""
-        if hermi not in (1, 2):
-            raise ValueError("the periodic GDF derivative supports hermi=1 or 2")
-        if hermi == 2 and abs(j_factor) > 1e-15:
-            raise ValueError("an antisymmetric density has no Coulomb contribution")
-        dm = cp.asarray(dm)
+    def jk_sum(self, terms):
+        """Derivative of ``sum weight*(j_factor*E_J - k_factor/2*E_K)`` per atom over
+        ``terms`` of (dm, hermi, j_factor, k_factor, exxdiv, weight), dm (nao, nao) symmetric
+        for hermi=1 or antisymmetric for hermi=2 (no Coulomb part), with one pass of every
+        integral (``gdf_jk_deriv.ejk_derivatives``)."""
         nao = self.gpu_mf.cell.nao
-        if dm.shape != (nao, nao):
-            raise ValueError(f"GDF derivative density must be ({nao}, {nao})")
-        return np.asarray(self._jk_energy_per_atom(
-            self.opt, dm, hermi=hermi,
-            j_factor=j_factor, k_factor=k_factor, exxdiv=exxdiv,
-            omega=0.0, linear_dep_threshold=self.linear_dep_threshold))
+        for dm, hermi, j_factor, *_ in terms:
+            if hermi not in (1, 2):
+                raise ValueError("the periodic GDF derivative supports hermi=1 or 2")
+            if hermi == 2 and abs(j_factor) > 1e-15:
+                raise ValueError("an antisymmetric density has no Coulomb contribution")
+            if dm.shape != (nao, nao):
+                raise ValueError(f"GDF derivative density must be ({nao}, {nao})")
+        return np.asarray(ejk_derivatives(
+            self.opt, terms, omega=0.0,
+            linear_dep_threshold=self.linear_dep_threshold)[0])
 
 
 def grad_elec(pprpa_grad, xy, mult, atmlst=None):
@@ -258,12 +238,8 @@ def grad_elec(pprpa_grad, xy, mult, atmlst=None):
 
     # All reference-density Coulomb/exchange terms use the same GDF metric as
     # the ppRPA operator.  Q(D+P)-Q(P) isolates Q(D)+the D/P cross derivative.
-    de += gdf_deriv.jk(
-        tg, hermi=1, j_factor=1.0, k_factor=hybrid,
-        exxdiv=mf.exxdiv)
-    de -= gdf_deriv.jk(
-        pg, hermi=1, j_factor=1.0, k_factor=hybrid,
-        exxdiv=mf.exxdiv)
+    terms = [(tg, 1, 1.0, hybrid, mf.exxdiv, 1.0),
+             (pg, 1, 1.0, hybrid, mf.exxdiv, -1.0)]
 
     # Pair-density exchange.  GPU4PySCF's GDF derivative is the derivative of
     # -(k_factor/4) Tr[D K(D)].  k_factor=2 therefore has the ppRPA magnitude;
@@ -272,11 +248,11 @@ def grad_elec(pprpa_grad, xy, mult, atmlst=None):
     xa = (xg - xg.T) * 0.5
     xs = (xg + xg.T) * 0.5
     if float(cp.max(cp.abs(xa))) > 1e-10:
-        de += gdf_deriv.jk(
-            xa, hermi=2, j_factor=0.0, k_factor=2.0, exxdiv=None)
+        terms.append((xa, 2, 0.0, 2.0, None, 1.0))
     if float(cp.max(cp.abs(xs))) > 1e-10:
-        de -= gdf_deriv.jk(
-            xs, hermi=1, j_factor=0.0, k_factor=2.0, exxdiv=None)
+        terms.append((xs, 1, 0.0, 2.0, None, -1.0))
+    # one pass of the three-center derivative integrals for all of them
+    de += gdf_deriv.jk_sum(terms)
 
     # XC potential skeleton and its response to the relaxed density.  This
     # helper contains no Coulomb/exchange term; those are entirely GDF above.
