@@ -28,6 +28,7 @@ from lib_pprpa.grad.grad_utils_gpu_pbc import relaxed_xc_gradient as _xcg_gpu
 from lib_pprpa.grad.hcore_contracted import hcore_deriv_contracted
 from lib_pprpa.grad.pprpa import make_rdm1_relaxed_warm
 from lib_pprpa.grad.pprpa_gamma_gpu import make_gpu_vresp
+from lib_pprpa.gpu_mem import pooled
 from lib_pprpa.pbc_gdf import validate_gdf_context, validate_gdf_mf
 
 
@@ -307,7 +308,10 @@ class Gradients(_cpu.Gradients):
         self.de = None
 
     def grad_elec(self, xy, mult, atmlst):
-        return grad_elec(self, xy, mult, atmlst)
+        # the grid passes (CPHF response, hcore, Vxc) allocate blocks over gpu4pyscf's
+        # cudaMalloc threshold every iteration: pool them
+        with pooled():
+            return grad_elec(self, xy, mult, atmlst)
 
 
 Grad = Gradients
