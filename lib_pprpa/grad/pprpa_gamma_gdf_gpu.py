@@ -130,10 +130,12 @@ def make_gpu_gdf_mf(mf, gpu_df=None, gpu_grids=None):
 
 
 class _GDFDerivativeEngine:
-    """One reusable GPU4PySCF three-center derivative engine."""
+    """One reusable GPU4PySCF three-center derivative engine (Gamma point)."""
 
     def __init__(self, gpu_mf):
-        from gpu4pyscf.pbc.df.grad.krhf import _jk_energy_per_atom
+        # the Gamma-point form: pbc.df.grad.krhf sends only symmetric densities there and
+        # runs an antisymmetric one through its complex k-point path
+        from gpu4pyscf.pbc.df.grad.rhf import _jk_energy_per_atom
         from gpu4pyscf.pbc.df.int3c2e import SRInt3c2eOpt
         from gpu4pyscf.pbc.df.rsdf_builder import _guess_omega
         from gpu4pyscf.pbc.tools.k2gamma import kpts_to_kmesh
@@ -158,6 +160,8 @@ class _GDFDerivativeEngine:
 
         self.gpu_mf = gpu_mf
         self.kpts = np.asarray(gpu_mf.kpts).reshape(-1, 3)
+        if len(self.kpts) != 1 or abs(self.kpts).max() > 0:
+            raise NotImplementedError("the GDF derivative engine is Gamma-point only")
         with_df = gpu_mf.with_df
         cell = gpu_mf.cell
         kmesh = kpts_to_kmesh(
@@ -178,7 +182,7 @@ class _GDFDerivativeEngine:
         if dm.shape != (nao, nao):
             raise ValueError(f"GDF derivative density must be ({nao}, {nao})")
         return np.asarray(self._jk_energy_per_atom(
-            self.opt, dm[None], self.kpts, hermi=hermi,
+            self.opt, dm, hermi=hermi,
             j_factor=j_factor, k_factor=k_factor, exxdiv=exxdiv,
             omega=0.0, linear_dep_threshold=self.linear_dep_threshold))
 
