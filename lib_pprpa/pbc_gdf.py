@@ -15,6 +15,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
 from typing import Any
+import uuid
 
 import numpy as np
 
@@ -58,7 +59,15 @@ def _basis_signature(with_df):
 
 
 def _operator_signature(pprpa):
-    """Hash the Davidson inputs that must survive until differentiation."""
+    """Hash the Davidson inputs that must survive until differentiation.
+
+    A solver on the GPU pair operator (``make_pprpa_gdf(operator=...)``) is identified by the
+    multiplicity and token recorded when the operator was built from the GDF, so the operator
+    can be released (``pprpa_eri_gpu.release_gpu_eri``) before the gradient, which never uses it.
+    """
+    operator = getattr(pprpa, "_pbc_gdf_operator", None)
+    if operator is not None:
+        return (str(pprpa.channel), _array_digest(pprpa.mo_energy), "pair operator", *operator)
     if pprpa.Lpq is not None:
         loo = pprpa.Lpq[:, :pprpa.nocc, :pprpa.nocc]
         lvv = pprpa.Lpq[:, pprpa.nocc:, pprpa.nocc:]
@@ -145,9 +154,12 @@ def attach_gdf_context(pprpa, mf):
     the Davidson object before running it.
     """
     validate_gdf_mf(mf)
-    if pprpa._use_eri or pprpa._ao_direct:
+    if getattr(pprpa, "_pbc_gdf_operator", None) is not None:
+        if getattr(pprpa, "_gpu_eri", None) is None:
+            raise ValueError("the GDF pair operator is not attached to the ppRPA solver")
+    elif pprpa._use_eri or pprpa._ao_direct:
         raise ValueError("a GDF ppRPA solver must use Lpq, not ERI/AO-direct contractions")
-    if pprpa.Lpq is None and (pprpa.Loo is None or pprpa.Lvv is None):
+    elif pprpa.Lpq is None and (pprpa.Loo is None or pprpa.Lvv is None):
         raise ValueError("the ppRPA solver does not contain GDF Lpq factors")
     pprpa._scf = mf
     pprpa._pbc_gdf_context = PBCGDFContext(
@@ -177,7 +189,7 @@ def validate_gdf_context(pprpa, mf):
         raise RuntimeError("the recorded GDF active space no longer matches the ppRPA solver")
     if context.operator_signature != _operator_signature(pprpa):
         raise RuntimeError("the recorded GDF Davidson operator changed after construction")
-    if pprpa._use_eri or pprpa._ao_direct:
+    if getattr(pprpa, "_pbc_gdf_operator", None) is None and (pprpa._use_eri or pprpa._ao_direct):
         raise RuntimeError("the ppRPA operator is not using GDF Lpq contractions")
     return context
 
@@ -196,6 +208,22 @@ def _check_gpu_df(with_df, gpu_df):
         raise ValueError("gpu_df holds no cderi (gpu_df.build())")
 
 
+def _gpu_window(mf, nocc_act, nvir_act, dump_file, gpu_df=None):
+    """The checks of the GPU factor paths (``mf.with_df`` mirrored by ``gpu_df`` when given, no
+    ``dump_file``), then (with_df, nocc_act, nvir_act, slice of the active orbitals), the
+    requests capped by the reference."""
+    with_df = validate_gdf_mf(mf)
+    if gpu_df is not None:
+        _check_gpu_df(with_df, gpu_df)
+    if dump_file is not None:
+        raise NotImplementedError("dump_file is written by the CPU (gpu=False) path only")
+    nocc = int(np.sum(mf.mo_occ) / 2)
+    nvir = len(mf.mo_energy) - nocc
+    nocc_act = nocc if nocc_act is None else min(nocc, nocc_act)
+    nvir_act = nvir if nvir_act is None else min(nvir, nvir_act)
+    return with_df, nocc_act, nvir_act, slice(nocc - nocc_act, nocc + nvir_act)
+
+
 def get_pyscf_input_sc_gdf(
         mf, nocc_act=None, nvir_act=None, dump_file=None, with_dip=False, gpu=False,
         gpu_df=None):
@@ -208,23 +236,14 @@ def get_pyscf_input_sc_gdf(
     ``gpu``: the factors are then transformed from its cderi
     (:func:`lib_pprpa.gpu_gdf.cderi_active_factors`) instead of evaluated again.
     """
-    with_df = validate_gdf_mf(mf)
-    if gpu_df is not None:
-        _check_gpu_df(with_df, gpu_df)
-        gpu = True
-    if not gpu:
+    if not gpu and gpu_df is None:
+        validate_gdf_mf(mf)
         return get_pyscf_input_sc(
             mf, nocc_act=nocc_act, nvir_act=nvir_act, dump_file=dump_file,
             cholesky=False, with_dip=with_dip)
-    if dump_file is not None:
-        raise NotImplementedError("dump_file is written by the CPU (gpu=False) path only")
     from lib_pprpa.gpu_gdf import cderi_active_factors, gdf_active_factors
 
-    nocc = int(np.sum(mf.mo_occ) / 2)
-    nvir = len(mf.mo_energy) - nocc
-    nocc_act = nocc if nocc_act is None else min(nocc, nocc_act)
-    nvir_act = nvir if nvir_act is None else min(nvir, nvir_act)
-    window = slice(nocc - nocc_act, nocc + nvir_act)
+    with_df, nocc_act, nvir_act, window = _gpu_window(mf, nocc_act, nvir_act, dump_file, gpu_df)
     mo_act = np.asarray(mf.mo_coeff)[:, window]
     if gpu_df is None:
         lpq = gdf_active_factors(with_df, mo_act, verbose=mf.verbose)
@@ -239,7 +258,7 @@ def get_pyscf_input_sc_gdf(
 
 def make_pprpa_gdf(
         mf, channel="pp", nocc_act=None, nvir_act=None, dump_file=None,
-        mu=None, gpu=False, gpu_df=None, **davidson_kwargs):
+        mu=None, gpu=False, gpu_df=None, operator=None, **davidson_kwargs):
     """Construct a Davidson ppRPA solver from the reference's periodic GDF.
 
     The returned object is tagged with the exact mean-field/GDF provenance.
@@ -247,12 +266,34 @@ def make_pprpa_gdf(
     the matching gradient with ``pprpa_gamma_gdf_gpu.Gradients``.  ``gpu`` builds
     the factors on the GPU, ``gpu_df`` from that GDF's cderi (see
     :func:`get_pyscf_input_sc_gdf`).
+
+    With ``operator`` ('s' or 't', needs ``gpu_df``) the solver instead runs on the GPU pair
+    operator of that multiplicity, built from packed factors made on the device from the cderi
+    (:func:`lib_pprpa.gpu_gdf.cderi_pair_factors`), with no Lpq in host memory; run
+    ``pprpa.kernel(operator)``.  The gradient does not use the operator:
+    ``pprpa_eri_gpu.release_gpu_eri(pprpa)`` frees it after the kernel.
     """
-    nocc, mo_energy, lpq = get_pyscf_input_sc_gdf(
-        mf, nocc_act=nocc_act, nvir_act=nvir_act, dump_file=dump_file, gpu=gpu,
-        gpu_df=gpu_df)
-    pprpa = ppRPA_Davidson(
-        nocc, mo_energy, lpq, channel=channel, **davidson_kwargs)
+    if operator is None:
+        nocc, mo_energy, lpq = get_pyscf_input_sc_gdf(
+            mf, nocc_act=nocc_act, nvir_act=nvir_act, dump_file=dump_file, gpu=gpu,
+            gpu_df=gpu_df)
+        pprpa = ppRPA_Davidson(
+            nocc, mo_energy, lpq, channel=channel, **davidson_kwargs)
+    else:
+        if gpu_df is None:
+            raise ValueError("the GDF pair operator is built from gpu_df's cderi")
+        from lib_pprpa.gpu_gdf import cderi_pair_factors
+        from lib_pprpa.pprpa_eri_gpu import attach_gpu_eri_contraction, pair_operator_from_factors
+
+        _, nocc, _, window = _gpu_window(mf, nocc_act, nvir_act, dump_file, gpu_df)
+        factors = cderi_pair_factors(gpu_df, np.asarray(mf.mo_coeff)[:, window], nocc,
+                                     verbose=mf.verbose)
+        # the operator build pops each factor block once its strips are done
+        op = pair_operator_from_factors(factors, nocc, operator, verbose=mf.verbose)
+        pprpa = ppRPA_Davidson(
+            nocc, np.asarray(mf.mo_energy)[window], None, channel=channel, **davidson_kwargs)
+        attach_gpu_eri_contraction(pprpa, op, verbose=mf.verbose)
+        pprpa._pbc_gdf_operator = (operator, uuid.uuid4().hex)
     if mu is not None:
         pprpa.mu = mu
     return attach_gdf_context(pprpa, mf)

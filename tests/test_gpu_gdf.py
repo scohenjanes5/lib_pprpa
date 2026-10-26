@@ -215,6 +215,27 @@ def test_operator_from_cderi_factors_roots(diamond, tmp_path):
     np.testing.assert_allclose(exci["cderi"], exci["lpq"], rtol=0.0, atol=1e-10)
 
 
+def test_make_pprpa_gdf_operator_route(diamond, tmp_path):
+    import pytest
+    from lib_pprpa.pbc_gdf import make_pprpa_gdf, validate_gdf_context
+    from lib_pprpa.pprpa_eri_gpu import release_gpu_eri
+
+    _, twin = _tiered_twin(diamond, tmp_path, ndev=40, nhost=70)
+    kw = dict(channel="pp", nocc_act=8, nvir_act=8, nroot=3, residue_thresh=1e-10)
+    ref = make_pprpa_gdf(diamond, gpu_df=twin, **kw)
+    ref.kernel("t")
+    solver = make_pprpa_gdf(diamond, gpu_df=twin, operator="t", **kw)
+    assert solver.Lpq is None
+    solver.kernel("t")
+    np.testing.assert_allclose(solver.exci_t, ref.exci_t, rtol=0.0, atol=1e-10)
+    validate_gdf_context(solver, diamond)
+    # the gradient never uses the operator, so releasing it keeps the provenance
+    release_gpu_eri(solver)
+    validate_gdf_context(solver, diamond)
+    with pytest.raises(ValueError):
+        make_pprpa_gdf(diamond, operator="t", **kw)
+
+
 def test_tiered_host_share_follows_max_memory(diamond, tmp_path):
     from pyscf import lib
     from lib_pprpa.grad.pprpa_gamma_gdf_gpu import make_gpu_gdf_mf
