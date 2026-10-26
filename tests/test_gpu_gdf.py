@@ -1,5 +1,7 @@
 """GPU active-space GDF factors (lib_pprpa.gpu_gdf) against the CPU PySCF GDF."""
 
+import copy
+
 import numpy as np
 import pytest
 
@@ -127,3 +129,108 @@ def test_make_pprpa_gdf_reads_gpu_df(diamond):
                               gpu=True)
     np.testing.assert_allclose(_eri(solver.Lpq), _eri(streamed.Lpq), rtol=0.0, atol=1e-12)
     validate_gdf_context(solver, diamond)
+
+
+def _tiered_twin(diamond, tmp_path, ndev, nhost):
+    """The stock GPU GDF of ``diamond`` and a tiered twin with ndev device rows, nhost host rows
+    and the rest in a scratch file under tmp_path."""
+    from lib_pprpa.grad.pprpa_gamma_gdf_gpu import make_gpu_gdf_mf
+    from lib_pprpa.gpu_gdf import build_tiered_gdf
+
+    stock = make_gpu_gdf_mf(diamond).with_df
+    npair = stock._cderi[0].shape[1]
+    twin = copy.copy(stock)
+    twin.reset()
+    build_tiered_gdf(twin, device_bytes=ndev * 8 * npair, host_bytes=nhost * 8 * npair,
+                     scratch_dir=str(tmp_path))
+    return stock, twin
+
+
+def test_tiered_cderi_matches_stock_build(diamond, tmp_path):
+    from lib_pprpa.gpu_gdf import cderi_active_factors
+
+    stock, twin = _tiered_twin(diamond, tmp_path, ndev=40, nhost=70)
+    store = twin._cderi[0]
+    naux = stock._cderi[0].shape[0]
+    assert store.shape == stock._cderi[0].shape
+    assert (store.ndev, store.nhost) == (40, 70) and store.nfile == naux - 110
+    np.testing.assert_array_equal(twin._cderi_idx[0].get(), stock._cderi_idx[0].get())
+    full = store[0:naux].get()
+    np.testing.assert_allclose(full, stock._cderi[0], rtol=0.0, atol=1e-12)
+    # slices inside one tier and across the device/host and host/file boundaries
+    for q0, q1 in ((3, 17), (30, 50), (100, 120), (35, naux - 2), (115, naux)):
+        np.testing.assert_array_equal(store[q0:q1].get(), full[q0:q1])
+    mo = diamond.mo_coeff[:, 4:26]
+    np.testing.assert_allclose(_eri(cderi_active_factors(twin, mo)),
+                               _eri(cderi_active_factors(stock, mo)), rtol=0.0, atol=1e-12)
+
+
+def test_tiered_cderi_through_gpu4pyscf_jk(diamond, tmp_path):
+    import cupy as cp
+
+    stock, twin = _tiered_twin(diamond, tmp_path, ndev=40, nhost=70)
+    rng = np.random.default_rng(7)
+    dm = rng.standard_normal((diamond.cell.nao,) * 2)
+    dm = cp.asarray(dm + dm.T)
+    vj, vk = stock.get_jk(dm, hermi=1, exxdiv=None)
+    tj, tk = twin.get_jk(dm, hermi=1, exxdiv=None)
+    np.testing.assert_allclose(tj.get(), vj.get(), rtol=0.0, atol=1e-10)
+    np.testing.assert_allclose(tk.get(), vk.get(), rtol=0.0, atol=1e-10)
+
+
+def test_cderi_pair_factors_layout(diamond, tmp_path):
+    from lib_pprpa.gpu_gdf import cderi_active_factors, cderi_pair_factors
+    from lib_pprpa.pprpa_eri_gpu import gdf_pair_factors
+
+    _, twin = _tiered_twin(diamond, tmp_path, ndev=40, nhost=70)
+    nocc = 12
+    mo = diamond.mo_coeff[:, 4:26]
+    ref = gdf_pair_factors(cderi_active_factors(twin, mo), nocc)
+    F = cderi_pair_factors(twin, mo, nocc)
+    assert set(F) == set(ref)
+    for key in ref:
+        assert F[key].flags.c_contiguous and F[key].shape == ref[key].shape
+        np.testing.assert_allclose(F[key].get(), ref[key].get(), rtol=0.0, atol=1e-14)
+
+
+def test_operator_from_cderi_factors_roots(diamond, tmp_path):
+    from lib_pprpa.gpu_gdf import cderi_active_factors, cderi_pair_factors
+    from lib_pprpa.pprpa_davidson import ppRPA_Davidson
+    from lib_pprpa.pprpa_eri_gpu import (attach_gpu_eri_contraction, gdf_pair_operator,
+                                         pair_operator_from_factors, release_gpu_eri)
+
+    _, twin = _tiered_twin(diamond, tmp_path, ndev=40, nhost=70)
+    nocc, mo = 8, diamond.mo_coeff[:, 8:24]
+    moe = np.linspace(-1.0, 1.0, 16)
+    lpq = cderi_active_factors(twin, mo)
+    exci = {}
+    for name, op in (("lpq", gdf_pair_operator(lpq, nocc, "t")),
+                     ("cderi", pair_operator_from_factors(cderi_pair_factors(twin, mo, nocc),
+                                                          nocc, "t"))):
+        mp = ppRPA_Davidson(nocc, moe, None, channel="pp", nroot=3, residue_thresh=1e-10)
+        attach_gpu_eri_contraction(mp, op)
+        mp.kernel("t")
+        exci[name] = np.asarray(mp.exci_t)
+        release_gpu_eri(mp)
+    np.testing.assert_allclose(exci["cderi"], exci["lpq"], rtol=0.0, atol=1e-10)
+
+
+def test_tiered_host_share_follows_max_memory(diamond, tmp_path):
+    from pyscf import lib
+    from lib_pprpa.grad.pprpa_gamma_gdf_gpu import make_gpu_gdf_mf
+    from lib_pprpa.gpu_gdf import build_tiered_gdf
+
+    stock = make_gpu_gdf_mf(diamond).with_df
+    naux = stock._cderi[0].shape[0]
+    twin = copy.copy(stock)
+    used = lib.current_memory()[0]
+    # no room beside what the process holds: every row not on the device goes to scratch
+    twin.reset()
+    build_tiered_gdf(twin, device_bytes=0, max_memory=used / 2, scratch_dir=str(tmp_path))
+    store = twin._cderi[0]
+    assert (store.ndev, store.nhost, store.nfile) == (0, 0, naux)
+    np.testing.assert_allclose(store[0:naux].get(), stock._cderi[0], rtol=0.0, atol=1e-12)
+    # plenty of room: all of it in host memory
+    twin.reset()
+    build_tiered_gdf(twin, max_memory=used + 1e6)
+    assert (twin._cderi[0].nhost, twin._cderi[0].nfile) == (naux, 0)
