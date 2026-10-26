@@ -46,7 +46,7 @@ from gpu4pyscf.pbc.df.grad.rhf import _gen_metric_solver, _get_shl_pair_batch_si
 from gpu4pyscf.pbc.df.int2c2e import Int2c2eOpt, _estimate_sr_2c2e_rcut
 from gpu4pyscf.pbc.df.int3c2e import (MAX_IMGS_PER_TASK, POOL_SIZE, int3c2e_scheme,
                                       libpbc)
-from gpu4pyscf.pbc.df.rsdf_builder import LINEAR_DEP_THR
+from gpu4pyscf.pbc.df.rsdf_builder import LINEAR_DEP_THR, _precontract_j2c_aux_coeff
 from gpu4pyscf.pbc.grad.rhf import contract_h1e_dm
 from gpu4pyscf.pbc.grad.rks_stress import (
     _get_weighted_coulG_strain_derivatives as get_wcoulG)
@@ -54,11 +54,13 @@ from gpu4pyscf.pbc.gto import int1e
 from gpu4pyscf.pbc.gto.cell import get_Gv_weights
 from gpu4pyscf.pbc.tools.pbc import madelung
 
+from lib_pprpa.gpu_gdf import cderi_fit
+
 __all__ = ['ejk_derivatives']
 
 
 def ejk_derivatives(int3c2e_opt, terms, omega=None, verbose=None,
-                    linear_dep_threshold=LINEAR_DEP_THR):
+                    linear_dep_threshold=LINEAR_DEP_THR, with_df=None):
     '''Nuclear (natm, 3) and strain (3, 3) derivatives of
     sum_t weight_t * (j_factor_t E_J[dm_t] - k_factor_t/2 E_K[dm_t]) per cell, each term as
     gpu4pyscf's ``pbc.df.grad.rhf._get_ejk_derivatives(int3c2e_opt, dm, hermi, j_factor,
@@ -66,6 +68,11 @@ def ejk_derivatives(int3c2e_opt, terms, omega=None, verbose=None,
 
     terms : iterable of (dm, hermi, j_factor, k_factor, exxdiv, weight); dm a real (nao, nao)
         density, symmetric for hermi=1, antisymmetric for hermi=2 (no Coulomb energy).
+    with_df : a built gpu4pyscf GDF object of the same cell, auxiliary basis and metric
+        threshold whose cderi L = C^T (raw|pq) is stored.  The fit of the densities, metric
+        applied, is then read from it (C L.dm, C a^T L b, :func:`lib_pprpa.gpu_gdf.cderi_fit`)
+        instead of evaluated with the 0th-order integrals; C is the eigendecomposed metric
+        factor gpu4pyscf's cderi carries, the one the metric below is built from.
     '''
     cell = int3c2e_opt.cell
     auxcell = int3c2e_opt.auxcell
@@ -78,16 +85,20 @@ def ejk_derivatives(int3c2e_opt, terms, omega=None, verbose=None,
     # (left and right factors in the sorted AO order, weight * k_factor, dm, exxdiv)
     jterms = []
     kterms = []
+    jdms_orig = []      # Coulomb densities in the original AO order (cderi fit)
+    kpairs_orig = []    # exchange factors (r, l) in the original AO order (cderi fit)
     for dm, hermi, j_factor, k_factor, exxdiv, weight in terms:
         if hermi not in (1, 2):
             raise ValueError('ejk_derivatives supports hermi=1 or 2')
         dm = cp.asarray(dm, dtype=np.float64)
         if hermi == 1 and j_factor * weight != 0:
             jterms.append((cell.apply_C_mat_CT(dm), weight * j_factor))
+            jdms_orig.append(dm)
         if k_factor * weight != 0:
             factor_l, factor_r = factorize_dm(dm, hermi)
             if factor_l.shape[-1] == 0:
                 continue
+            kpairs_orig.append((factor_l if factor_r is None else factor_r, factor_l))
             factor_l = cell.apply_C_dot(factor_l, axis=0)
             factor_r = (factor_l if factor_r is None
                         else cell.apply_C_dot(factor_r, axis=0))
@@ -111,42 +122,18 @@ def ejk_derivatives(int3c2e_opt, terms, omega=None, verbose=None,
     mem_avail = mem_free - naux*nocc2*8 - nao**2*8*(nj+1)
     batch_size = max(1, min(naux, int(mem_avail*.5/(nao_pair*8))))
     assert batch_size < POOL_SIZE
-    eval_j3c, _, _, aux_offsets = int3c2e_opt.int3c2e_evaluator(
-        aux_batch_size=batch_size, cart=True)
     blksize = max(1, min(naux, int(mem_avail*.4/(nao**2*2*8))//8*8))
     log.debug1('%.3f GB free memory. nao_pair=%d naux=%d batch_size=%d blksize=%d, '
                '%d Coulomb and %d exchange terms', mem_free*1e-9, nao_pair, naux,
                batch_size, blksize, nj, len(kterms))
 
-    # 0th order 3c2e: (P|dm) of the Coulomb terms and (P|l_i r_j) of the exchange terms
     jdms = cp.stack([dm.ravel() for dm, _ in jterms]) if nj else None
-    rho = cp.zeros((nj, naux))
-    j3c_oo = [cp.empty((naux, fl.shape[1], fl.shape[1])) for fl, *_ in kterms]
-    aux0 = aux1 = 0
-    j3c_full = cp.zeros((nao, nao, blksize))
-    buf = cp.empty((batch_size, nao_pair))
-    for kbatch in range(len(aux_offsets) - 1):
-        compressed = eval_j3c(aux_batch_id=kbatch, out=buf)[:,0,:]
-        for k0, k1 in lib.prange(0, compressed.shape[1], blksize):
-            dk = k1 - k0
-            aux0, aux1 = aux1, aux1 + dk
-            j3c = j3c_full[:,:,:dk]
-            j3c[j_addr,i_addr] = j3c[i_addr,j_addr] = compressed[:,k0:k1]
-            if nj:
-                rho[:,aux0:aux1] = jdms.dot(j3c.reshape(nao*nao, dk))
-            for (factor_l, factor_r, *_), oo in zip(kterms, j3c_oo):
-                tmp = contract('pqr,pi->iqr', j3c, factor_r)
-                contract('iqr,qj->rij', tmp, factor_l, out=oo[aux0:aux1])
-    j3c_full = buf = eval_j3c = j3c = tmp = compressed = None
-    t0 = log.timer_debug1('contract dm', *t0)
-
     precision = auxcell.precision * 1e-6
     auxcell.rcut = _estimate_sr_2c2e_rcut(auxcell, int3c2e_opt.omega, precision)
     int2c2e_opt = Int2c2eOpt(auxcell)
-    j2c = int2c2e_opt.int2c2e(sort_output=False)
 
     ################################
-    # LR part 0th order
+    # LR part: Fourier transforms and kernels
     ft_opt = ft_ao.FTOpt.from_intopt(int3c2e_opt)
     eval_ft = ft_opt.ft_evaluator(
         compressing=False, cart=True, original_ao_order=False)[0]
@@ -191,41 +178,75 @@ def ejk_derivatives(int3c2e_opt, terms, omega=None, verbose=None,
         tmp = contract('pqG,pi->iqG', pqG, factor_r)
         return contract('iqG,qj->ijG', tmp, factor_l)
 
-    Gblksize = g_block_size()
-    for p0, p1 in lib.prange(0, ngrids, Gblksize):
-        nGv = p1 - p0
-        auxG = ft_ao.ft_ao(auxcell, Gv[p0:p1]).T
-        auxGw = (auxG * wcoulG_LR0[p0:p1]).view(np.float64)
-        contract('iG,jG->ij', auxG.view(np.float64), auxGw, beta=1, out=j2c)
-        # conj((r|G)^{[0]}) (ij|G)^{[0]}
-        pqG = pq_g(p0, p1)
-        if nj:
-            rhoG = jdms.dot(pqG.reshape(nao*nao, nGv*2))
-            rho += rhoG.dot(auxGw.T)
-        for (factor_l, factor_r, *_), oo in zip(kterms, j3c_oo):
-            contract('rG,ijG->rij', auxGw, ij_g(pqG, factor_l, factor_r), beta=1, out=oo)
-    pqG = auxG = auxGw = rhoG = None
+    if with_df is None:
+        # 0th-order integrals: the SR 3c2e fit, j2c and the LR fit, then the metric
+        eval_j3c, _, _, aux_offsets = int3c2e_opt.int3c2e_evaluator(
+            aux_batch_size=batch_size, cart=True)
+        # SR 3c2e: (P|dm) of the Coulomb terms and (P|l_i r_j) of the exchange terms
+        rho = cp.zeros((nj, naux))
+        j3c_oo = [cp.empty((naux, fl.shape[1], fl.shape[1])) for fl, *_ in kterms]
+        aux0 = aux1 = 0
+        j3c_full = cp.zeros((nao, nao, blksize))
+        buf = cp.empty((batch_size, nao_pair))
+        for kbatch in range(len(aux_offsets) - 1):
+            compressed = eval_j3c(aux_batch_id=kbatch, out=buf)[:,0,:]
+            for k0, k1 in lib.prange(0, compressed.shape[1], blksize):
+                dk = k1 - k0
+                aux0, aux1 = aux1, aux1 + dk
+                j3c = j3c_full[:,:,:dk]
+                j3c[j_addr,i_addr] = j3c[i_addr,j_addr] = compressed[:,k0:k1]
+                if nj:
+                    rho[:,aux0:aux1] = jdms.dot(j3c.reshape(nao*nao, dk))
+                for (factor_l, factor_r, *_), oo in zip(kterms, j3c_oo):
+                    tmp = contract('pqr,pi->iqr', j3c, factor_r)
+                    contract('iqr,qj->rij', tmp, factor_l, out=oo[aux0:aux1])
+        j3c_full = buf = eval_j3c = j3c = tmp = compressed = None
+        t0 = log.timer_debug1('contract dm', *t0)
 
-    ################################
-    # (d/dX P|Q) contributions
-    j2c = auxcell.apply_CT_mat_C(j2c)
-    if auxcell.cell.cart:
-        raise NotImplementedError
-    aux_coeff = cp.asarray(auxcell.ctr_coeff)
-    solve_j2c = _gen_metric_solver(j2c, linear_dep_threshold, auxcell.dimension)
-    metric = aux_coeff.dot(solve_j2c(aux_coeff.T))
-    j2c = aux_coeff = solve_j2c = None
-    # the metric acts on the auxiliary index only: transform the exchange blocks in place
-    dm_oo = j3c_oo
-    for (factor_l, *_), oo in zip(kterms, dm_oo):
-        nocc = factor_l.shape[1]
-        occ_blk = min(nocc, int(get_avail_mem(exclude_memory_pool=True)*.4//(naux*nocc*8)))
-        if occ_blk < 1:
-            raise RuntimeError('Insufficient GPU memory for GDF gradient metric')
-        for i0, i1 in lib.prange(0, nocc, occ_blk):
-            oo[:,i0:i1] = contract('uv,vij->uij', metric, oo[:,i0:i1])
-    auxvec = rho.dot(metric.T)          # fitted Coulomb densities, (nj, naux)
-    metric = rho = j3c_oo = None
+        j2c = int2c2e_opt.int2c2e(sort_output=False)
+        Gblksize = g_block_size()
+        for p0, p1 in lib.prange(0, ngrids, Gblksize):
+            nGv = p1 - p0
+            auxG = ft_ao.ft_ao(auxcell, Gv[p0:p1]).T
+            auxGw = (auxG * wcoulG_LR0[p0:p1]).view(np.float64)
+            contract('iG,jG->ij', auxG.view(np.float64), auxGw, beta=1, out=j2c)
+            # conj((r|G)^{[0]}) (ij|G)^{[0]}
+            pqG = pq_g(p0, p1)
+            if nj:
+                rhoG = jdms.dot(pqG.reshape(nao*nao, nGv*2))
+                rho += rhoG.dot(auxGw.T)
+            for (factor_l, factor_r, *_), oo in zip(kterms, j3c_oo):
+                contract('rG,ijG->rij', auxGw, ij_g(pqG, factor_l, factor_r), beta=1, out=oo)
+        pqG = auxG = auxGw = rhoG = None
+
+
+        ################################
+        # (d/dX P|Q) contributions
+        j2c = auxcell.apply_CT_mat_C(j2c)
+        if auxcell.cell.cart:
+            raise NotImplementedError
+        aux_coeff = cp.asarray(auxcell.ctr_coeff)
+        solve_j2c = _gen_metric_solver(j2c, linear_dep_threshold, auxcell.dimension)
+        metric = aux_coeff.dot(solve_j2c(aux_coeff.T))
+        j2c = aux_coeff = solve_j2c = None
+        # the metric acts on the auxiliary index only: transform the exchange blocks in place
+        dm_oo = [_aux_apply(metric, oo, out=oo) for oo in j3c_oo]
+        auxvec = rho.dot(metric.T)          # fitted Coulomb densities, (nj, naux)
+        metric = rho = j3c_oo = None
+    else:
+        # the fit from the stored cderi L = C^T (raw|pq): (raw|.) metric-applied = C L.(.)
+        aux_coeff = cp.asarray(_precontract_j2c_aux_coeff(
+            auxcell, None, 0, int3c2e_opt.omega, linear_dep_threshold)[0][0])
+        if aux_coeff.shape[0] != naux:
+            raise ValueError("with_df's auxiliary basis is not the integrals' one")
+        rho_df, blocks = cderi_fit(with_df, jdms_orig, kpairs_orig, verbose=verbose)
+        if rho_df.shape[1] != aux_coeff.shape[1]:
+            raise ValueError('with_df: its cderi was fitted with another metric truncation')
+        auxvec = rho_df.dot(aux_coeff.T)
+        rho_df = None
+        dm_oo = [_aux_apply(aux_coeff, blk) for blk in blocks]
+        blocks = aux_coeff = None
+        t0 = log.timer_debug1('fit from the cderi', *t0)
     jw = cp.asarray([w for _, w in jterms])
 
     dm_aux = contract('ti,tj->ij', auxvec * jw[:,None], auxvec) if nj else cp.zeros((naux, naux))
@@ -427,3 +448,15 @@ def ejk_derivatives(int3c2e_opt, terms, omega=None, verbose=None,
             sigma -= fac * exx_1 * ek_G0
             sigma -= 2 * fac * exx_0 * int1e.ovlp_strain_deriv(cell.cell, k_dm, kpts)
     return ejk, sigma
+
+
+def _aux_apply(m, blk, out=None):
+    '''out[:, i] = m @ blk[:, i] over the auxiliary (leading) index of blk (n, ni, nj), in
+    slices of i within the free memory; ``out`` may be ``blk`` itself when m is square.'''
+    ni, nj = blk.shape[1], blk.shape[2]
+    if out is None:
+        out = cp.empty((m.shape[0], ni, nj))
+    step = min(ni, max(1, int(get_avail_mem(exclude_memory_pool=True)*.4 // (m.shape[0]*nj*8))))
+    for i0, i1 in lib.prange(0, ni, step):
+        out[:, i0:i1] = contract('uv,vij->uij', m, blk[:, i0:i1])
+    return out

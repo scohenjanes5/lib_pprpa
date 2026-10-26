@@ -39,7 +39,7 @@ from lib_pprpa.gpu_mem import empty_pinned, free_bytes, plan_budget
 from lib_pprpa.pprpa_eri_gpu import gdf_pair_factors
 
 __all__ = ['TieredCderi', 'build_tiered_gdf', 'cderi_active_factors', 'cderi_pair_factors',
-           'gdf_active_factors']
+           'gdf_active_factors', 'cderi_fit']
 
 # cudaMemcpyDefault: the direction follows from the (unified) addresses
 _MEMCPY_DEFAULT = 4
@@ -233,6 +233,40 @@ def cderi_pair_factors(gpu_df, mo_act, nocc, max_memory=None, verbose=None):
     log.timer('GDF pair factors from cderi', *t0)
     return F
 
+
+
+def cderi_fit(gpu_df, dms, pairs, max_memory=None, verbose=None):
+    '''The density fit the GDF energy derivatives need, from the compressed AO cderi
+    L = C^T (raw|pq) of a built gpu4pyscf Gamma-point GDF object ``gpu_df`` in one pass.
+
+    dms : (nj, nao, nao) symmetric densities in the original AO order.
+    pairs : [(a, b)] of (nao, ra) and (nao, rb) matrices in the original AO order.
+    Kwargs:
+        max_memory : device bytes the blocks may fill (default: the free device memory).
+    Returns:
+        rho (nj, naux) with rho[t, P] = sum_pq L[P, pq] dms[t, p, q], and per pair a CuPy
+        array (naux, ra, rb) of a^T L_P b, both in the cderi's auxiliary basis.
+    '''
+    log = logger.new_logger(gpu_df.cell, verbose)
+    t0 = log.init_timer()
+    naux = _cderi(gpu_df, 'cderi_fit').shape[0]
+    nao = gpu_df.cell.nao
+    dms = cp.asarray(dms, dtype=np.float64).reshape(-1, nao * nao)
+    nj = dms.shape[0]
+    pairs = [(cp.asarray(a, dtype=np.float64), cp.asarray(b, dtype=np.float64))
+             for a, b in pairs]
+    rho = cp.zeros((nj, naux))
+    blocks = [cp.empty((naux, a.shape[1], b.shape[1])) for a, b in pairs]
+    rb_max = max([b.shape[1] for _, b in pairs], default=0)
+    # per function besides its cderi row and slab: the half-transformed slab of one pair
+    for p0, p1, blk in _cderi_blocks(gpu_df, 8 * nao * rb_max, max_memory, 'GDF fit from cderi',
+                                     log):
+        if nj:
+            rho[:, p0:p1] = dms.dot(blk.reshape(p1 - p0, nao * nao).T)
+        for (a, b), out in zip(pairs, blocks):
+            cp.matmul(a.T, cp.matmul(blk, b), out=out[p0:p1])
+    log.timer('GDF fit from cderi', *t0)
+    return rho, blocks
 
 class TieredCderi:
     '''Gamma-point cderi (naux, npair) with rows [0, ndev) in device memory, [ndev, ndev + nhost)

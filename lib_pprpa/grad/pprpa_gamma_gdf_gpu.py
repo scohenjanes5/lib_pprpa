@@ -163,9 +163,13 @@ class _GDFDerivativeEngine:
                 raise ValueError("an antisymmetric density has no Coulomb contribution")
             if dm.shape != (nao, nao):
                 raise ValueError(f"GDF derivative density must be ({nao}, {nao})")
+        # the GPU reference's GDF keeps its cderi: the densities' fit is read from it
+        with_df = self.gpu_mf.with_df
+        if getattr(with_df, '_cderi', None) is None:
+            with_df = None
         return np.asarray(ejk_derivatives(
             self.opt, terms, omega=0.0,
-            linear_dep_threshold=self.linear_dep_threshold)[0])
+            linear_dep_threshold=self.linear_dep_threshold, with_df=with_df)[0])
 
 
 def grad_elec(pprpa_grad, xy, mult, atmlst=None):

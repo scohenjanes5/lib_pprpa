@@ -92,3 +92,18 @@ def test_gamma_antisymmetric_matches_kpoint_path(engine):
         engine.opt, xa[None], engine.kpts, hermi=2, j_factor=0.0, k_factor=2.0,
         exxdiv=None, omega=0.0, linear_dep_threshold=engine.linear_dep_threshold))
     np.testing.assert_allclose(de, ref, rtol=0, atol=1e-9 * max(1.0, abs(ref).max()))
+
+
+@pytest.mark.parametrize("hybrid", [0.0, 0.25])
+def test_fit_from_cderi_matches_integrals(engine, hybrid):
+    """The densities' fit read from the reference GDF's stored cderi (C L.dm, C a^T L b) gives
+    the derivatives of the fit from the 0th-order integrals and the metric."""
+    from lib_pprpa.grad.gdf_jk_deriv import ejk_derivatives
+    t, p, xa, xs = _densities(engine.gpu_mf.cell.nao)
+    terms = [(t, 1, 1.0, hybrid, None, 1.0), (p, 1, 1.0, hybrid, None, -1.0),
+             (xa, 2, 0.0, 2.0, None, 1.0), (xs, 1, 0.0, 2.0, None, -1.0)]
+    kw = dict(omega=0.0, linear_dep_threshold=engine.linear_dep_threshold)
+    ref, ref_sigma = ejk_derivatives(engine.opt, terms, **kw)
+    de, sigma = ejk_derivatives(engine.opt, terms, with_df=engine.gpu_mf.with_df, **kw)
+    np.testing.assert_allclose(de, ref, rtol=0, atol=1e-9 * max(1.0, abs(ref).max()))
+    np.testing.assert_allclose(sigma, ref_sigma, rtol=0, atol=1e-9 * max(1.0, abs(ref_sigma).max()))
