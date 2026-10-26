@@ -8,9 +8,10 @@ so a strip over the first orbitals [pa, pb) is converted on the device from the 
 rows of those orbitals alone.  ``gpu_ao2mo_pair_operator`` does that to every strip of
 the FFT ao2mo as it is built, so the Gram blocks are never stored and only M (about 2/3
 of them; B is half of oovv) reaches the host.  ``gdf_pair_operator`` does the same from
-three-index factors, whose Gram rows are one GEMM per strip.  ``attach_gpu_eri_contraction``
-takes that operator, or Gram blocks, which it converts at the first product for the
-multiplicity the solver then has.
+three-index factors, whose Gram rows are one GEMM per strip; ``pair_operator_from_factors``
+takes those factors already on the device, in the pair layout of ``gdf_pair_factors``.
+``attach_gpu_eri_contraction`` takes that operator, or Gram blocks, which it converts at
+the first product for the multiplicity the solver then has.
 """
 import math
 
@@ -26,8 +27,8 @@ from lib_pprpa.gpu_multi import default_devices, each
 from lib_pprpa.pair_operator import (STRIP_ROWS, PairOperator, operator_strips, pair_offset,
                                      pair_operator_bytes, row_strips)
 
-__all__ = ['attach_gpu_eri_contraction', 'gdf_pair_operator', 'gpu_ao2mo_pair_operator',
-           'release_gpu_eri']
+__all__ = ['attach_gpu_eri_contraction', 'gdf_pair_factors', 'gdf_pair_operator',
+           'gpu_ao2mo_pair_operator', 'pair_operator_from_factors', 'release_gpu_eri']
 
 # (ntri, full_dim) float64 arrays one product holds besides the strips: T, X, Y and
 # the two of Y^T + orb T.
@@ -111,35 +112,105 @@ def gdf_pair_operator(lpq, nocc, multi, rows=None, pair_blk=None, resident=None,
     Returns:
         A PairOperator, for ``attach_gpu_eri_contraction``.
     """
+    nocc = int(nocc)
+    nvir = lpq.shape[1] - nocc
+    factors = (_pair_factor(lpq, oa, ob, layout)          # one block on the device at a time
+               for _, _, oa, ob, layout in _factor_blocks(nocc, nvir))
+    return _gdf_operator(factors, lpq.shape[0], nocc, nvir, multi, rows, pair_blk, resident,
+                         emulate, verbose, upload=True)
+
+
+def pair_operator_from_factors(factors, nocc, multi, rows=None, pair_blk=None, resident=None,
+                               emulate=True, verbose=None):
+    """The pair-space operator of multiplicity ``multi`` ('s' or 't') from factor blocks
+    already on the device, as ``gdf_pair_operator`` builds it from lpq without the upload.
+
+    Args:
+        factors : dict {'vv': F_vv, 'oo': F_oo, 'ov': F_ov} of C-contiguous float64 CuPy
+            arrays (npair, naux), F[P, L] = lpq[L, p, q] over the pairs of
+            ``gdf_pair_factors``.  Each block is removed from the dict once its strips
+            are built, so its memory goes when the caller holds no other reference.
+    Kwargs:
+        As for ``gdf_pair_operator``.
+    Returns:
+        A PairOperator, for ``attach_gpu_eri_contraction``.
+    """
+    nocc = int(nocc)
+    naux, nvir = _check_factors(factors, nocc)
+    blocks = (factors.pop(key) for _, key, _, _, _ in _factor_blocks(nocc, nvir))
+    return _gdf_operator(blocks, naux, nocc, nvir, multi, rows, pair_blk, resident, emulate,
+                         verbose, upload=False)
+
+
+def gdf_pair_factors(lpq, nocc):
+    """The device factor blocks of ``pair_operator_from_factors`` from lpq[L, p, q] of the
+    active orbitals (occupied first): F_vv[P, L] = lpq[L, nocc + a, nocc + b] over
+    P = a (a + 1) / 2 + b, a >= b, F_oo likewise over the occupied pairs, and
+    F_ov[P, L] = lpq[L, i, nocc + a] over P = i nvir + a."""
+    nocc = int(nocc)
+    return {key: _pair_factor(lpq, oa, ob, layout)
+            for _, key, oa, ob, layout in _factor_blocks(nocc, lpq.shape[1] - nocc)}
+
+
+def _factor_blocks(nocc, nvir):
+    """[(name, key, oa, ob, layout)]: each Gram block, its key in a factors dict, the first
+    orbitals of its two pair indices in lpq, and its pair layout."""
+    return [("vvvv", "vv", nocc, nocc, _PairLayout(nvir, nvir, compact=True)),
+            ("oooo", "oo", 0, 0, _PairLayout(nocc, nocc, compact=True)),
+            ("oovv", "ov", 0, nocc, _PairLayout(nocc, nvir, compact=False))]
+
+
+def _check_factors(factors, nocc):
+    """(naux, nvir) of factor blocks with the layout of ``gdf_pair_factors``."""
+    if set(factors) != {"vv", "oo", "ov"}:
+        raise ValueError(f"factors must have the keys 'vv', 'oo', 'ov', got {sorted(factors)}")
+    F_ov = factors["ov"]
+    if F_ov.ndim != 2 or F_ov.shape[0] % nocc:
+        raise ValueError(f"factors['ov']: {F_ov.shape[0]} pair rows for nocc={nocc}")
+    nvir, naux = F_ov.shape[0] // nocc, F_ov.shape[1]
+    want = {"vv": pack_offset(nvir), "oo": pack_offset(nocc), "ov": nocc * nvir}
+    for key, F in factors.items():
+        if not (isinstance(F, cp.ndarray) and F.dtype == np.float64 and F.flags.c_contiguous
+                and F.shape == (want[key], naux)):
+            raise ValueError(f"factors[{key!r}]: expected a C-contiguous float64 CuPy array "
+                             f"of shape {(want[key], naux)}, got {type(F).__name__} "
+                             f"{getattr(F, 'dtype', None)} {getattr(F, 'shape', None)}")
+    return naux, nvir
+
+
+def _gdf_operator(factors, naux, nocc, nvir, multi, rows, pair_blk, resident, emulate, verbose,
+                  upload):
+    """The operator strip by strip, block by block, from ``factors``, which yields the
+    device factors of each block of ``_factor_blocks`` in turn; ``upload`` when it builds
+    them as it goes (their memory then counts in the block's build)."""
     if multi not in ("s", "t"):
         raise ValueError(f"multi must be 's' or 't', got {multi!r}")
     log = logger.new_logger(None, logger.NOTE if verbose is None else verbose)
     t0 = log.init_timer()
-    nocc = int(nocc)
-    naux, nvir = lpq.shape[0], lpq.shape[1] - nocc
-    blocks = (("vvvv", (nocc, nvir), (nocc, nvir)), ("oooo", (0, nocc), (0, nocc)),
-              ("oovv", (0, nocc), (nocc, nvir)))
-    layouts = [_PairLayout(nA, nB, compact=name != "oovv") for name, (_, nA), (_, nB) in blocks]
+    blocks = _factor_blocks(nocc, nvir)
     sink = _OperatorSink(nocc, nvir, multi, rows)
     need = sum(s[-1] for s in operator_strips(nocc, nvir, multi, rows))   # bound: strips only shrink
     if resident is None:
-        work = max(_gdf_block_bytes(layout, naux) + sink.device_bytes(name)
-                   for (name, _, _), layout in zip(blocks, layouts))
+        work = max(_gdf_block_bytes(layout, naux, upload) + sink.device_bytes(name)
+                   for name, _, _, _, layout in blocks)
         resident = need + work <= plan_budget(free_bytes())
     sink.device = bool(resident)
     log.info("GDF pair operator (%s): naux=%d nocc=%d nvir=%d, operator <= %.2f GB %s", multi,
              naux, nocc, nvir, need / 1e9, "on the device" if resident else "in pinned host memory")
-    for (name, (oa, _), (ob, _)), layout in zip(blocks, layouts):
-        _gdf_block(lpq, oa, ob, layout, name, sink, pair_blk, emulate, log)
+    for name, _, _, _, layout in blocks:
+        F = next(factors)        # not zip(): its reused result tuple would hold the last F
+        _gdf_block(F, layout, name, sink, pair_blk, emulate, log)
+        F = None
+        cp.get_default_memory_pool().free_all_blocks()
         t0 = log.timer(f"GDF pair operator {name}", *t0)
     return PairOperator(nocc, nvir, multi, sink.strips)
 
 
-def _gdf_block_bytes(layout, naux):
-    """Device bytes of one block's build: F, an aux slice of at most its size, and the
-    Gram strip buffers at the widest strip (PAIR_BLK_CAP pairs)."""
+def _gdf_block_bytes(layout, naux, upload):
+    """Device bytes of one block's build: the Gram strip buffers at the widest strip
+    (PAIR_BLK_CAP pairs) and, with ``upload``, F and an aux slice of at most its size."""
     b = min(PAIR_BLK_CAP, layout.npair)
-    return 16 * layout.npair * naux + 8 * b * (layout.npair + b)
+    return (16 * layout.npair * naux if upload else 0) + 8 * b * (layout.npair + b)
 
 
 def _pair_factor(lpq, oa, ob, layout):
@@ -173,10 +244,10 @@ def _gram_strip_width(layout, pair_blk, extra):
     return min(blk, layout.npair)
 
 
-def _gdf_block(lpq, oa, ob, layout, name, sink, pair_blk, emulate, log):
-    """Gram rows of block ``name`` strip by strip from the factors, each strip handed to
-    ``sink``; the tiles at or above the diagonal of a strip are dropped by _pack_tile."""
-    F = _pair_factor(lpq, oa, ob, layout)
+def _gdf_block(F, layout, name, sink, pair_blk, emulate, log):
+    """Gram rows of block ``name`` strip by strip from its device factors F, each strip
+    handed to ``sink``; the tiles at or above the diagonal of a strip are dropped by
+    _pack_tile."""
     blk = _gram_strip_width(layout, pair_blk, sink.device_bytes(name))
     tasks = layout.split(0, layout.nA, blk)
     emit = sink.prepare(name, tasks)
@@ -197,8 +268,6 @@ def _gdf_block(lpq, oa, ob, layout, name, sink, pair_blk, emulate, log):
                 cublas.gemm("N", "T", F[P0:P1], F[Q0:Q1], out=tile)
             _pack_tile(buf, tile, P0, Q0, base)
         emit(pa, pb, buf, base)
-    F = buf_all = tile_all = None
-    cp.get_default_memory_pool().free_all_blocks()
 
 
 def attach_gpu_eri_contraction(pprpa, *eri, mode="auto", rows=None, devices=None, verbose=None):

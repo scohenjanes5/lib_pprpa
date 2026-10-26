@@ -1,5 +1,6 @@
-"""The pair-space operator built from three-index factors (gdf_pair_operator) against
-the one converted from their packed Gram blocks and the CPU use_eri products."""
+"""The pair-space operator built from three-index factors (gdf_pair_operator, and
+pair_operator_from_factors from device factor blocks) against the one converted from their
+packed Gram blocks and the CPU use_eri products."""
 
 import numpy as np
 import pytest
@@ -105,3 +106,75 @@ def test_gdf_operator_under_a_tight_budget(monkeypatch):
         out.append(gpu.contraction(tv))
         mod.release_gpu_eri(gpu)
     np.testing.assert_allclose(out[1], out[0], rtol=1e-12, atol=1e-12)
+
+
+def test_pair_factors_layout():
+    """gdf_pair_factors stores F[P, L] = lpq[L, p, q] in the documented pair orders."""
+    import cupy as cp
+    from lib_pprpa.pprpa_eri_gpu import gdf_pair_factors
+    rng = np.random.default_rng(9)
+    naux, nocc, nvir = 6, 3, 4
+    L = _factors(rng, naux, nocc + nvir)
+    F = gdf_pair_factors(L, nocc)
+    assert sorted(F) == ["oo", "ov", "vv"]
+    assert all(isinstance(f, cp.ndarray) and f.flags.c_contiguous for f in F.values())
+    a, b = np.tril_indices(nvir)
+    i, j = np.tril_indices(nocc)
+    io, av = np.divmod(np.arange(nocc * nvir), nvir)
+    np.testing.assert_array_equal(F["vv"].get(), L[:, nocc + a, nocc + b].T)
+    np.testing.assert_array_equal(F["oo"].get(), L[:, i, j].T)
+    np.testing.assert_array_equal(F["ov"].get(), L[:, io, nocc + av].T)
+
+
+@pytest.mark.parametrize("multi", ("s", "t"))
+@pytest.mark.parametrize("pair_blk, resident", ((None, None), (3, False)))
+def test_operator_from_device_factors(multi, pair_blk, resident):
+    """pair_operator_from_factors gives the operator of gdf_pair_operator and lets every
+    block go once it is used: afterwards the pool holds the device strips, not the factors."""
+    import cupy as cp
+    from lib_pprpa import pprpa_eri_gpu as mod
+    rng = np.random.default_rng(11)
+    naux, nocc, nvir = 4000, 4, 6                # factors 1.8 MB, well above pool rounding
+    L = _factors(rng, naux, nocc + nvir)
+    moe = np.sort(rng.standard_normal(nocc + nvir))
+    pool = cp.get_default_memory_pool()
+    factors = mod.gdf_pair_factors(L, nocc)
+    held = sum(f.nbytes for f in factors.values())
+    before = pool.used_bytes()
+    op = mod.pair_operator_from_factors(factors, nocc, multi, pair_blk=pair_blk,
+                                        resident=resident)
+    assert factors == {}
+    on_device = sum(s[3].nbytes for s in op.strips if isinstance(s[3], cp.ndarray))
+    assert pool.used_bytes() <= before - held + on_device + 64 * 1024
+    if resident is False:
+        assert on_device == 0
+    out = []
+    for o in (mod.gdf_pair_operator(L, nocc, multi, pair_blk=pair_blk), op):
+        gpu = _solver(nocc, moe, multi)
+        tv = np.random.default_rng(13).standard_normal((3, gpu.full_dim))
+        mod.attach_gpu_eri_contraction(gpu, o)
+        out.append(gpu.contraction(tv))
+        mod.release_gpu_eri(gpu)
+    np.testing.assert_allclose(out[1], out[0], rtol=1e-13, atol=1e-13)
+
+
+def test_operator_from_factors_rejects_other_layouts():
+    """A wrong key set, block shape, dtype, memory order or host array is refused before
+    any block is taken from the dict."""
+    import cupy as cp
+    from lib_pprpa.pprpa_eri_gpu import gdf_pair_factors, pair_operator_from_factors
+    rng = np.random.default_rng(15)
+    nocc = 3
+    good = gdf_pair_factors(_factors(rng, 5, nocc + 4), nocc)
+    bad = [{k: v for k, v in good.items() if k != "oo"},
+           dict(good, vv=good["vv"][:-1]),
+           dict(good, oo=good["oo"].astype(cp.float32)),
+           dict(good, ov=cp.asfortranarray(good["ov"])),
+           dict(good, vv=good["vv"].get())]
+    for factors in bad:
+        keys = sorted(factors)
+        with pytest.raises(ValueError):
+            pair_operator_from_factors(factors, nocc, "s")
+        assert sorted(factors) == keys
+    with pytest.raises(ValueError):
+        pair_operator_from_factors(dict(good), nocc, "x")
