@@ -12,8 +12,8 @@ W=energy-weighted dm, X=pp-RPA 2-RDM amplitude density):
   hcore   : hcore_contracted.hcore_deriv_contracted(T)  (density on the mesh once)
   ovlp    : krhf_g.contract_h1e_dm(s1, W)            (note +=, W carries -dme0)
   J ref   : polarization Q(T)-Q(P) via jk_energy_per_atom(j=1,sr=lr=0), FFTDF
-  hyb K   : Q(T)-Q(P), Q = -1/2 pairing_k_force_lowrank(mo, M) with the hybrid's
-            hyb SR + alpha LR kernel, FFT                (hybrids)
+  hyb K   : Q(T)-Q(P) = -1/2 [F_b(D, T) + F_b(P, D)], gpu_exchange.exchange_force with
+            the hybrid's hyb SR + alpha LR kernel, FFT    (hybrids)
   pairing : gpu_pairing_force.pairing_k_force_lowrank(C, M) for X = C M C^T, FFT
   Vxc     : 2*einsum(v1ao[1:,atom], T) from grad_utils_gpu_pbc._contract_xc_kernel
   fxc     : 1*einsum(f1vo[1:,atom], D)  (same routine; factor 1 = CPU's 0.5*..*2)
@@ -22,8 +22,8 @@ W=energy-weighted dm, X=pp-RPA 2-RDM amplitude density):
 Key conventions / gpu4pyscf quirks (see also grad_utils_gpu_pbc):
 * J derivatives use FFTDF (``get_j_e1`` exists, fast).  FFTDF has no ``get_k_e1``, so
   the K derivatives are the low-rank FFT force: the derivative of the SCF's own FFTDF
-  exchange energy, -1/4 tr(D K[D]) = -1/2 times the force of X = D, with D = mo M mo^T
-  (M = P_mo + diag(mo_occ) for T, P_mo for P).
+  exchange energy, -1/4 tr(D K[D]) = -1/2 times the force of X = D.  The difference of the
+  T and P terms runs through pairs that hold an occupied orbital only (nocc nmo, not nmo^2).
 * pp-RPA pairing exchange: X = [C_v, C_o] diag(x, y) [C_v, C_o]^T has rank <= nocc + nvir,
   so its force is one FFT pass over the active-MO codensities plus a gradient-AO
   pass; exact for a general X, no symmetric/antisymmetric split.
@@ -49,6 +49,7 @@ from lib_pprpa.grad.grad_utils import get_xy_full
 from lib_pprpa.grad.grad_utils_gpu_pbc import _contract_xc_kernel as _cxk_gpu
 from lib_pprpa.gpu_coulomb import exchange_coulG
 from lib_pprpa.gpu_emulation import emulation_available, fp64_emulation
+from lib_pprpa.gpu_exchange import exchange_force, factor
 from lib_pprpa.gpu_mem import pooled
 from lib_pprpa.gpu_pairing_force import (pair_exchange, pair_potential_lowrank,
                                          pairing_k_force_lowrank)
@@ -233,11 +234,16 @@ def grad_elec(pprpa_grad, xy, mult, atmlst=None):
 
     if abs(hyb) > 1e-12 or abs(alpha) > 1e-12:
         # hybrid reference exchange via the same polarization identity, on the SCF's mesh:
-        # T = mo (P_mo + n) mo^T and P = mo P_mo mo^T, each Q = -1/2 its exchange force
+        # Q = -1/2 F with F(M) = F_b(M, M) bilinear (W from the first, L from the second), so
+        # F(T) - F(P) = F_b(D, T) + F_b(P, D): W of D on every MO, W of P on the occupied ones
         coulG = exchange_coulG(cell, cell.mesh, omega, alpha, hyb, mf.exxdiv)
-        for M, sign in ((P_mo + np.diag(mf.mo_occ), -0.5), (P_mo, 0.5)):
-            de += cp.asarray(sign * pairing_k_force_lowrank(
-                cell, cell.mesh, mo, M, devices=pprpa_grad.devices, coulG=coulG))
+        occ = mf.mo_occ > 0
+        n, cocc = mf.mo_occ[occ], mo[:, occ]
+        lam_p, U_p = factor(P_mo, mo)
+        de_k = exchange_force(cell, cell.mesh, n, cocc, mo, mo @ (P_mo + np.diag(mf.mo_occ)),
+                              coulG)
+        de_k += exchange_force(cell, cell.mesh, lam_p, U_p, cocc, cocc * n, coulG)
+        de -= 0.5 * cp.asarray(de_k)
 
     de += cp.asarray(de_pairing)
 

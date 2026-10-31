@@ -55,6 +55,34 @@ def test_exchange_matches_fftdf(omega, exxdiv):
     got = cp.asnumpy(LowRankFFTDF(cell, KPTS).get_jk(dm, **args)[1])
     assert got.shape == ref.shape
     assert np.abs(got - ref).max() < 1e-10 * np.abs(ref).max()
+    # an untagged density (the SCF's initial guess) is factored over the AO basis
+    r = np.random.default_rng(2).standard_normal((cell.nao,) * 2)
+    dm_plain = cp.asarray(np.asarray(dm.get())[0] + 0.01 * (r + r.T))[None]
+    ref = cp.asnumpy(FFTDF(cell, KPTS).get_jk(dm_plain, **args)[1])
+    got = cp.asnumpy(LowRankFFTDF(cell, KPTS).get_jk(dm_plain, **args)[1])
+    assert np.abs(got - ref).max() < 1e-10 * np.abs(ref).max()
+
+
+def test_exchange_in_blocks(monkeypatch):
+    """A free-memory figure that forces ket blocks of 4, factor blocks of 12 and single-pair
+    FFT batches reproduces the one-block exchange, tagged (rank nocc) and untagged (rank nao)."""
+    import cupy as cp
+    import lib_pprpa.gpu_exchange as gx
+    from lib_pprpa.gpu_fftdf import LowRankFFTDF
+    cell = _cell()
+    kmf = _scf(cell, "pbe", lowrank=False)
+    dm = kmf.make_rdm1()
+    r = np.random.default_rng(2).standard_normal((cell.nao,) * 2)
+    dm_plain = cp.asarray(np.asarray(dm.get())[0] + 0.01 * (r + r.T))[None]
+    args = dict(hermi=1, kpts=KPTS, with_j=False, exxdiv=None)
+    one = [cp.asnumpy(LowRankFFTDF(cell, KPTS).get_jk(d, **args)[1]) for d in (dm, dm_plain)]
+    ngrid = int(np.prod(cell.mesh))
+    # plan_budget keeps 512 MiB back: 240 bytes per grid point remain
+    monkeypatch.setattr(gx, "free_bytes", lambda: 240 * ngrid + 512 * 1024**2)
+    assert gx._plan(cell, cell.mesh, cell.nao, cell.nao) == (4, 12, 1)
+    for d, ref in zip((dm, dm_plain), one):
+        got = cp.asnumpy(LowRankFFTDF(cell, KPTS).get_jk(d, **args)[1])
+        assert np.abs(got - ref).max() < 1e-12 * np.abs(ref).max()
 
 
 @pytest.mark.parametrize("xc", ("b3lyp", "hse06"))

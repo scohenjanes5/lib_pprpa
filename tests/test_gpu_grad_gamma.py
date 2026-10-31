@@ -152,22 +152,48 @@ def test_pairing_force_matches_aft(system, mult, store_phil, pairs_per_batch, mo
     assert np.abs(got - one).max() < 1e-11 * np.abs(one).max()
 
 
+def _exchange_force(cell, mo, M, coulG):
+    """F(M) = F_b(M, M) of mo M mo^T through gpu_exchange (W and L from the same density)."""
+    from lib_pprpa.gpu_exchange import exchange_force, factor
+    lam, U = factor(M, mo)
+    return exchange_force(cell, cell.mesh, lam, U, mo, mo @ M, coulG)
+
+
 # (omega, alpha, hyb): short-range only, long-range only, global
 @pytest.mark.parametrize("omega, alpha, hyb",
                          ((1.0, 0.0, 0.25), (1.0, 0.4, 0.0), (0.0, 0.25, 0.25)))
 def test_reference_exchange_force_matches_aft(system, omega, alpha, hyb):
     """-1/2 the low-rank force with the hybrid's kernel is gpu4pyscf's AFT exchange
     derivative jk_energy_per_atom(sr=hyb, lr=alpha) of the symmetric density mo M mo^T."""
-    from lib_pprpa.gpu_pairing_force import pairing_k_force_lowrank
     from lib_pprpa.gpu_coulomb import exchange_coulG
     cell, mf, _, _ = system
     mo = mf.mo_coeff
     M = 0.1 * np.random.default_rng(3).standard_normal((mo.shape[1],) * 2)
     M = np.diag(mf.mo_occ) + M + M.T
     coulG = exchange_coulG(cell, cell.mesh, omega, alpha, hyb, None)
-    got = -0.5 * pairing_k_force_lowrank(cell, cell.mesh, mo, M, coulG=coulG)
+    got = -0.5 * _exchange_force(cell, mo, M, coulG)
     ref = _aft_exchange(cell, mf, mo @ M @ mo.T, hyb, alpha, omega)
     assert np.abs(got - ref).max() < 1e-6 * np.abs(ref).max()
+
+
+def test_reference_exchange_bilinear_split(system):
+    """F(T) - F(P) = F_b(D, T) + F_b(P, D) for D = diag(mo_occ), as the gradient forms it
+    (W of D on every MO, W of P on the occupied ones)."""
+    from lib_pprpa.gpu_coulomb import exchange_coulG
+    from lib_pprpa.gpu_exchange import exchange_force, factor
+    cell, mf, _, _ = system
+    mo = mf.mo_coeff
+    P = 0.05 * np.random.default_rng(5).standard_normal((mo.shape[1],) * 2)
+    P = P + P.T
+    D = np.diag(mf.mo_occ)
+    coulG = exchange_coulG(cell, cell.mesh, 0.0, 0.25, 0.25, None)
+    ref = _exchange_force(cell, mo, D + P, coulG) - _exchange_force(cell, mo, P, coulG)
+    occ = mf.mo_occ > 0
+    n, cocc = mf.mo_occ[occ], mo[:, occ]
+    lam_p, U_p = factor(P, mo)
+    got = exchange_force(cell, cell.mesh, n, cocc, mo, mo @ (D + P), coulG)
+    got += exchange_force(cell, cell.mesh, lam_p, U_p, cocc, cocc * n, coulG)
+    assert np.abs(got - ref).max() < 1e-10 * np.abs(ref).max()
 
 
 def test_reference_exchange_force_is_fftdf_derivative(system):
@@ -177,13 +203,11 @@ def test_reference_exchange_force_is_fftdf_derivative(system):
     from pyscf.pbc import gto
     from gpu4pyscf.pbc.df import fft_jk
     from gpu4pyscf.pbc.df.fft import FFTDF
-    from lib_pprpa.gpu_pairing_force import pairing_k_force_lowrank
     from lib_pprpa.gpu_coulomb import exchange_coulG
     cell, mf, _, _ = system
     D = mf.make_rdm1()
     coulG = exchange_coulG(cell, cell.mesh, 0.0, 1.0, 1.0, None)
-    got = -0.5 * pairing_k_force_lowrank(cell, cell.mesh, mf.mo_coeff, np.diag(mf.mo_occ),
-                                         coulG=coulG)
+    got = -0.5 * _exchange_force(cell, mf.mo_coeff, np.diag(mf.mo_occ), coulG)
 
     def energy(coords):
         c = gto.Cell(atom=[[cell.atom_symbol(i), r] for i, r in enumerate(coords)],

@@ -8,11 +8,10 @@ a ``ket`` (the occupied orbitals of a CPHF iteration) it returns V @ ket directl
 Z = ao0^T (aow ket) + aow^T (ao0 ket), 2 nk / nao of a nao^2 product.  LDA/GGA, real
 symmetric D (``hermi=1``), FFTDF J; matches ``gen_response`` up to the summation order.
 
-A hybrid's exchange -K[D]/2 comes from the factors of D over the MOs, D = C M C^T with
-C = [ket, its complement in the MO span], through one FFT pass over the codensity pairs
-that hold a ket column (``gpu_pairing_force``; for a CPHF iteration nocc (nocc + 1) / 2 +
-nocc nvir pairs instead of the nao^2 of FFTDF ``get_k``).  Exact on the MO span: the ket,
-or, without one, every MO (V P with P = C C^T S the MO projector).
+A hybrid's exchange -K[D]/2 comes from the eigen-factors of D over the MOs
+(``gpu_exchange``): rank x nket codensity pairs, for a CPHF iteration 2 nocc x nocc instead
+of the nao^2 of FFTDF ``get_k``.  Exact on the MO span: the ket, or, without one, every MO
+(V P with P the S-projector onto the MOs).
 '''
 
 import numpy as np
@@ -21,7 +20,7 @@ from gpu4pyscf.pbc import tools as gtools
 from gpu4pyscf.pbc.dft.numint import _scale_ao
 
 from lib_pprpa.gpu_coulomb import exchange_coulG
-from lib_pprpa.gpu_pairing_force import pair_exchange, pair_potential_lowrank
+from lib_pprpa.gpu_exchange import exchange_ket, factor, projector
 
 __all__ = ['fused_response']
 
@@ -73,24 +72,14 @@ def fused_response(cell, kmf):
     if hybrid:
         omega, alpha, hyb = ni.rsh_and_hybrid_coeff(xc)
         coulG_k = exchange_coulG(cell, mesh, omega, alpha, hyb, kmf.exxdiv)
-        ovlp = cp.asarray(cell.pbc_intor('int1e_ovlp', hermi=1))
         mo = cp.asarray(kmf.mo_coeff[0])
-        mo_s = mo.T @ ovlp                                   # C^T S of the MOs
+        proj = projector(mo, cell.pbc_intor('int1e_ovlp', hermi=1))
 
     def exchange(dm, ket):
-        if ket is None:
-            C = mo
-        else:
-            u = cp.linalg.svd(mo_s @ ket)[0]                 # full (nmo, nmo)
-            C = cp.hstack([ket, mo @ u[:, ket.shape[1]:]])
-        cs = C.T @ ovlp
-        g = cs @ C
-        # M = g^-1 C^T S dm S C g^-1, so that C M C^T = dm on the MO span
-        M = cp.linalg.solve(g, cp.linalg.solve(g, cs @ dm @ cs.T).T)
-        W = pair_potential_lowrank(cell, mesh, C.get(), M.get(), coulG=coulG_k,
-                                   nket=None if ket is None else ket.shape[1])
-        K = cp.asarray(pair_exchange(cell, mesh, W))
-        return K if ket is not None else K @ mo_s
+        lam, U = factor(proj @ dm @ proj.T, mo)
+        K = exchange_ket(cell, mesh, lam, U, mo if ket is None else ket, coulG_k,
+                         verbose=kmf.verbose)
+        return K if ket is not None else K @ proj
 
     def respond(dm, ket=None):
         wv = potential_weights(dm)
