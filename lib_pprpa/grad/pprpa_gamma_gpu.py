@@ -12,15 +12,18 @@ W=energy-weighted dm, X=pp-RPA 2-RDM amplitude density):
   hcore   : hcore_contracted.hcore_deriv_contracted(T)  (density on the mesh once)
   ovlp    : krhf_g.contract_h1e_dm(s1, W)            (note +=, W carries -dme0)
   J ref   : polarization Q(T)-Q(P) via jk_energy_per_atom(j=1,sr=lr=0), FFTDF
-  hyb K   : Q(T)-Q(P) via jk_energy_per_atom(j=0,sr=hyb,lr=alpha), AFTDF  (hybrids)
+  hyb K   : Q(T)-Q(P), Q = -1/2 pairing_k_force_lowrank(mo, M) with the hybrid's
+            hyb SR + alpha LR kernel, FFT                (hybrids)
   pairing : gpu_pairing_force.pairing_k_force_lowrank(C, M) for X = C M C^T, FFT
   Vxc     : 2*einsum(v1ao[1:,atom], T) from grad_utils_gpu_pbc._contract_xc_kernel
   fxc     : 1*einsum(f1vo[1:,atom], D)  (same routine; factor 1 = CPU's 0.5*..*2)
   PP nl   : pp.vppnl_nuc_grad(T)
 
 Key conventions / gpu4pyscf quirks (see also grad_utils_gpu_pbc):
-* J derivatives use FFTDF (``get_j_e1`` exists, fast); K derivatives use AFTDF
-  because FFTDF ``get_k_e1`` is NotImplemented.  AFT matches FFT to ~1e-8.
+* J derivatives use FFTDF (``get_j_e1`` exists, fast).  FFTDF has no ``get_k_e1``, so
+  the K derivatives are the low-rank FFT force: the derivative of the SCF's own FFTDF
+  exchange energy, -1/4 tr(D K[D]) = -1/2 times the force of X = D, with D = mo M mo^T
+  (M = P_mo + diag(mo_occ) for T, P_mo for P).
 * pp-RPA pairing exchange: X = [C_v, C_o] diag(x, y) [C_v, C_o]^T has rank <= nocc + nvir,
   so its force is one FFT pass over the active-MO codensities plus a gradient-AO
   pass; exact for a general X, no symmetric/antisymmetric split.
@@ -32,10 +35,7 @@ Key conventions / gpu4pyscf quirks (see also grad_utils_gpu_pbc):
 
 Requirements / scope
 --------------------
-* Gamma point, RKS (or RHF) reference only; LDA/GGA functionals.
-* Hybrid functionals: the reference exchange force goes through the AFT
-  ``get_k_e1``, which at large nao needs the memory-adaptive ``blksize`` patch
-  in ``pbc/df/aft_jk.py`` (else OOM at fine grids).
+* Gamma point, RKS (or RHF) reference only; LDA/GGA and (range-separated) hybrid functionals.
 * Validated: vs CPU 2e-10 (C2 diamond, up to gth-tzv2p, singlet+triplet);
   vs finite difference 2.9e-7 (C2, off-grid).  Runs on the 63-atom NV cell.
 """
@@ -66,12 +66,14 @@ def _fused_applies(kmf):
             and ni._xc_type(kmf.xc) in ('LDA', 'GGA') and not ni.libxc.is_hybrid_xc(kmf.xc))
 
 
-def _aftdf(cell, kpts):
-    """AFTDF set up for energy-gradient J/K (FFTDF lacks get_k_e1)."""
-    from gpu4pyscf.pbc.df.aft import AFTDF
-    adf = AFTDF(cell, kpts)
-    adf.mesh = cell.mesh
-    return adf
+def _exchange_coulG(cell, mesh, omega, alpha, hyb, exxdiv):
+    '''Kernel hyb * SR(omega) + alpha * LR(omega) of the reference exchange (gpu4pyscf's
+    ``weighted_coulG`` with lr_factor=alpha, sr_factor=hyb), in ``get_coulG``'s
+    normalisation: weighted_coulG carries the FFT weight kws.'''
+    from gpu4pyscf.pbc.df.fft import FFTDF
+    kws = cp.asarray(cell.get_Gv_weights(mesh)[2])
+    return FFTDF(cell).weighted_coulG(np.zeros(3), exxdiv, mesh, omega,
+                                      lr_factor=alpha, sr_factor=hyb) / kws
 
 
 def make_gpu_vresp(cell, mf, gpu_mf=None, emulate=True):
@@ -213,10 +215,6 @@ def grad_elec(pprpa_grad, xy, mult, atmlst=None):
     kmf.mo_coeff = [cp.asarray(mo)]
     kmf.mo_energy = [cp.asarray(mf.mo_energy)]
     kmf.mo_occ = [cp.asarray(mf.mo_occ)]
-    # Main object keeps the default FFTDF: J derivatives, hcore, overlap and the
-    # XC skeletons are all far cheaper through FFT.  Exchange derivatives (pp-RPA
-    # pairing, and the hybrid reference K) have no FFT get_k_e1, so a separate
-    # AFTDF object is used only for those (built lazily below).
     gg = kmf.nuc_grad_method()
 
     ni = kmf._numint if is_ks else None
@@ -225,18 +223,6 @@ def grad_elec(pprpa_grad, xy, mult, atmlst=None):
         omega, alpha, hyb = ni.rsh_and_hybrid_coeff(mf.xc)
     else:
         omega, alpha, hyb = 0.0, 1.0, 1.0
-    exxdiv = mf.exxdiv
-
-    def _kmf_aft():
-        kf = (gdft.KRKS(cell, kpts=kpts, xc=mf.xc) if is_ks
-              else gscf.KRHF(cell, kpts=kpts))
-        kf.exxdiv = mf.exxdiv
-        kf.mo_coeff = kmf.mo_coeff
-        kf.mo_energy = kmf.mo_energy
-        kf.mo_occ = kmf.mo_occ
-        kf.with_df = _aftdf(cell, kpts)
-        kf.rsjk = None
-        return kf
 
     Dg, Pg, Tg, Wg = (cp.asarray(a) for a in (D, P, T, W))
     aoslices = cell.aoslice_by_atom()
@@ -254,14 +240,12 @@ def grad_elec(pprpa_grad, xy, mult, atmlst=None):
     de += cp.asarray(eJ[0] - eJ[1])
 
     if abs(hyb) > 1e-12 or abs(alpha) > 1e-12:
-        # hybrid reference exchange K (AFTDF) via the same polarization identity
-        kaft = _kmf_aft()
-
-        def dvk(dm):
-            return cp.asarray(krhf_g.jk_energy_per_atom(
-                kaft, dm[None], kpts, j_factor=0.0, sr_factor=hyb, lr_factor=alpha,
-                omega=omega, exxdiv=exxdiv))
-        de += dvk(Tg) - dvk(Pg)
+        # hybrid reference exchange via the same polarization identity, on the SCF's mesh:
+        # T = mo (P_mo + n) mo^T and P = mo P_mo mo^T, each Q = -1/2 its exchange force
+        coulG = _exchange_coulG(cell, cell.mesh, omega, alpha, hyb, mf.exxdiv)
+        for M, sign in ((P_mo + np.diag(mf.mo_occ), -0.5), (P_mo, 0.5)):
+            de += cp.asarray(sign * pairing_k_force_lowrank(
+                cell, cell.mesh, mo, M, devices=pprpa_grad.devices, coulG=coulG))
 
     de += cp.asarray(de_pairing)
 

@@ -1,6 +1,6 @@
-"""Gamma-point GPU pp-RPA gradient: the low-rank pairing force against the AFT
-kernel it replaces, and the full gradient against the CPU reference, with the
-CPHF warm start."""
+"""Gamma-point GPU pp-RPA gradient: the low-rank pairing and reference exchange forces
+against gpu4pyscf's AFT exchange derivative and the FFTDF exchange energy, and the full
+gradient against the CPU reference, with the CPHF warm start."""
 
 import numpy as np
 import pytest
@@ -91,32 +91,34 @@ def _dense_get_k(cell):
     return get_k
 
 
-def _aft_pairing_force(cell, mf, X):
-    """The AFT kernel the low-rank force replaces: +Q_K(antisym X) - Q_K(sym X), sr=lr=2."""
+def _aft_exchange(cell, mf, dm, sr_factor, lr_factor, omega=0.0):
+    """gpu4pyscf's AFT exchange energy derivative Q_K(dm), NumPy (natm, 3)."""
     import cupy as cp
     from gpu4pyscf.pbc import dft as gdft
+    from gpu4pyscf.pbc.df.aft import AFTDF
     from gpu4pyscf.pbc.grad import krhf as krhf_g
-    from lib_pprpa.grad.pprpa_gamma_gpu import _aftdf
     kf = gdft.KRKS(cell, kpts=KPTS, xc=mf.xc)
     kf.exxdiv = None
     kf.mo_coeff = [cp.asarray(mf.mo_coeff)]
     kf.mo_energy = [cp.asarray(mf.mo_energy)]
     kf.mo_occ = [cp.asarray(mf.mo_occ)]
-    kf.with_df = _aftdf(cell, KPTS)
+    kf.with_df = AFTDF(cell, KPTS)
+    kf.with_df.mesh = cell.mesh
     kf.rsjk = None
-    Xg = cp.asarray(X)
-    Xa, Xs = (Xg - Xg.T) * 0.5, (Xg + Xg.T) * 0.5
+    return cp.asnumpy(krhf_g.jk_energy_per_atom(
+        kf, cp.asarray(dm)[None], KPTS, j_factor=0.0, sr_factor=sr_factor,
+        lr_factor=lr_factor, omega=omega, exxdiv=None))
 
-    def pair(dm):
-        return cp.asarray(krhf_g.jk_energy_per_atom(
-            kf, dm[None], KPTS, j_factor=0.0, sr_factor=2.0, lr_factor=2.0,
-            omega=0.0, exxdiv=None))
-    de = cp.zeros((cell.natm, 3))
-    if float(cp.abs(Xa).max()) > 1e-10:
-        de += pair(Xa)
-    if float(cp.abs(Xs).max()) > 1e-10:
-        de -= pair(Xs)
-    return de.get()
+
+def _aft_pairing_force(cell, mf, X):
+    """The AFT kernel the low-rank force replaces: +Q_K(antisym X) - Q_K(sym X), sr=lr=2."""
+    Xa, Xs = (X - X.T) * 0.5, (X + X.T) * 0.5
+    de = np.zeros((cell.natm, 3))
+    if np.abs(Xa).max() > 1e-10:
+        de += _aft_exchange(cell, mf, Xa, 2.0, 2.0)
+    if np.abs(Xs).max() > 1e-10:
+        de -= _aft_exchange(cell, mf, Xs, 2.0, 2.0)
+    return de
 
 
 @pytest.mark.parametrize("mult", ("s", "t"))
@@ -148,6 +150,60 @@ def test_pairing_force_matches_aft(system, mult, store_phil, pairs_per_batch, mo
     got = pf.pairing_k_force_lowrank(cell, cell.mesh, C, M, store_phil=store_phil)
     assert np.abs(got - ref).max() < 1e-6 * np.abs(ref).max()
     assert np.abs(got - one).max() < 1e-11 * np.abs(one).max()
+
+
+# (omega, alpha, hyb): short-range only, long-range only, global
+@pytest.mark.parametrize("omega, alpha, hyb",
+                         ((1.0, 0.0, 0.25), (1.0, 0.4, 0.0), (0.0, 0.25, 0.25)))
+def test_reference_exchange_force_matches_aft(system, omega, alpha, hyb):
+    """-1/2 the low-rank force with the hybrid's kernel is gpu4pyscf's AFT exchange
+    derivative jk_energy_per_atom(sr=hyb, lr=alpha) of the symmetric density mo M mo^T."""
+    from lib_pprpa.gpu_pairing_force import pairing_k_force_lowrank
+    from lib_pprpa.grad.pprpa_gamma_gpu import _exchange_coulG
+    cell, mf, _, _ = system
+    mo = mf.mo_coeff
+    M = 0.1 * np.random.default_rng(3).standard_normal((mo.shape[1],) * 2)
+    M = np.diag(mf.mo_occ) + M + M.T
+    coulG = _exchange_coulG(cell, cell.mesh, omega, alpha, hyb, None)
+    got = -0.5 * pairing_k_force_lowrank(cell, cell.mesh, mo, M, coulG=coulG)
+    ref = _aft_exchange(cell, mf, mo @ M @ mo.T, hyb, alpha, omega)
+    assert np.abs(got - ref).max() < 1e-6 * np.abs(ref).max()
+
+
+def test_reference_exchange_force_is_fftdf_derivative(system):
+    """The low-rank force differentiates the SCF's FFTDF exchange energy -1/4 tr(D K[D]) of
+    a fixed AO density on the fixed mesh (central differences, 1e-4 bohr)."""
+    import cupy as cp
+    from pyscf.pbc import gto
+    from gpu4pyscf.pbc.df import fft_jk
+    from gpu4pyscf.pbc.df.fft import FFTDF
+    from lib_pprpa.gpu_pairing_force import pairing_k_force_lowrank
+    from lib_pprpa.grad.pprpa_gamma_gpu import _exchange_coulG
+    cell, mf, _, _ = system
+    D = mf.make_rdm1()
+    coulG = _exchange_coulG(cell, cell.mesh, 0.0, 1.0, 1.0, None)
+    got = -0.5 * pairing_k_force_lowrank(cell, cell.mesh, mf.mo_coeff, np.diag(mf.mo_occ),
+                                         coulG=coulG)
+
+    def energy(coords):
+        c = gto.Cell(atom=[[cell.atom_symbol(i), r] for i, r in enumerate(coords)],
+                     a=cell.lattice_vectors(), unit="Bohr", basis=cell.basis,
+                     pseudo=cell.pseudo, charge=cell.charge, mesh=cell.mesh, verbose=0)
+        c.build()
+        k = fft_jk.get_k(FFTDF(c, KPTS), cp.asarray(D)[None], hermi=1, kpt=np.zeros(3),
+                         exxdiv=None)
+        return -0.25 * float(cp.sum(k[0] * cp.asarray(D)))
+
+    h = 1e-4
+    x0 = cell.atom_coords()
+    fd = np.zeros_like(got)
+    for ia in range(cell.natm):
+        for x in range(3):
+            xp, xm = x0.copy(), x0.copy()
+            xp[ia, x] += h
+            xm[ia, x] -= h
+            fd[ia, x] = (energy(xp) - energy(xm)) / (2 * h)
+    assert np.abs(got - fd).max() < 1e-6 * np.abs(fd).max()
 
 
 @pytest.mark.parametrize("mult", ("s", "t"))

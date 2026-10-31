@@ -11,7 +11,7 @@ This folder has three GPU periodic examples:
   energy and analytical gradient. The reference, Davidson operator, CPHF
   response, and every two-electron derivative all use periodic GDF.
 
-The two optimization examples share the same FFT/AFT back end:
+The two optimization examples share the same FFT back end:
 
 ```
 GPU KRKS SCF (gpu4pyscf)
@@ -58,26 +58,6 @@ change.
   rewrites at every SCF.
 - Other roots of the same Davidson need only their own
   `Gradients(mp, mf, mult, istate)`, with no second SCF or Davidson.
-
-## gpu4pyscf source patch (hybrid functionals at large systems)
-The exchange terms of the pp-RPA gradient (the 2-RDM exchange of the relaxed
-density and the pairing force) are built from the low-rank factors of the pair
-densities and need no patch.  Only the hybrid reference exchange force still
-goes through the AFT kernel below, whose fixed block size OOMs at large `nao` /
-fine mesh.  It is a **pure-Python edit — no rebuild needed**, but a
-`git checkout`/reinstall of gpu4pyscf will wipe it.
-
-### `gpu4pyscf/pbc/df/aft_jk.py` — `get_ek_ip1` block size (~line 522)
-The K energy-gradient kernel under-budgets its `nao^2 * blk` arrays. Change the
-divisor factor `*2` -> `*8`:
-```python
-# from:
-blksize = int(avail_mem/(nao**2*bvk_ncells*16*2))//16*16
-# to:
-blksize = int(avail_mem/(nao**2*bvk_ncells*16*8))//16*16
-```
-
-Keep an `.orig_bak` backup next to the file; to revert, copy it back.
 
 ## MO-eri version (`pbc_pprpa_gamma_opt_nv_gpu.py`) — what it additionally needs
 
@@ -203,7 +183,7 @@ PySCF periodic GDF reference, call
 `lib_pprpa.grad.pprpa_gamma_gdf_gpu.Gradients`. The solver records the exact
 SCF orbitals, auxiliary basis, metric threshold, mesh, and GDF object identity;
 the gradient fails rather than silently mixing a different reference or an
-FFT/AFT exchange derivative.
+FFT exchange derivative.
 
 Current scope is a real restricted three-dimensional Gamma-point reference,
 the pp/hh Davidson Lpq operator, HF or LDA/GGA/global-hybrid KS, and a full

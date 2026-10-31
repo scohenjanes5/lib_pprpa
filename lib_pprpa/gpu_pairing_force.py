@@ -21,6 +21,10 @@ with K_pq = sum_jk (pj|kq) X_jk, so one ``pair_potential_lowrank`` serves the re
 density's exchange (``pair_exchange``) and the force.  With several
 ``devices`` the FFT batches of pairs are dispatched over them (``gpu_multi``) and the
 partial W are added on the first; the AO passes run on W's device.
+
+``coulG`` replaces the bare kernel W[.] (for example the weighted range-separated
+kernel of a hybrid's exchange), so the same pass is the exchange force of any
+density C M C^T on the SCF's FFT mesh.
 '''
 
 import numpy as np
@@ -41,11 +45,13 @@ __all__ = ['pairing_k_force_lowrank', 'pair_potential_lowrank', 'pair_exchange']
 _FFT_BYTES = 64
 
 
-def _potential(cell, mesh, C, M, keep, store_phil, devices, log):
+def _potential(cell, mesh, C, M, keep, store_phil, devices, log, coulG=None):
     '''W (len(keep), ngrid) CuPy on devices[0] for the columns ``keep`` of C, over the pairs
     of kept columns.  The FFT batches of pairs are dispatched over ``devices``; each rank
     accumulates its own W and the partials are added on devices[0].'''
     t0 = log.init_timer()
+    if coulG is not None:
+        coulG = cp.asnumpy(coulG)                           # copied to each rank's device
     r = len(keep)
     ngrid = int(np.prod(mesh))
     devices = default_devices(devices)
@@ -77,7 +83,8 @@ def _potential(cell, mesh, C, M, keep, store_phil, devices, log):
         return dict(phiC=phiC, Mk=Mk_d, phiL=Mk_d.T @ phiC if store_phil else None,
                     n=cp.asarray(keep[n_idx], dtype=np.int32),
                     m=cp.asarray(keep[m_idx], dtype=np.int32),
-                    w_half=half_kernel(gtools.get_coulG(cell, mesh=mesh), mesh),
+                    w_half=half_kernel(gtools.get_coulG(cell, mesh=mesh) if coulG is None
+                                       else coulG, mesh),
                     W=cp.zeros((r, ngrid)))
 
     def work(rank, st, task):
@@ -146,7 +153,7 @@ def pair_exchange(cell, mesh, W):
 
 
 def pairing_k_force_lowrank(cell, mesh, C, M, W=None, store_phil=None, devices=None,
-                            verbose=None):
+                            verbose=None, coulG=None):
     '''Pairing-exchange contribution to dE/dR, NumPy (natm, 3), for X = C M C^T.
 
     Args:
@@ -160,6 +167,8 @@ def pairing_k_force_lowrank(cell, mesh, C, M, W=None, store_phil=None, devices=N
             gpu_mem.FFT_BATCH_MIN codensities still fits beside it.
         devices : CUDA device ids the FFT pass is dispatched over when W is built here
             (default: current).
+        coulG : (ngrid,) Coulomb kernel in ``get_coulG``'s normalisation, used when W is
+            built here (default: the bare kernel).
     '''
     log = logger.new_logger(cell, verbose)
     t0 = log.init_timer()
@@ -172,7 +181,7 @@ def pairing_k_force_lowrank(cell, mesh, C, M, W=None, store_phil=None, devices=N
         keep = np.flatnonzero(np.abs(M).max(axis=0) > 0)
         if len(keep) == 0:
             return np.zeros((cell.natm, 3))
-        W = _potential(cell, mesh, C, M, keep, store_phil, devices, log)
+        W = _potential(cell, mesh, C, M, keep, store_phil, devices, log, coulG=coulG)
     else:
         keep = np.arange(C.shape[1])
     r = len(keep)

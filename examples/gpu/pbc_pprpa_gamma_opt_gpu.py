@@ -165,5 +165,4 @@ if __name__ == "__main__":
 #   * use a frozen-core active space: pprpaobj(mf, CHANNEL, AS_size=N, mo_eri=False)
 #   * for the energy solve, the MO-eri path (GPU FFT ao2mo + batched use_eri
 #     contraction) is much faster than AO-direct at large active spaces
-#   * hybrid functionals at large nao / fine mesh need the aft_jk blksize patch — see README.md
 # ---------------------------------------------------------------------------
