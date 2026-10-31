@@ -45,24 +45,27 @@ __all__ = ['pairing_k_force_lowrank', 'pair_potential_lowrank', 'pair_exchange']
 _FFT_BYTES = 64
 
 
-def _potential(cell, mesh, C, M, keep, store_phil, devices, log, coulG=None):
-    '''W (len(keep), ngrid) CuPy on devices[0] for the columns ``keep`` of C, over the pairs
-    of kept columns.  The FFT batches of pairs are dispatched over ``devices``; each rank
-    accumulates its own W and the partials are added on devices[0].'''
+def _potential(cell, mesh, C, M, keep, store_phil, devices, log, coulG=None, nket=None):
+    '''W (nket, ngrid) CuPy on devices[0] for the first ``nket`` (default all) of the columns
+    ``keep`` of C, over the pairs of kept columns that hold one of them.  The FFT batches of
+    pairs are dispatched over ``devices``; each rank accumulates its own W and the partials
+    are added on devices[0].'''
     t0 = log.init_timer()
     if coulG is not None:
         coulG = cp.asnumpy(coulG)                           # copied to each rank's device
     r = len(keep)
+    nket = r if nket is None else nket
     ngrid = int(np.prod(mesh))
     devices = default_devices(devices)
     nshare = max(devices.count(d) for d in devices)
     Mk = M[:, keep]                                         # (nC, r)
-    # pairs (n, m) with m <= n, row n contiguous; codensities index phiC
+    # pairs (n, m) with m <= n and m < nket, row n contiguous; codensities index phiC
     n_idx, m_idx = np.tril_indices(r)
+    n_idx, m_idx = n_idx[m_idx < nket], m_idx[m_idx < nket]
     npair = len(n_idx)
     with cp.cuda.Device(devices[0]):
         # planned before setup: each rank on a device holds phiC and its W
-        free = free_bytes() - nshare * (C.shape[1] + r) * ngrid * 8
+        free = free_bytes() - nshare * (C.shape[1] + nket) * ngrid * 8
     phil_bytes = nshare * r * ngrid * 8
     if store_phil is None:
         store_phil = phil_bytes + FFT_BATCH_MIN * _FFT_BYTES * ngrid <= plan_budget(free)
@@ -85,7 +88,7 @@ def _potential(cell, mesh, C, M, keep, store_phil, devices, log, coulG=None):
                     m=cp.asarray(keep[m_idx], dtype=np.int32),
                     w_half=half_kernel(gtools.get_coulG(cell, mesh=mesh) if coulG is None
                                        else coulG, mesh),
-                    W=cp.zeros((r, ngrid)))
+                    W=cp.zeros((nket, ngrid)))
 
     def work(rank, st, task):
         p0, p1 = task
@@ -110,7 +113,7 @@ def _potential(cell, mesh, C, M, keep, store_phil, devices, log, coulG=None):
                 phiL_n, phiL_m = rows_buf[k], rows_buf[:k]
             cp.multiply(phiL_n[None], Vs, out=scratch[:s1 - s0])
             W[m0:m1] += scratch[:s1 - s0]                   # W_m += phiL_n V_nm
-            if k > 0:
+            if k > 0 and n < nket:
                 cp.multiply(phiL_m, Vs[:k], out=scratch[:k])
                 W[n] += scratch[:k].sum(axis=0)             # W_n += phiL_m V_nm
 
@@ -120,7 +123,7 @@ def _potential(cell, mesh, C, M, keep, store_phil, devices, log, coulG=None):
     W = parts[0]
     with cp.cuda.Device(devices[0]):
         for rank in range(1, len(parts)):
-            for n in range(r):                              # row by row from the rank's device
+            for n in range(nket):                           # row by row from the rank's device
                 W[n] += cp.asarray(parts[rank][n])
             parts[rank] = None
     each(devices, lambda rank: cp.get_default_memory_pool().free_all_blocks())
@@ -129,20 +132,23 @@ def _potential(cell, mesh, C, M, keep, store_phil, devices, log, coulG=None):
     return W
 
 
-def pair_potential_lowrank(cell, mesh, C, M, store_phil=None, devices=None, verbose=None):
+def pair_potential_lowrank(cell, mesh, C, M, store_phil=None, devices=None, verbose=None,
+                           coulG=None, nket=None):
     '''W_m = sum_n phiL_n W[phiC_n phiC_m] for every column m of C, CuPy (nC, ngrid) on the
     first of ``devices`` (default: current), for ``pairing_k_force_lowrank(..., W=W)`` and
-    ``pair_exchange``.'''
+    ``pair_exchange``.  With ``nket`` only the first nket columns m, (nket, ngrid): the pairs
+    without one of them are skipped.  ``coulG`` as in ``pairing_k_force_lowrank``.'''
     log = logger.new_logger(cell, verbose)
     C = np.asarray(C, dtype=np.float64)
     M = np.asarray(M, dtype=np.float64)
     mesh = np.asarray(mesh, dtype=int)
-    return _potential(cell, mesh, C, M, np.arange(C.shape[1]), store_phil, devices, log)
+    return _potential(cell, mesh, C, M, np.arange(C.shape[1]), store_phil, devices, log,
+                      coulG=coulG, nket=nket)
 
 
 def pair_exchange(cell, mesh, W):
-    '''K[C M C^T] @ C, NumPy (nao, nC), from the ``pair_potential_lowrank`` grids W of C and M
-    (K_pq = sum_jk (pj|kq) D_jk, gpu4pyscf's fft_jk.get_k with hermi=0).'''
+    '''K[C M C^T] @ C[:, :len(W)], NumPy (nao, len(W)), from the ``pair_potential_lowrank``
+    grids W of C and M (K_pq = sum_jk (pj|kq) D_jk, gpu4pyscf's fft_jk.get_k with hermi=0).'''
     mesh = np.asarray(mesh, dtype=int)
     ngrid = int(np.prod(mesh))
     with W.device:

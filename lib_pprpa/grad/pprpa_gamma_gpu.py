@@ -47,6 +47,7 @@ from lib_pprpa.grad.pprpa import make_rdm1_relaxed_warm
 from lib_pprpa.grad import pprpa_gamma as _cpu
 from lib_pprpa.grad.grad_utils import get_xy_full
 from lib_pprpa.grad.grad_utils_gpu_pbc import _contract_xc_kernel as _cxk_gpu
+from lib_pprpa.gpu_coulomb import exchange_coulG
 from lib_pprpa.gpu_emulation import emulation_available, fp64_emulation
 from lib_pprpa.gpu_mem import pooled
 from lib_pprpa.gpu_pairing_force import (pair_exchange, pair_potential_lowrank,
@@ -56,32 +57,23 @@ from lib_pprpa.grad.hcore_contracted import hcore_deriv_contracted
 
 
 def _fused_applies(kmf):
-    '''``gpu_response.fused_response`` covers this KRKS: KNumInt on its uniform grids, FFTDF J,
-    LDA/GGA without exact exchange.'''
+    '''``gpu_response.fused_response`` covers this KRKS: KNumInt on its uniform grids, FFTDF J
+    and K, LDA/GGA (hybrid or not).'''
     from gpu4pyscf.pbc.df.fft import FFTDF
     from gpu4pyscf.pbc.dft.numint import KNumInt
     ni = kmf._numint
     return (type(ni) is KNumInt and type(kmf.with_df) is FFTDF
-            and kmf.j_engine is None
-            and ni._xc_type(kmf.xc) in ('LDA', 'GGA') and not ni.libxc.is_hybrid_xc(kmf.xc))
-
-
-def _exchange_coulG(cell, mesh, omega, alpha, hyb, exxdiv):
-    '''Kernel hyb * SR(omega) + alpha * LR(omega) of the reference exchange (gpu4pyscf's
-    ``weighted_coulG`` with lr_factor=alpha, sr_factor=hyb), in ``get_coulG``'s
-    normalisation: weighted_coulG carries the FFT weight kws.'''
-    from gpu4pyscf.pbc.df.fft import FFTDF
-    kws = cp.asarray(cell.get_Gv_weights(mesh)[2])
-    return FFTDF(cell).weighted_coulG(np.zeros(3), exxdiv, mesh, omega,
-                                      lr_factor=alpha, sr_factor=hyb) / kws
+            and kmf.j_engine is None and kmf.rsjk is None
+            and ni._xc_type(kmf.xc) in ('LDA', 'GGA'))
 
 
 def make_gpu_vresp(cell, mf, gpu_mf=None, emulate=True):
     """GPU CPHF response (``singlet=None, hermi=1``) for Gamma KS.
 
-    LDA/GGA on the uniform-grid KNumInt with FFTDF J run as ``gpu_response.fused_response``
-    (J inside the fxc pass, and with ``ket`` only V @ ket, the columns the CPHF iterations
-    use); everything else (hybrids, MGGA, GDF, other integrators) runs gpu4pyscf's
+    LDA/GGA (and their hybrids) on the uniform-grid KNumInt with FFTDF run as
+    ``gpu_response.fused_response`` (J inside the fxc pass, exact exchange from the MO
+    factors of D, and with ``ket`` only V @ ket, the columns the CPHF iterations
+    use); everything else (MGGA, GDF, RSJK, other integrators) runs gpu4pyscf's
     ``KRKS.gen_response``.  Both cache the XC kernel once.  ``vresp(dm, ket=None)``:
     NumPy in -> NumPy out, CuPy in -> CuPy out.  With
     ``emulate`` the response runs under cuBLAS's ``performant`` fp64 emulation where the
@@ -242,7 +234,7 @@ def grad_elec(pprpa_grad, xy, mult, atmlst=None):
     if abs(hyb) > 1e-12 or abs(alpha) > 1e-12:
         # hybrid reference exchange via the same polarization identity, on the SCF's mesh:
         # T = mo (P_mo + n) mo^T and P = mo P_mo mo^T, each Q = -1/2 its exchange force
-        coulG = _exchange_coulG(cell, cell.mesh, omega, alpha, hyb, mf.exxdiv)
+        coulG = exchange_coulG(cell, cell.mesh, omega, alpha, hyb, mf.exxdiv)
         for M, sign in ((P_mo + np.diag(mf.mo_occ), -0.5), (P_mo, 0.5)):
             de += cp.asarray(sign * pairing_k_force_lowrank(
                 cell, cell.mesh, mo, M, devices=pprpa_grad.devices, coulG=coulG))

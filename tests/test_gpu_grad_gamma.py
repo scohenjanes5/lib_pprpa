@@ -159,12 +159,12 @@ def test_reference_exchange_force_matches_aft(system, omega, alpha, hyb):
     """-1/2 the low-rank force with the hybrid's kernel is gpu4pyscf's AFT exchange
     derivative jk_energy_per_atom(sr=hyb, lr=alpha) of the symmetric density mo M mo^T."""
     from lib_pprpa.gpu_pairing_force import pairing_k_force_lowrank
-    from lib_pprpa.grad.pprpa_gamma_gpu import _exchange_coulG
+    from lib_pprpa.gpu_coulomb import exchange_coulG
     cell, mf, _, _ = system
     mo = mf.mo_coeff
     M = 0.1 * np.random.default_rng(3).standard_normal((mo.shape[1],) * 2)
     M = np.diag(mf.mo_occ) + M + M.T
-    coulG = _exchange_coulG(cell, cell.mesh, omega, alpha, hyb, None)
+    coulG = exchange_coulG(cell, cell.mesh, omega, alpha, hyb, None)
     got = -0.5 * pairing_k_force_lowrank(cell, cell.mesh, mo, M, coulG=coulG)
     ref = _aft_exchange(cell, mf, mo @ M @ mo.T, hyb, alpha, omega)
     assert np.abs(got - ref).max() < 1e-6 * np.abs(ref).max()
@@ -178,10 +178,10 @@ def test_reference_exchange_force_is_fftdf_derivative(system):
     from gpu4pyscf.pbc.df import fft_jk
     from gpu4pyscf.pbc.df.fft import FFTDF
     from lib_pprpa.gpu_pairing_force import pairing_k_force_lowrank
-    from lib_pprpa.grad.pprpa_gamma_gpu import _exchange_coulG
+    from lib_pprpa.gpu_coulomb import exchange_coulG
     cell, mf, _, _ = system
     D = mf.make_rdm1()
-    coulG = _exchange_coulG(cell, cell.mesh, 0.0, 1.0, 1.0, None)
+    coulG = exchange_coulG(cell, cell.mesh, 0.0, 1.0, 1.0, None)
     got = -0.5 * pairing_k_force_lowrank(cell, cell.mesh, mf.mo_coeff, np.diag(mf.mo_occ),
                                          coulG=coulG)
 

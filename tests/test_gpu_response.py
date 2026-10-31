@@ -1,5 +1,6 @@
-"""The fused Gamma response (J inside the fxc pass) against gpu4pyscf's KRKS.gen_response:
-the full matrix and the vir-occ block, LDA and GGA; make_gpu_vresp's routing."""
+"""The fused Gamma response (J inside the fxc pass, a hybrid's exchange from the MO factors)
+against gpu4pyscf's KRKS.gen_response: the full matrix and the columns of the occupied ket,
+for a CPHF (vir-occ) and a general density, LDA, GGA and hybrids; make_gpu_vresp's routing."""
 
 import numpy as np
 import pytest
@@ -39,13 +40,17 @@ def _trial(mf):
     return o, v, t, dm + dm.T
 
 
-@pytest.mark.parametrize("xc", ("pbe", "lda,vwn"))
+@pytest.mark.parametrize("xc", ("pbe", "lda,vwn", "pbe0", "b3lyp",
+                                "0.25*SR_HF(1.0) + 0.75*PBE, PBE",
+                                "0.4*LR_HF(1.0) + 0.6*PBE, PBE"))
 def test_fused_response_matches_gen_response(xc):
     import cupy as cp
     from gpu4pyscf.pbc import dft as gdft
     from lib_pprpa.gpu_response import fused_response
     cell, mf = _diamond(xc)
     o, v, t, dm = _trial(mf)
+    r = np.random.default_rng(1).standard_normal((cell.nao,) * 2)
+    dm_general = mf.mo_coeff @ (r + r.T) @ mf.mo_coeff.T
     kmf = gdft.KRKS(cell, kpts=np.zeros((1, 3)), xc=xc)
     kmf.exxdiv = None
     kmf.mo_coeff = cp.asarray(mf.mo_coeff)[None]
@@ -53,24 +58,30 @@ def test_fused_response_matches_gen_response(xc):
     kmf.mo_occ = cp.asarray(mf.mo_occ)[None]
     kmf.grids.build()
     nao = cell.nao
-    ref = cp.asnumpy(kmf.gen_response(singlet=None, hermi=1)(
-        cp.asarray(dm).reshape(1, 1, nao, nao))[0, 0])
+    native = kmf.gen_response(singlet=None, hermi=1)
     respond = fused_response(cell, kmf)
-    got = cp.asnumpy(respond(cp.asarray(dm)))
-    assert np.abs(got - ref).max() < 1e-10 * np.abs(ref).max()
-    got_ket = cp.asnumpy(respond(cp.asarray(dm), ket=cp.asarray(o)))
-    assert np.abs(got_ket - ref @ o).max() < 1e-10 * np.abs(ref @ o).max()
+    # the exchange's FFTs run real-to-complex: 1e-9 for hybrids
+    tol = 1e-9 if mf._numint.libxc.is_hybrid_xc(xc) else 1e-10
+    for d in (dm, dm_general):
+        ref = cp.asnumpy(native(cp.asarray(d).reshape(1, 1, nao, nao))[0, 0])
+        got = cp.asnumpy(respond(cp.asarray(d)))
+        assert np.abs(got - ref).max() < tol * np.abs(ref).max()
+        got_ket = cp.asnumpy(respond(cp.asarray(d), ket=cp.asarray(o)))
+        assert np.abs(got_ket - ref @ o).max() < tol * np.abs(ref @ o).max()
 
 
 def test_make_gpu_vresp_routes():
-    """LDA/GGA get the fused response, a hybrid gen_response; both serve ``ket``."""
+    """LDA/GGA and their hybrids on FFTDF get the fused response, GDF gen_response; the
+    response serves ``ket``."""
     from gpu4pyscf.pbc import dft as gdft
     from lib_pprpa.grad.pprpa_gamma_gpu import _fused_applies, make_gpu_vresp
     cell, mf = _diamond("pbe")
     o, v, t, dm = _trial(mf)
-    for xc, fused in (("pbe", True), ("pbe0", False)):
+    assert not _fused_applies(gdft.KRKS(cell, kpts=np.zeros((1, 3)), xc="pbe").density_fit())
+    # the ket and the full matrix factor a hybrid's density differently: 1e-9
+    for xc, tol in (("pbe", 1e-10), ("pbe0", 1e-9)):
         mf.xc = xc
-        assert _fused_applies(gdft.KRKS(cell, kpts=np.zeros((1, 3)), xc=xc)) == fused
+        assert _fused_applies(gdft.KRKS(cell, kpts=np.zeros((1, 3)), xc=xc))
         vresp = make_gpu_vresp(cell, mf, emulate=False)
         ref = vresp(dm) @ o
-        np.testing.assert_allclose(vresp(dm, ket=o), ref, rtol=0, atol=1e-10 * np.abs(ref).max())
+        np.testing.assert_allclose(vresp(dm, ket=o), ref, rtol=0, atol=tol * np.abs(ref).max())

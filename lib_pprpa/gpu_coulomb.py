@@ -21,7 +21,8 @@ from gpu4pyscf.pbc.dft import numint as gnumint
 
 from lib_pprpa.gpu_mem import free_bytes, plan_budget
 
-__all__ = ['ao_loop', 'mo_on_grid', 'codensity', 'half_kernel', 'coulomb_potential']
+__all__ = ['ao_loop', 'mo_on_grid', 'codensity', 'half_kernel', 'coulomb_potential',
+           'exchange_coulG']
 
 _KPTS0 = np.zeros((1, 3))
 _GRID_BLK_MIN = 4096
@@ -98,6 +99,16 @@ def codensity(A, B, aidx, bidx, P0, P1, out=None):
         out = cp.empty((P1 - P0, A.shape[1]))
     _CODENSITY(A, B, aidx, bidx, A.shape[1], P0, out)
     return out
+
+
+def exchange_coulG(cell, mesh, omega, alpha, hyb, exxdiv):
+    '''Kernel hyb * SR(omega) + alpha * LR(omega) of a hybrid's exact exchange (gpu4pyscf's
+    ``weighted_coulG`` with lr_factor=alpha, sr_factor=hyb; the same kernel KRKS._get_jk
+    applies), in ``get_coulG``'s normalisation: weighted_coulG carries the FFT weight kws.'''
+    from gpu4pyscf.pbc.df.fft import FFTDF
+    kws = cp.asarray(cell.get_Gv_weights(mesh)[2])
+    return FFTDF(cell).weighted_coulG(np.zeros(3), exxdiv, mesh, omega,
+                                      lr_factor=alpha, sr_factor=hyb) / kws
 
 
 def half_kernel(w_flat, mesh):
