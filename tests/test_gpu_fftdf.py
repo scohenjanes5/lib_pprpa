@@ -63,6 +63,30 @@ def test_exchange_matches_fftdf(omega, exxdiv):
     assert np.abs(got - ref).max() < 1e-10 * np.abs(ref).max()
 
 
+def test_exchange_with_padded_mos():
+    """gpu4pyscf pads the MOs of an overlap with removed eigenvalues with zero columns: the
+    exchange of such a tagged density is finite and exact on the span of the other columns."""
+    import cupy as cp
+    from gpu4pyscf.lib.cupy_helper import tag_array
+    from gpu4pyscf.pbc.df.fft import FFTDF
+    from lib_pprpa.gpu_fftdf import LowRankFFTDF
+    cell = _cell()
+    kmf = _scf(cell, "pbe", lowrank=False)
+    dm = kmf.make_rdm1()
+    mo = cp.array(kmf.mo_coeff)
+    mo[0][:, -2:] = 0                        # two virtuals, as for two removed eigenvalues
+    args = dict(hermi=1, kpts=KPTS, with_j=False, exxdiv=None)
+    got = LowRankFFTDF(cell, KPTS).get_jk(
+        tag_array(cp.asarray(dm), mo_coeff=mo, mo_occ=kmf.mo_occ), **args)[1][0]
+    assert bool(cp.isfinite(got).all())
+    K = FFTDF(cell, KPTS).get_jk(cp.asarray(dm), **args)[1][0]
+    S = cp.asarray(cell.pbc_intor("int1e_ovlp", hermi=1))
+    C = mo[0][:, :-2]
+    P = C @ cp.linalg.solve(C.T @ S @ C, C.T @ S)
+    ref = cp.asnumpy(P.T @ K @ P)
+    assert np.abs(cp.asnumpy(got) - ref).max() < 1e-10 * np.abs(ref).max()
+
+
 def test_exchange_in_blocks(monkeypatch):
     """A free-memory figure that forces ket blocks of 4, factor blocks of 12 and single-pair
     FFT batches reproduces the one-block exchange, tagged (rank nocc) and untagged (rank nao)."""

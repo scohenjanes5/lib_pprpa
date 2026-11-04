@@ -43,10 +43,14 @@ def factor(M, C):
 def projector(C, ovlp):
     '''(C^T S C)^-1 C^T S, CuPy: C @ it is the S-projector onto the span of C, so a density's
     coefficients over C are proj dm proj^T, exact whether or not C is S-orthonormal (SCF MOs
-    are only to ~1e-8 in an ill-conditioned basis).'''
+    are only to ~1e-8 in an ill-conditioned basis).  Zero columns of C get zero rows: gpu4pyscf
+    pads the MOs of an overlap with eigenvalues it removed (below 1e-6) with zero columns.'''
     C, ovlp = cp.asarray(C), cp.asarray(ovlp)
-    cs = C.T @ ovlp
-    return cp.linalg.solve(cs @ C, cs)
+    live = cp.abs(C).max(axis=0) > 0
+    cs = C[:, live].T @ ovlp
+    proj = cp.zeros((C.shape[1], C.shape[0]))
+    proj[live] = cp.linalg.solve(cs @ C[:, live], cs)
+    return proj
 
 
 def _plan(cell, mesh, nket, rank):
