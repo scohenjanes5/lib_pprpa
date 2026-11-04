@@ -29,12 +29,13 @@ def _cell():
                  unit="bohr", basis="gth-dzv", pseudo="gth-pade", mesh=[20] * 3, verbose=0)
 
 
-def _scf(cell, xc, lowrank, ace=False):
+def _scf(cell, xc, lowrank, ace=False, conv_tol_grad=None):
     from gpu4pyscf.pbc import dft as gdft
     from lib_pprpa.gpu_fftdf import LowRankFFTDF
     kmf = gdft.KRKS(cell, kpts=KPTS, xc=xc)
     kmf.exxdiv = None
     kmf.conv_tol = 1e-11
+    kmf.conv_tol_grad = conv_tol_grad
     if lowrank:
         kmf.with_df = LowRankFFTDF(cell, KPTS)
         kmf.with_df.ace = ace
@@ -174,7 +175,9 @@ def test_ace_scf(xc):
     import cupy as cp
     from lib_pprpa.gpu_fftdf import full_exchange_orbitals
     cell = _cell()
-    ref, got = _scf(cell, xc, lowrank=False), _scf(cell, xc, lowrank=True, ace=True)
+    # densities compared to 1e-6: the default orbital-gradient stop is sqrt(conv_tol) = 3e-6
+    ref, got = (_scf(cell, xc, lowrank, ace=lowrank, conv_tol_grad=1e-8)
+                for lowrank in (False, True))
     assert got.converged
     assert abs(got.e_tot - ref.e_tot) < 1e-9
     assert float(abs(cp.asarray(got.make_rdm1()) - cp.asarray(ref.make_rdm1())).max()) < 1e-6
