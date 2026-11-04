@@ -1,5 +1,6 @@
 """LowRankFFTDF: the exchange of an orbital-tagged density against gpu4pyscf's FFTDF, full,
-short- and long-range kernels, with and without the Ewald probe charge; hybrid SCF energies."""
+short- and long-range kernels, with and without the Ewald probe charge; the ACE exchange on
+the occupied orbitals; hybrid SCF energies and orbitals."""
 
 import numpy as np
 import pytest
@@ -28,7 +29,7 @@ def _cell():
                  unit="bohr", basis="gth-dzv", pseudo="gth-pade", mesh=[20] * 3, verbose=0)
 
 
-def _scf(cell, xc, lowrank):
+def _scf(cell, xc, lowrank, ace=False):
     from gpu4pyscf.pbc import dft as gdft
     from lib_pprpa.gpu_fftdf import LowRankFFTDF
     kmf = gdft.KRKS(cell, kpts=KPTS, xc=xc)
@@ -36,8 +37,31 @@ def _scf(cell, xc, lowrank):
     kmf.conv_tol = 1e-11
     if lowrank:
         kmf.with_df = LowRankFFTDF(cell, KPTS)
+        kmf.with_df.ace = ace
     kmf.kernel()
     return kmf
+
+
+@pytest.mark.parametrize("omega", (None, 0.7, -0.7))
+@pytest.mark.parametrize("exxdiv", (None, "ewald"))
+def test_ace_exact_on_occupied(omega, exxdiv):
+    """K_ace C_occ = K C_occ and Tr(D K_ace) = Tr(D K) against gpu4pyscf's FFTDF."""
+    import cupy as cp
+    from gpu4pyscf.pbc.df.fft import FFTDF
+    from lib_pprpa.gpu_fftdf import LowRankFFTDF
+    cell = _cell()
+    kmf = _scf(cell, "pbe", lowrank=False)
+    dm = kmf.make_rdm1()
+    args = dict(hermi=1, kpts=KPTS, with_j=False, omega=omega, exxdiv=exxdiv)
+    ref = FFTDF(cell, KPTS).get_jk(dm, **args)[1][0]
+    df = LowRankFFTDF(cell, KPTS)
+    df.ace = True
+    got = df.get_jk(dm, **args)[1][0]
+    cocc = cp.asarray(kmf.mo_coeff[0])[:, cp.asarray(kmf.mo_occ[0]) > 0]
+    scale = float(abs(ref @ cocc).max())
+    assert float(abs(got @ cocc - ref @ cocc).max()) < 1e-10 * scale
+    e_ref, e_got = (float(cp.einsum('ij,ji->', cp.asarray(dm[0]), k)) for k in (ref, got))
+    assert abs(e_got - e_ref) < 1e-10 * abs(e_ref)
 
 
 @pytest.mark.parametrize("omega", (None, 0.7, -0.7))
@@ -141,3 +165,22 @@ def test_hybrid_scf_energy(xc):
     ref, got = (_scf(cell, xc, lowrank) for lowrank in (False, True))
     assert got.converged
     assert abs(got.e_tot - ref.e_tot) < 1e-9
+
+
+@pytest.mark.parametrize("xc", ("b3lyp", "hse06"))
+def test_ace_scf(xc):
+    """An ACE SCF converges to the full-exchange energy and density; full_exchange_orbitals
+    then gives the full-exchange orbital energies, virtuals included."""
+    import cupy as cp
+    from lib_pprpa.gpu_fftdf import full_exchange_orbitals
+    cell = _cell()
+    ref, got = _scf(cell, xc, lowrank=False), _scf(cell, xc, lowrank=True, ace=True)
+    assert got.converged
+    assert abs(got.e_tot - ref.e_tot) < 1e-9
+    assert float(abs(cp.asarray(got.make_rdm1()) - cp.asarray(ref.make_rdm1())).max()) < 1e-6
+    # the ACE Fock lacks the virtuals' exchange
+    assert float(abs(cp.asarray(got.mo_energy) - cp.asarray(ref.mo_energy)).max()) > 1e-4
+    full_exchange_orbitals(got)
+    assert got.with_df.ace
+    assert float(abs(cp.asarray(got.mo_energy) - cp.asarray(ref.mo_energy)).max()) < 1e-6
+    assert float(abs(cp.asarray(got.make_rdm1()) - cp.asarray(ref.make_rdm1())).max()) < 1e-6

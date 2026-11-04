@@ -41,11 +41,14 @@ __all__ = ['pairing_k_force_lowrank', 'pair_potential_lowrank', 'pair_exchange']
 _FFT_BYTES = 64
 
 
-def _potential(cell, mesh, C, M, keep, store_phil, devices, log):
+def _potential(cell, mesh, C, M, keep, store_phil, devices, log, coulG=None):
     '''W (len(keep), ngrid) CuPy on devices[0] for the columns ``keep`` of C, over the pairs
     of kept columns.  The FFT batches of pairs are dispatched over ``devices``; each rank
-    accumulates its own W and the partials are added on devices[0].'''
+    accumulates its own W and the partials are added on devices[0].  ``coulG``: the kernel
+    (``get_coulG``'s normalisation, default the bare Coulomb one).'''
     t0 = log.init_timer()
+    coulG = gtools.get_coulG(cell, mesh=mesh) if coulG is None else coulG
+    coulG = cp.asnumpy(coulG)                               # each rank copies it to its device
     r = len(keep)
     ngrid = int(np.prod(mesh))
     devices = default_devices(devices)
@@ -77,7 +80,7 @@ def _potential(cell, mesh, C, M, keep, store_phil, devices, log):
         return dict(phiC=phiC, Mk=Mk_d, phiL=Mk_d.T @ phiC if store_phil else None,
                     n=cp.asarray(keep[n_idx], dtype=np.int32),
                     m=cp.asarray(keep[m_idx], dtype=np.int32),
-                    w_half=half_kernel(gtools.get_coulG(cell, mesh=mesh), mesh),
+                    w_half=half_kernel(coulG, mesh),
                     W=cp.zeros((r, ngrid)))
 
     def work(rank, st, task):
@@ -122,15 +125,18 @@ def _potential(cell, mesh, C, M, keep, store_phil, devices, log):
     return W
 
 
-def pair_potential_lowrank(cell, mesh, C, M, store_phil=None, devices=None, verbose=None):
+def pair_potential_lowrank(cell, mesh, C, M, store_phil=None, devices=None, verbose=None,
+                           coulG=None):
     '''W_m = sum_n phiL_n W[phiC_n phiC_m] for every column m of C, CuPy (nC, ngrid) on the
     first of ``devices`` (default: current), for ``pairing_k_force_lowrank(..., W=W)`` and
-    ``pair_exchange``.'''
+    ``pair_exchange``.  ``coulG``: the kernel W (default bare Coulomb; a hybrid's
+    ``gpu_coulomb.exchange_coulG``).'''
     log = logger.new_logger(cell, verbose)
     C = np.asarray(C, dtype=np.float64)
     M = np.asarray(M, dtype=np.float64)
     mesh = np.asarray(mesh, dtype=int)
-    return _potential(cell, mesh, C, M, np.arange(C.shape[1]), store_phil, devices, log)
+    return _potential(cell, mesh, C, M, np.arange(C.shape[1]), store_phil, devices, log,
+                      coulG)
 
 
 def pair_exchange(cell, mesh, W):
