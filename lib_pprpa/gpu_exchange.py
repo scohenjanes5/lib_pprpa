@@ -106,6 +106,9 @@ def exchange_ket(cell, mesh, lam, U, ket, coulG, verbose=None):
         Kb = cp.zeros((cell.nao, i1 - i0))
         for g0, g1, aoT in ao_loop(cell, mesh, extra_per_point=8 * (i1 - i0)):
             Kb += aoT @ W[:, g0:g1].T
+        # the loop variable keeps the last AO chunk, as large as the plan allowed, through
+        # the next ket block, whose budget was planned without it
+        aoT = None
         K[:, i0:i1] = Kb * (cell.vol / ngrid)
         W = None
     log.timer(f'exchange: {U.shape[1] * nket} codensity pairs', *t0)
@@ -135,7 +138,7 @@ def exchange_force(cell, mesh, lam, U, ket, L, coulG, verbose=None):
             Wc = cp.ascontiguousarray(W[:, g0:g1])
             for x in range(3):
                 G[x] += ao[1 + x].T @ Wc.T
-        W = None
+        ao = Wc = W = None             # the last AO chunk too (see exchange_ket)
         t += cp.einsum('xim,im->xi', G, L[:, i0:i1]) * (cell.vol / ngrid)
     t = t.get()
     de = np.zeros((cell.natm, 3))

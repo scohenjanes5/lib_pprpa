@@ -85,6 +85,32 @@ def test_exchange_in_blocks(monkeypatch):
         assert np.abs(got - ref).max() < 1e-12 * np.abs(ref).max()
 
 
+def test_ket_blocks_start_alike(monkeypatch):
+    """Every ket block starts with the device memory of the first: the plan is made once, so
+    nothing of a block (the last AO chunk of its projection) may stay into the next."""
+    import cupy as cp
+    import lib_pprpa.gpu_exchange as gx
+    from lib_pprpa.gpu_fftdf import LowRankFFTDF
+    cell = _cell()
+    dm = _scf(cell, "pbe", lowrank=False).make_rdm1()
+    ngrid = int(np.prod(cell.mesh))
+    monkeypatch.setattr(gx, "free_bytes", lambda: 240 * ngrid + 512 * 1024**2)
+    pool = cp.get_default_memory_pool()
+    used = []
+    grids = gx._grids
+
+    def recording(*args):
+        used.append(pool.used_bytes())
+        return grids(*args)
+
+    monkeypatch.setattr(gx, "_grids", recording)
+    LowRankFFTDF(cell, KPTS).get_jk(dm, hermi=1, kpts=KPTS, with_j=False, exxdiv=None)
+    assert len(used) > 2
+    # only the previous block's (nao, 4) K block may remain (512 bytes); a kept last AO
+    # chunk is (nao, 2000) here, 256 kB
+    assert max(used) - used[0] < 4096
+
+
 @pytest.mark.parametrize("xc", ("b3lyp", "hse06"))
 def test_hybrid_scf_energy(xc):
     cell = _cell()
