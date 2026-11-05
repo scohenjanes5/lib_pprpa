@@ -68,6 +68,10 @@ def test_fused_response_matches_gen_response(xc):
         assert np.abs(got - ref).max() < tol * np.abs(ref).max()
         got_ket = cp.asnumpy(respond(cp.asarray(d), ket=cp.asarray(o)))
         assert np.abs(got_ket - ref @ o).max() < tol * np.abs(ref @ o).max()
+    # the CPHF density stated as cross o^T + o cross^T: its o o pairs taken once
+    ref = cp.asnumpy(native(cp.asarray(dm).reshape(1, 1, nao, nao))[0, 0]) @ o
+    got = cp.asnumpy(respond(cp.asarray(dm), ket=cp.asarray(o), cross=cp.asarray(v @ t)))
+    assert np.abs(got - ref).max() < tol * np.abs(ref).max()
 
 
 def test_make_gpu_vresp_routes():
@@ -85,3 +89,34 @@ def test_make_gpu_vresp_routes():
         vresp = make_gpu_vresp(cell, mf, emulate=False)
         ref = vresp(dm) @ o
         np.testing.assert_allclose(vresp(dm, ket=o), ref, rtol=0, atol=tol * np.abs(ref).max())
+
+
+def test_cross_exchange_in_blocks(monkeypatch):
+    """exchange_cross_ket (the o o pairs of a CPHF density once) against exchange_ket of the
+    density's factors, in one FFT batch and in batches of two pairs that split the rows."""
+    import cupy as cp
+    from gpu4pyscf.pbc import tools as gtools
+    import lib_pprpa.gpu_exchange as gx
+    cell, mf = _diamond("pbe")
+    o, v, t, dm = _trial(mf)
+    coulG = gtools.get_coulG(cell, mesh=cell.mesh)
+    C = np.hstack([o, v])
+    proj = np.linalg.pinv(C)
+    lam, U = gx.factor(proj @ dm @ proj.T, C)
+    ref = cp.asnumpy(gx.exchange_ket(cell, cell.mesh, lam, U, o, coulG))
+    got = cp.asnumpy(gx.exchange_cross_ket(cell, cell.mesh, o, v @ t, coulG))
+    assert np.abs(got - ref).max() < 1e-11 * np.abs(ref).max()
+    ngrid = int(np.prod(cell.mesh))
+
+    def tight():
+        # plan_budget keeps 512 MiB back: 240 bytes per grid point, 96 of them the grids
+        return 240 * ngrid + 512 * 1024**2
+
+    monkeypatch.setattr(gx, "free_bytes", tight)
+    calls = []
+    potential = gx.coulomb_potential
+    monkeypatch.setattr(gx, "coulomb_potential",
+                        lambda rho, *a: calls.append(len(rho)) or potential(rho, *a))
+    got = cp.asnumpy(gx.exchange_cross_ket(cell, cell.mesh, o, v @ t, coulG))
+    assert max(calls) == 2
+    assert np.abs(got - ref).max() < 1e-11 * np.abs(ref).max()

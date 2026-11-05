@@ -182,7 +182,9 @@ def make_rdm1_relaxed_rhf_pprpa(
         vresp: optional response ``vresp(dm)`` -> (J + fxc + hyb K)[dm] (default
             ``mf.gen_response(singlet=None, hermi=1)``).  A response with a true
             ``accepts_ket`` attribute is called as ``vresp(dm, ket=orbI)`` and returns
-            ``vresp(dm) @ orbI`` (nao, nocc_all): only those columns are ever used.
+            ``vresp(dm) @ orbI`` (nao, nocc_all): only those columns are ever used.  One with
+            a true ``accepts_cross`` is told the CPHF density's form, ``vresp(dm, ket=orbI,
+            cross=c)`` with dm = c orbI^T + orbI c^T, device arrays.
         pair_get_k: optional callback ``pair_get_k(dms, hermi)`` for direct
             exchange contractions of the active pair density X + Y (a stack
             of one (nao, nao) matrix; one entry per matrix returned).  This
@@ -292,6 +294,7 @@ def make_rdm1_relaxed_rhf_pprpa(
     if vresp is None:
         vresp = mf.gen_response(singlet=None, hermi=1)
     accepts_ket = getattr(vresp, 'accepts_ket', False)
+    accepts_cross = getattr(vresp, 'accepts_cross', False)
 
     def vresp_occ(dm):
         # vresp(dm) @ orbI: every response below is read on the occupied columns only, and
@@ -405,7 +408,11 @@ def make_rdm1_relaxed_rhf_pprpa(
         shape = (nvir + nfrozen_vir, nocc + nfrozen_occ)
         if use_device:
             xd = cupy.asarray(x.reshape(shape)) * 2
-            dm = orbA_gpu @ xd @ orbI_gpu.T
+            cross = orbA_gpu @ xd
+            dm = cross @ orbI_gpu.T
+            if accepts_cross:
+                v = vresp(dm + dm.T, ket=orbI_gpu, cross=cross)
+                return cupy.asnumpy(orbA_gpu.T @ v).ravel()
             if accepts_ket:
                 return cupy.asnumpy(orbA_gpu.T @ vresp(dm + dm.T, ket=orbI_gpu)).ravel()
             v1ao = vresp(dm + dm.T)

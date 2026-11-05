@@ -10,6 +10,10 @@ and the exchange force of D is the same W against the gradient AOs.  One codensi
 and its W stay on the device while the factor grids are evaluated block by block, so memory is
 set by the ket block, not by the rank of D.  ``factor`` gives (lam, U) of a symmetric density
 from its coefficients over a basis (``projector``).  NumPy or CuPy coefficients; one device.
+
+A CPHF density D = c o^T + o c^T (o the occupied orbitals, c = C_v x) on the occupied kets:
+the c o^T half has the symmetric codensities o_j o_i, taken once, the o c^T half the c_j o_i,
+1.5 n^2 pairs for the 2n x n of D's factors (``exchange_cross_ket``).
 '''
 
 import numpy as np
@@ -20,7 +24,7 @@ from pyscf.lib import logger
 from lib_pprpa.gpu_coulomb import ao_loop, codensity, coulomb_potential, half_kernel, mo_on_grid
 from lib_pprpa.gpu_mem import free_bytes, max_fft_batch, plan_budget
 
-__all__ = ['factor', 'projector', 'exchange_ket', 'exchange_force']
+__all__ = ['factor', 'projector', 'exchange_ket', 'exchange_cross_ket', 'exchange_force']
 
 # Bytes per (codensity, grid point) of one coulomb_potential batch: 56.4 (codensities, half
 # spectrum, real output, two cuFFT work areas, measured on the 159^3 mesh, see gpu_ao2mo).
@@ -28,6 +32,8 @@ _FFT_BYTES = 64
 # Shares of the per-grid-point budget: ket grids + their W, factor grids; the rest is the FFT batch.
 _KET_SHARE = 0.3
 _FACTOR_SHARE = 0.4
+# exchange_cross_ket: the FFT batch plus the temporary of its W updates
+_CROSS_FFT_BYTES = _FFT_BYTES + 8
 # Eigenvalues of a factored density below this fraction of the largest are dropped.
 _RANK_TOL = 1e-13
 
@@ -117,6 +123,63 @@ def exchange_ket(cell, mesh, lam, U, ket, coulG, verbose=None):
         W = None
     log.timer(f'exchange: {U.shape[1] * nket} codensity pairs', *t0)
     return K
+
+
+def exchange_cross_ket(cell, mesh, ket, cross, coulG, verbose=None):
+    '''K[cross ket^T + ket cross^T] @ ket, CuPy (nao, n), for ket and cross (nao, n) and the
+    kernel ``coulG`` (``get_coulG``'s normalisation): a CPHF density C_v x C_o^T + h.c. on the
+    occupied orbitals (ket C_o, cross C_v x).  W_i = sum_j c_j V[o_j o_i] + o_j V[c_j o_i]
+    with both orbital sets on the grid once, the o_j o_i pairs j >= i once, one AO projection.
+    Holds the two orbital grids and W, unblocked: 24 n bytes per grid point.'''
+    log = logger.new_logger(cell, verbose)
+    t0 = log.init_timer()
+    mesh = np.asarray(mesh, dtype=int)
+    ngrid = int(np.prod(mesh))
+    n = ket.shape[1]
+    per_point = plan_budget(free_bytes()) // ngrid - 24 * n
+    pb = per_point // _CROSS_FFT_BYTES
+    if pb < 1:
+        raise MemoryError(f'cross exchange: {per_point} bytes per grid point leave no FFT batch')
+    pb = min(pb, max_fft_batch(ngrid))
+    w_half = half_kernel(coulG, mesh)
+    o, c = mo_on_grid(cell, [cp.asarray(ket, dtype=np.float64),
+                             cp.asarray(cross, dtype=np.float64)], mesh)
+    W = cp.zeros_like(o)
+    # c o^T: pairs (j, i <= j), row j at j (j + 1) / 2; W_i += c_j V_ji and, off the
+    # diagonal, W_j += c_i V_ji
+    jj, ii = np.tril_indices(n)
+    jidx, iidx = cp.asarray(jj, dtype=np.int32), cp.asarray(ii, dtype=np.int32)
+    for p0, p1 in lib.prange(0, len(jj), pb):
+        V = coulomb_potential(codensity(o, o, jidx, iidx, p0, p1), mesh, w_half)
+        for j in range(int(jj[p0]), int(jj[p1 - 1]) + 1):
+            r0 = j * (j + 1) // 2
+            s0, s1 = max(p0, r0), min(p1, r0 + j + 1)
+            i0, i1 = s0 - r0, s1 - r0
+            seg = V[s0 - p0:s1 - p0]
+            off = i1 - i0 - (1 if i1 == j + 1 else 0)
+            if off:
+                W[j] += (c[i0:i0 + off] * seg[:off]).sum(axis=0)
+            seg *= c[j]
+            W[i0:i1] += seg
+        V = None
+    # o c^T: pairs (j, i) row-major, W_i += o_j V[c_j o_i]
+    jidx = cp.repeat(cp.arange(n, dtype=np.int32), n)
+    iidx = cp.tile(cp.arange(n, dtype=np.int32), n)
+    for p0, p1 in lib.prange(0, n * n, pb):
+        V = coulomb_potential(codensity(c, o, jidx, iidx, p0, p1), mesh, w_half)
+        for j in range(p0 // n, (p1 - 1) // n + 1):
+            s0, s1 = max(p0, j * n), min(p1, (j + 1) * n)
+            seg = V[s0 - p0:s1 - p0]
+            seg *= o[j]
+            W[s0 - j * n:s1 - j * n] += seg
+        V = None
+    o = c = jidx = iidx = None
+    K = cp.zeros((cell.nao, n))
+    for g0, g1, aoT in ao_loop(cell, mesh, extra_per_point=8 * n):
+        K += aoT @ W[:, g0:g1].T
+    aoT = W = None
+    log.timer(f'cross exchange: {n * (n + 1) // 2 + n * n} codensity pairs', *t0)
+    return K * (cell.vol / ngrid)
 
 
 def exchange_force(cell, mesh, lam, U, ket, L, coulG, verbose=None):

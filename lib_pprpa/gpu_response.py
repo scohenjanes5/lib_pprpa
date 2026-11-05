@@ -11,7 +11,8 @@ symmetric D (``hermi=1``), FFTDF J; matches ``gen_response`` up to the summation
 A hybrid's exchange -K[D]/2 comes from the eigen-factors of D over the MOs
 (``gpu_exchange``): rank x nket codensity pairs, for a CPHF iteration 2 nocc x nocc instead
 of the nao^2 of FFTDF ``get_k``.  Exact on the MO span: the ket, or, without one, every MO
-(V P with P the S-projector onto the MOs).
+(V P with P the S-projector onto the MOs).  Given the CPHF form D = cross ket^T + ket cross^T
+the exchange takes 1.5 nocc^2 pairs (``exchange_cross_ket``).
 '''
 
 import numpy as np
@@ -20,7 +21,7 @@ from gpu4pyscf.pbc import tools as gtools
 from gpu4pyscf.pbc.dft.numint import _scale_ao
 
 from lib_pprpa.gpu_coulomb import exchange_coulG
-from lib_pprpa.gpu_exchange import exchange_ket, factor, projector
+from lib_pprpa.gpu_exchange import exchange_cross_ket, exchange_ket, factor, projector
 
 __all__ = ['fused_response']
 
@@ -28,9 +29,10 @@ _KPTS0 = np.zeros((1, 3))
 
 
 def fused_response(cell, kmf):
-    '''``respond(dm, ket=None)`` for the Gamma KRKS ``kmf`` (KNumInt on its uniform grids,
-    LDA/GGA or their hybrids, ``kmf.mo_coeff`` set): (J + fxc - K/2)[dm] (nao, nao) for a
-    real symmetric CuPy dm, or that matrix times ``ket`` (nao, nk), CuPy.
+    '''``respond(dm, ket=None, cross=None)`` for the Gamma KRKS ``kmf`` (KNumInt on its uniform
+    grids, LDA/GGA or their hybrids, ``kmf.mo_coeff`` set): (J + fxc - K/2)[dm] (nao, nao) for
+    a real symmetric CuPy dm, or that matrix times ``ket`` (nao, nk), CuPy.  ``cross`` (nao, nk)
+    with a ket states dm = cross ket^T + ket cross^T, for the exchange's pairs.
     '''
     ni, grids, xc = kmf._numint, kmf.grids, kmf.xc
     if grids.coords is None:
@@ -75,13 +77,15 @@ def fused_response(cell, kmf):
         mo = cp.asarray(kmf.mo_coeff[0])
         proj = projector(mo, cell.pbc_intor('int1e_ovlp', hermi=1))
 
-    def exchange(dm, ket):
+    def exchange(dm, ket, cross):
+        if cross is not None:
+            return exchange_cross_ket(cell, mesh, ket, cross, coulG_k, verbose=kmf.verbose)
         lam, U = factor(proj @ dm @ proj.T, mo)
         K = exchange_ket(cell, mesh, lam, U, mo if ket is None else ket, coulG_k,
                          verbose=kmf.verbose)
         return K if ket is not None else K @ proj
 
-    def respond(dm, ket=None):
+    def respond(dm, ket=None, cross=None):
         wv = potential_weights(dm)
         nk = cell.nao if ket is None else ket.shape[1]
         Z = cp.zeros((cell.nao, nk))
@@ -97,7 +101,7 @@ def fused_response(cell, kmf):
         if ket is None:
             Z = Z + Z.T
         if hybrid:
-            Z -= .5 * exchange(dm, ket)
+            Z -= .5 * exchange(dm, ket, cross)
         return Z
 
     return respond
