@@ -181,9 +181,8 @@ def make_rdm1_relaxed_rhf_pprpa(
         mf: a mean-field RHF/RKS object.
         vresp: optional response ``vresp(dm)`` -> (J + fxc + hyb K)[dm] (default
             ``mf.gen_response(singlet=None, hermi=1)``).  A response with a true
-            ``accepts_ket`` attribute is called in the CPHF iterations as
-            ``vresp(dm, ket=orbI)`` and returns ``vresp(dm) @ orbI`` (nao, nocc_all):
-            only those columns are ever used.
+            ``accepts_ket`` attribute is called as ``vresp(dm, ket=orbI)`` and returns
+            ``vresp(dm) @ orbI`` (nao, nocc_all): only those columns are ever used.
         pair_get_k: optional callback ``pair_get_k(dms, hermi)`` for direct
             exchange contractions of the active pair density X + Y (a stack
             of one (nao, nao) matrix; one entry per matrix returned).  This
@@ -292,6 +291,15 @@ def make_rdm1_relaxed_rhf_pprpa(
     # set singlet=None, generate function for CPHF type response kernel
     if vresp is None:
         vresp = mf.gen_response(singlet=None, hermi=1)
+    accepts_ket = getattr(vresp, 'accepts_ket', False)
+
+    def vresp_occ(dm):
+        # vresp(dm) @ orbI: every response below is read on the occupied columns only, and
+        # with a ket a hybrid's exchange is built on nocc_all orbitals instead of every MO
+        if accepts_ket:
+            return np.asarray(vresp(dm, ket=orbI))
+        return vresp(dm) @ orbI
+
     # D' below carries the off-diagonal unrelaxed density of every orbital pair except the
     # degenerate ones, where it is zeroed; those elements (nonzero for a degenerate state) are
     # kept in den_u, which is the diagonal plus the degenerate blocks.
@@ -301,7 +309,10 @@ def make_rdm1_relaxed_rhf_pprpa(
     den_u = block_diag(-occ_y_mat @ occ_y_mat.conj().T, vir_x_mat @ vir_x_mat.conj().T)
     den_u[~degenerate] = 0
     den_u_ao = reduce(np.dot, (orbp, den_u, orbp.T))
-    veff_den_u = reduce(np.dot, (mf.mo_coeff.T, vresp(den_u_ao) * 2, mf.mo_coeff))
+    # only the occupied columns of veff_den_u are read
+    veff_den_u_I = mf.mo_coeff.T @ vresp_occ(den_u_ao) * 2
+    veff_den_u = np.zeros((veff_den_u_I.shape[0],) * 2, dtype=veff_den_u_I.dtype)
+    veff_den_u[:, slice_I] = veff_den_u_I
 
     start_clock('Calculate i_prime and i_prime_prime')
     # calculate I' first
@@ -372,7 +383,7 @@ def make_rdm1_relaxed_rhf_pprpa(
     d_ao = reduce(np.dot, (orbI, d_prime[slice_I, slice_i], orbi.T))
     d_ao += reduce(np.dot, (orbA, d_prime[slice_A, slice_a], orba.T))
     d_ao += d_ao.T
-    x_int += reduce(np.dot, (orbA.T, vresp(d_ao) * 2, orbI))
+    x_int += orbA.T @ vresp_occ(d_ao) * 2
 
     log = logger.new_logger(mf)
 
@@ -388,8 +399,6 @@ def make_rdm1_relaxed_rhf_pprpa(
         orbA_gpu = cupy.asarray(orbA)
         orbI_gpu = cupy.asarray(orbI)
     nresponse = [0]
-
-    accepts_ket = getattr(vresp, 'accepts_ket', False)
 
     def fvind(x):
         nresponse[0] += 1
@@ -458,7 +467,7 @@ def make_rdm1_relaxed_rhf_pprpa(
     i_int = -lib.einsum('qp,p->qp', d_prime, mo_ene_full)
     # I all occupied-all occupied block
     dp_ao = reduce(np.dot, (mf.mo_coeff, d_prime, mf.mo_coeff.T))
-    veff_dp_II = reduce(np.dot, (orbI.T, vresp(dp_ao + dp_ao.T), orbI))
+    veff_dp_II = orbI.T @ vresp_occ(dp_ao + dp_ao.T)
     i_int[slice_I, slice_I] -= 0.5 * veff_den_u[slice_I, slice_I]
     i_int[slice_I, slice_I] -= veff_dp_II
     # I active virtual-all occupied block
