@@ -32,7 +32,7 @@ _FFT_BYTES = 64
 # Shares of the per-grid-point budget: ket grids + their W, factor grids; the rest is the FFT batch.
 _KET_SHARE = 0.3
 _FACTOR_SHARE = 0.4
-# exchange_cross_ket: the FFT batch plus the temporary of its W updates
+# exchange_cross_ket: the FFT batch plus the buffer of its W[j] products
 _CROSS_FFT_BYTES = _FFT_BYTES + 8
 # Eigenvalues of a factored density below this fraction of the largest are dropped.
 _RANK_TOL = 1e-13
@@ -141,12 +141,15 @@ def exchange_cross_ket(cell, mesh, ket, cross, coulG, verbose=None):
     if pb < 1:
         raise MemoryError(f'cross exchange: {per_point} bytes per grid point leave no FFT batch')
     pb = min(pb, max_fft_batch(ngrid))
+    log.debug('cross exchange: %d kets, %d pairs per FFT', n, pb)
     w_half = half_kernel(coulG, mesh)
     o, c = mo_on_grid(cell, [cp.asarray(ket, dtype=np.float64),
                              cp.asarray(cross, dtype=np.float64)], mesh)
     W = cp.zeros_like(o)
     # c o^T: pairs (j, i <= j), row j at j (j + 1) / 2; W_i += c_j V_ji and, off the
-    # diagonal, W_j += c_i V_ji
+    # diagonal, W_j += c_i V_ji.  The products c_i V_ji go to one buffer: a temporary of
+    # each row's length would leave pooled() a cached block of every length.
+    buf = cp.empty((pb, ngrid))
     jj, ii = np.tril_indices(n)
     jidx, iidx = cp.asarray(jj, dtype=np.int32), cp.asarray(ii, dtype=np.int32)
     for p0, p1 in lib.prange(0, len(jj), pb):
@@ -158,10 +161,11 @@ def exchange_cross_ket(cell, mesh, ket, cross, coulG, verbose=None):
             seg = V[s0 - p0:s1 - p0]
             off = i1 - i0 - (1 if i1 == j + 1 else 0)
             if off:
-                W[j] += (c[i0:i0 + off] * seg[:off]).sum(axis=0)
+                W[j] += cp.multiply(c[i0:i0 + off], seg[:off], out=buf[:off]).sum(axis=0)
             seg *= c[j]
             W[i0:i1] += seg
         V = None
+    buf = None
     # o c^T: pairs (j, i) row-major, W_i += o_j V[c_j o_i]
     jidx = cp.repeat(cp.arange(n, dtype=np.int32), n)
     iidx = cp.tile(cp.arange(n, dtype=np.int32), n)
