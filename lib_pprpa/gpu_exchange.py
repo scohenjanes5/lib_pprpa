@@ -32,10 +32,37 @@ _FFT_BYTES = 64
 # Shares of the per-grid-point budget: ket grids + their W, factor grids; the rest is the FFT batch.
 _KET_SHARE = 0.3
 _FACTOR_SHARE = 0.4
-# exchange_cross_ket: the FFT batch plus the buffer of its W[j] products
-_CROSS_FFT_BYTES = _FFT_BYTES + 8
 # Eigenvalues of a factored density below this fraction of the largest are dropped.
 _RANK_TOL = 1e-13
+
+# W[rows[t]] += sum_k scale[src[k]] S[src[k]] V[pair[k]] over k in [ptr[t], ptr[t + 1]): one
+# thread per (target row, grid point), so each element of W is read and written once per batch.
+_ACCUMULATE = cp.ElementwiseKernel(
+    'raw float64 V, raw float64 S, raw float64 scale, raw int32 rows, raw int32 ptr, '
+    'raw int32 pair, raw int32 src, int64 ngrid',
+    'raw float64 W',
+    '''
+    const long long t = i / ngrid;
+    const long long g = i - t * ngrid;
+    double acc = 0.0;
+    for (int k = ptr[t]; k < ptr[t + 1]; ++k)
+        acc += scale[src[k]] * S[(long long)src[k] * ngrid + g] * V[(long long)pair[k] * ngrid + g];
+    W[(long long)rows[t] * ngrid + g] += acc;
+    ''',
+    'pprpa_exchange_accumulate')
+
+
+def _accumulate(W, V, S, scale, target, pair, src):
+    '''W[target_k] += scale[src_k] S[src_k] V[pair_k] for the contributions k of one FFT batch
+    (NumPy integer arrays; V the batch's potentials, S the source grids): one pass over V,
+    each target row of W read and written once, no temporaries of the grid's size.'''
+    order = np.argsort(target, kind='stable')
+    rows, start = np.unique(target[order], return_index=True)
+    ptr = np.append(start, len(order))
+    rows, ptr, pair, src = (cp.asarray(a, dtype=np.int32)
+                            for a in (rows, ptr, pair[order], src[order]))
+    ngrid = V.shape[1]
+    _ACCUMULATE(V, S, scale, rows, ptr, pair, src, ngrid, W, size=len(rows) * ngrid)
 
 
 def factor(M, C):
@@ -80,16 +107,13 @@ def _grids(cell, mesh, lam, U, ket_grid, ub, pb, w_half):
         u, = mo_on_grid(cell, [U[:, k0:k1]], mesh)
         lu = lam[k0:k1]
         nk = k1 - k0
-        # pairs (k, i) row-major: P = k * nket + i
-        kidx = cp.repeat(cp.arange(nk, dtype=np.int32), nket)
-        iidx = cp.tile(cp.arange(nket, dtype=np.int32), nk)
+        # pairs (i, k) ket-major, P = i * nk + k: a batch adds into a few rows of W
+        iidx = cp.repeat(cp.arange(nket, dtype=np.int32), nk)
+        kidx = cp.tile(cp.arange(nk, dtype=np.int32), nket)
         for p0, p1 in lib.prange(0, nk * nket, pb):
             V = coulomb_potential(codensity(u, ket_grid, kidx, iidx, p0, p1), mesh, w_half)
-            for k in range(p0 // nket, (p1 - 1) // nket + 1):
-                s0, s1 = max(p0, k * nket), min(p1, (k + 1) * nket)
-                seg = V[s0 - p0:s1 - p0]
-                seg *= u[k] * lu[k]                         # lam_k u_k V[u_k v_i]
-                W[s0 - k * nket:s1 - k * nket] += seg
+            P = np.arange(p0, p1)
+            _accumulate(W, V, u, lu, P // nk, P - p0, P % nk)     # lam_k u_k V[u_k v_i]
             V = None
         u = None
     return W
@@ -137,7 +161,7 @@ def exchange_cross_ket(cell, mesh, ket, cross, coulG, verbose=None):
     ngrid = int(np.prod(mesh))
     n = ket.shape[1]
     per_point = plan_budget(free_bytes()) // ngrid - 24 * n
-    pb = per_point // _CROSS_FFT_BYTES
+    pb = per_point // _FFT_BYTES
     if pb < 1:
         raise MemoryError(f'cross exchange: {per_point} bytes per grid point leave no FFT batch')
     pb = min(pb, max_fft_batch(ngrid))
@@ -146,36 +170,25 @@ def exchange_cross_ket(cell, mesh, ket, cross, coulG, verbose=None):
     o, c = mo_on_grid(cell, [cp.asarray(ket, dtype=np.float64),
                              cp.asarray(cross, dtype=np.float64)], mesh)
     W = cp.zeros_like(o)
-    # c o^T: pairs (j, i <= j), row j at j (j + 1) / 2; W_i += c_j V_ji and, off the
-    # diagonal, W_j += c_i V_ji.  The products c_i V_ji go to one buffer: a temporary of
-    # each row's length would leave pooled() a cached block of every length.
-    buf = cp.empty((pb, ngrid))
+    ones = cp.ones(n)
+    # c o^T: pairs (j, i <= j) row-major; W_i += c_j V_ji and, off the diagonal, W_j += c_i V_ji
     jj, ii = np.tril_indices(n)
     jidx, iidx = cp.asarray(jj, dtype=np.int32), cp.asarray(ii, dtype=np.int32)
     for p0, p1 in lib.prange(0, len(jj), pb):
         V = coulomb_potential(codensity(o, o, jidx, iidx, p0, p1), mesh, w_half)
-        for j in range(int(jj[p0]), int(jj[p1 - 1]) + 1):
-            r0 = j * (j + 1) // 2
-            s0, s1 = max(p0, r0), min(p1, r0 + j + 1)
-            i0, i1 = s0 - r0, s1 - r0
-            seg = V[s0 - p0:s1 - p0]
-            off = i1 - i0 - (1 if i1 == j + 1 else 0)
-            if off:
-                W[j] += cp.multiply(c[i0:i0 + off], seg[:off], out=buf[:off]).sum(axis=0)
-            seg *= c[j]
-            W[i0:i1] += seg
+        j, i = jj[p0:p1], ii[p0:p1]
+        P = np.arange(p1 - p0)
+        off = i < j
+        _accumulate(W, V, c, ones, np.concatenate([i, j[off]]), np.concatenate([P, P[off]]),
+                    np.concatenate([j, i[off]]))
         V = None
-    buf = None
-    # o c^T: pairs (j, i) row-major, W_i += o_j V[c_j o_i]
-    jidx = cp.repeat(cp.arange(n, dtype=np.int32), n)
-    iidx = cp.tile(cp.arange(n, dtype=np.int32), n)
+    # o c^T: pairs (i, j) ket-major, P = i * n + j; W_i += o_j V[c_j o_i]
+    iidx = cp.repeat(cp.arange(n, dtype=np.int32), n)
+    jidx = cp.tile(cp.arange(n, dtype=np.int32), n)
     for p0, p1 in lib.prange(0, n * n, pb):
         V = coulomb_potential(codensity(c, o, jidx, iidx, p0, p1), mesh, w_half)
-        for j in range(p0 // n, (p1 - 1) // n + 1):
-            s0, s1 = max(p0, j * n), min(p1, (j + 1) * n)
-            seg = V[s0 - p0:s1 - p0]
-            seg *= o[j]
-            W[s0 - j * n:s1 - j * n] += seg
+        P = np.arange(p0, p1)
+        _accumulate(W, V, o, ones, P // n, P - p0, P % n)
         V = None
     o = c = jidx = iidx = None
     K = cp.zeros((cell.nao, n))

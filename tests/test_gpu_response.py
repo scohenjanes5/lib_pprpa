@@ -120,3 +120,22 @@ def test_cross_exchange_in_blocks(monkeypatch):
     got = cp.asnumpy(gx.exchange_cross_ket(cell, cell.mesh, o, v @ t, coulG))
     assert max(calls) == 2
     assert np.abs(got - ref).max() < 1e-11 * np.abs(ref).max()
+
+
+def test_accumulate_by_target():
+    """The one-pass W update against a loop over its contributions: repeated, unsorted
+    targets, a row with none."""
+    import cupy as cp
+    import lib_pprpa.gpu_exchange as gx
+    rng = np.random.default_rng(3)
+    V, S = rng.standard_normal((6, 50)), rng.standard_normal((4, 50))
+    scale, W = rng.standard_normal(4), rng.standard_normal((5, 50))
+    target = np.array([3, 0, 3, 1, 3, 0, 4])
+    pair = np.array([0, 1, 2, 3, 4, 5, 0])
+    src = np.array([1, 2, 0, 3, 1, 2, 0])
+    ref = W.copy()
+    for t, p, s in zip(target, pair, src):
+        ref[t] += scale[s] * S[s] * V[p]
+    got = cp.asarray(W)
+    gx._accumulate(got, cp.asarray(V), cp.asarray(S), cp.asarray(scale), target, pair, src)
+    assert np.abs(cp.asnumpy(got) - ref).max() < 1e-13
