@@ -22,7 +22,7 @@ from gpu4pyscf.pbc.dft import numint as gnumint
 from lib_pprpa.gpu_mem import free_bytes, plan_budget
 
 __all__ = ['ao_loop', 'mo_on_grid', 'codensity', 'half_kernel', 'coulomb_potential',
-           'exchange_coulG']
+           'exchange_coulG', 'ao_project', 'ao_force']
 
 _KPTS0 = np.zeros((1, 3))
 _GRID_BLK_MIN = 4096
@@ -137,3 +137,31 @@ def coulomb_potential(rho, mesh, w_half):
     vG *= w_half
     vR = cufft.irfftn(vG, s=(nx, ny, nz), axes=(1, 2, 3), overwrite_x=True)
     return vR.reshape(rho.shape[0], -1)
+
+
+def ao_project(cell, mesh, W):
+    '''(vol / ngrid) sum_g ao(g) W(g)^T, CuPy (nao, nket) on W's device: K C for the potential
+    grids W (nket, ngrid) of an exchange K on the kets C.'''
+    with W.device:
+        K = cp.zeros((cell.nao, W.shape[0]))
+        for g0, g1, aoT in ao_loop(cell, mesh, extra_per_point=8 * W.shape[0]):
+            K += aoT @ W[:, g0:g1].T
+        return K * (cell.vol / W.shape[1])
+
+
+def ao_force(cell, mesh, W, L):
+    '''-2 sum_{i in A} sum_m L_im (vol / ngrid) sum_g d_x ao_i(g) W_m(g), NumPy (natm, 3): the
+    exchange force (dE/dR) of the potential grids W (nket, ngrid) against L (nao, nket).  The
+    sign: ``eval_ao(deriv=1)`` differentiates by the electron coordinate.'''
+    with W.device:
+        G = cp.zeros((3, cell.nao, W.shape[0]))
+        for g0, g1, ao in ao_loop(cell, mesh, deriv=1, extra_per_point=8 * W.shape[0]):
+            Wc = cp.ascontiguousarray(W[:, g0:g1])
+            for x in range(3):
+                G[x] += ao[1 + x].T @ Wc.T
+        t = cp.einsum('xim,im->xi', G, cp.asarray(L, dtype=np.float64)).get()
+    t *= cell.vol / W.shape[1]
+    de = np.zeros((cell.natm, 3))
+    for ia, (_, _, p0, p1) in enumerate(cell.aoslice_by_atom()):
+        de[ia] = -2.0 * t[:, p0:p1].sum(axis=1)
+    return de

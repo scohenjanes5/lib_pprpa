@@ -172,7 +172,7 @@ export LD_LIBRARY_PATH=$CU/lib:$SP/cutensor/lib:$LD_LIBRARY_PATH
   spaces the **MO-eri** path (GPU FFT ao2mo + batched `use_eri` contraction) is
   much faster — that is the path used for the NV-center production runs.
 - The CPU `make_rdm1_relaxed_rhf_pprpa` builds the relaxed density (small MO-space
-  algebra); the exchange of the pair density X + Y (`gpu_pairing_force.pair_exchange`,
+  algebra); the exchange of the pair density X + Y (`gpu_coulomb.ao_project`,
   from the potential grids the pairing force also uses) and the response run on the GPU.
 
 ## Fully GDF-consistent path

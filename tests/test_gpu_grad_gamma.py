@@ -145,7 +145,7 @@ def test_pairing_force_matches_aft(system, mult, store_phil, pairs_per_batch, mo
     if pairs_per_batch is not None:
         ngrid = int(np.prod(cell.mesh))
         # plan_budget keeps 512 MB back; the rebuilt rows take one more row
-        budget = ((pairs_per_batch + 0.5) * (pf._FFT_BYTES + 8) + 8) * ngrid + 512 * 1024**2
+        budget = ((pairs_per_batch + 0.5) * (pf.EXCHANGE_FFT_BYTES + 8) + 8) * ngrid + 512 * 1024**2
         monkeypatch.setattr(pf, "free_bytes", lambda: int(budget))
     got = pf.pairing_k_force_lowrank(cell, cell.mesh, C, M, store_phil=store_phil)
     assert np.abs(got - ref).max() < 1e-6 * np.abs(ref).max()
@@ -154,9 +154,9 @@ def test_pairing_force_matches_aft(system, mult, store_phil, pairs_per_batch, mo
 
 def _exchange_force(cell, mo, M, coulG):
     """F(M) = F_b(M, M) of mo M mo^T through gpu_exchange (W and L from the same density)."""
-    from lib_pprpa.gpu_exchange import exchange_force, factor
+    from lib_pprpa.gpu_exchange import exchange_ket, factor
     lam, U = factor(M, mo)
-    return exchange_force(cell, cell.mesh, lam, U, mo, mo @ M, coulG)
+    return exchange_ket(cell, cell.mesh, lam, U, mo, coulG, L=mo @ M)
 
 
 # (omega, alpha, hyb): short-range only, long-range only, global
@@ -180,7 +180,7 @@ def test_reference_exchange_bilinear_split(system):
     """F(T) - F(P) = F_b(D, T) + F_b(P, D) for D = diag(mo_occ), as the gradient forms it
     (W of D on every MO, W of P on the occupied ones)."""
     from lib_pprpa.gpu_coulomb import exchange_coulG
-    from lib_pprpa.gpu_exchange import exchange_force, factor
+    from lib_pprpa.gpu_exchange import exchange_ket, factor
     cell, mf, _, _ = system
     mo = mf.mo_coeff
     P = 0.05 * np.random.default_rng(5).standard_normal((mo.shape[1],) * 2)
@@ -191,8 +191,8 @@ def test_reference_exchange_bilinear_split(system):
     occ = mf.mo_occ > 0
     n, cocc = mf.mo_occ[occ], mo[:, occ]
     lam_p, U_p = factor(P, mo)
-    got = exchange_force(cell, cell.mesh, n, cocc, mo, mo @ (D + P), coulG)
-    got += exchange_force(cell, cell.mesh, lam_p, U_p, cocc, cocc * n, coulG)
+    got = exchange_ket(cell, cell.mesh, n, cocc, mo, coulG, L=mo @ (D + P))
+    got += exchange_ket(cell, cell.mesh, lam_p, U_p, cocc, coulG, L=cocc * n)
     assert np.abs(got - ref).max() < 1e-10 * np.abs(ref).max()
 
 

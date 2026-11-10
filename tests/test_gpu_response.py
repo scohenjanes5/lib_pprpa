@@ -109,8 +109,8 @@ def test_cross_exchange_in_blocks(monkeypatch):
     ngrid = int(np.prod(cell.mesh))
 
     def tight():
-        # plan_budget keeps 512 MiB back: 240 bytes per grid point, 96 of them the grids
-        return 240 * ngrid + 512 * 1024**2
+        # plan_budget keeps 512 MiB back: 160 bytes per grid point beside the held grids
+        return 160 * ngrid + 512 * 1024**2
 
     monkeypatch.setattr(gx, "free_bytes", tight)
     calls = []
@@ -124,6 +124,62 @@ def test_cross_exchange_in_blocks(monkeypatch):
     got = cp.asnumpy(gx.exchange_cross_ket(cell, cell.mesh, o, v @ t, coulG))
     assert max(calls) == 2
     assert np.abs(got - ref).max() < 1e-11 * np.abs(ref).max()
+
+
+def _blocks(nmo, nocc, kind, rng):
+    """A symmetric M over the MOs: every block random ('full'), the occupied block, the
+    vir-occ block and a rank-1 virtual block ('vo'), the occupations ('occ'), a rank-1
+    occupied block ('oo1')."""
+    M = np.zeros((nmo, nmo))
+    o, v = slice(0, nocc), slice(nocc, nmo)
+    if kind == "full":
+        M = rng.standard_normal((nmo, nmo))
+    elif kind == "vo":
+        M[o, o] = rng.standard_normal((nocc, nocc))
+        M[v, o] = rng.standard_normal((nmo - nocc, nocc))
+        u = rng.standard_normal(nmo - nocc)
+        M[v, v] = np.outer(u, u)
+    elif kind == "occ":
+        M[o, o] = 2 * np.eye(nocc)
+    else:
+        u = rng.standard_normal(nocc)
+        M[o, o] = np.outer(u, u)
+    return M + M.T
+
+
+# the route each density takes on diamond's 4 occupied of 16 MOs: factors 16 x 4 = 64 pairs
+# against 10 + 16 + 12 x 4; rank 9 x 4 against 10 + 16 + 4; 4 x 4 against 10; 1 x 4 against 10
+_ROUTES = {"full": "factors", "vo": "blocks", "occ": "blocks", "oo1": "factors"}
+
+
+@pytest.mark.parametrize("kind", sorted(_ROUTES))
+def test_occupied_blocks_match_factors(kind, monkeypatch):
+    """exchange_occ_ket, K and force (D's occupied/virtual blocks or its factors,
+    whichever has fewer pairs) against exchange_ket of D's factors; the
+    blocks also in batches of two pairs."""
+    import cupy as cp
+    from gpu4pyscf.pbc import tools as gtools
+    import lib_pprpa.gpu_exchange as gx
+    cell, mf = _diamond("pbe")
+    mo, occ = mf.mo_coeff, mf.mo_occ > 0
+    o = mo[:, occ]
+    rng = np.random.default_rng(4)
+    M = _blocks(mo.shape[1], o.shape[1], kind, rng)
+    parts, _ = gx._occ_parts(M, mo, occ)
+    assert ("oo" in parts) == (_ROUTES[kind] == "blocks")
+    coulG = gtools.get_coulG(cell, mesh=cell.mesh)
+    lam, U = gx.factor(M, mo)
+    L = rng.standard_normal(o.shape)
+    ref = cp.asnumpy(gx.exchange_ket(cell, cell.mesh, lam, U, o, coulG))
+    ref_f = gx.exchange_ket(cell, cell.mesh, lam, U, o, coulG, L=L)
+    ngrid = int(np.prod(cell.mesh))
+    for budget in (None, 160):
+        if budget is not None:
+            monkeypatch.setattr(gx, "free_bytes", lambda: budget * ngrid + 512 * 1024**2)
+        got = cp.asnumpy(gx.exchange_occ_ket(cell, cell.mesh, M, mo, occ, coulG))
+        assert np.abs(got - ref).max() < 1e-11 * np.abs(ref).max()
+        got_f = gx.exchange_occ_ket(cell, cell.mesh, M, mo, occ, coulG, L=L)
+        assert np.abs(got_f - ref_f).max() < 1e-11 * np.abs(ref_f).max()
 
 
 def test_accumulate_by_target():

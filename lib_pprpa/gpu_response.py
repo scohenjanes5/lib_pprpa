@@ -8,11 +8,11 @@ a ``ket`` (the occupied orbitals of a CPHF iteration) it returns V @ ket directl
 Z = ao0^T (aow ket) + aow^T (ao0 ket), 2 nk / nao of a nao^2 product.  LDA/GGA, real
 symmetric D (``hermi=1``), FFTDF J; matches ``gen_response`` up to the summation order.
 
-A hybrid's exchange -K[D]/2 comes from the eigen-factors of D over the MOs
-(``gpu_exchange``): rank x nket codensity pairs, for a CPHF iteration 2 nocc x nocc instead
-of the nao^2 of FFTDF ``get_k``.  Exact on the MO span: the ket, or, without one, every MO
-(V P with P the S-projector onto the MOs).  Given the CPHF form D = cross ket^T + ket cross^T
-the exchange takes 1.5 nocc^2 pairs (``exchange_cross_ket``).
+A hybrid's exchange -K[D]/2 comes from D over the MOs (``gpu_exchange``), exact on the MO
+span: without a ket from D's eigen-factors on every MO (V P with P the S-projector onto the
+MOs), on the ket (the occupied MOs) from D's occupied/virtual blocks or factors, whichever
+takes fewer codensity pairs, and for the CPHF form D = cross ket^T + ket cross^T from 1.5 nocc^2
+pairs (``exchange_cross_ket``), not the nao^2 of FFTDF ``get_k``.
 '''
 
 import numpy as np
@@ -21,7 +21,8 @@ from gpu4pyscf.pbc import tools as gtools
 from gpu4pyscf.pbc.dft.numint import _scale_ao
 
 from lib_pprpa.gpu_coulomb import exchange_coulG
-from lib_pprpa.gpu_exchange import exchange_cross_ket, exchange_ket, factor, projector
+from lib_pprpa.gpu_exchange import (exchange_cross_ket, exchange_ket, exchange_occ_ket, factor,
+                                    projector)
 
 __all__ = ['fused_response']
 
@@ -31,8 +32,9 @@ _KPTS0 = np.zeros((1, 3))
 def fused_response(cell, kmf):
     '''``respond(dm, ket=None, cross=None)`` for the Gamma KRKS ``kmf`` (KNumInt on its uniform
     grids, LDA/GGA or their hybrids, ``kmf.mo_coeff`` set): (J + fxc - K/2)[dm] (nao, nao) for
-    a real symmetric CuPy dm, or that matrix times ``ket`` (nao, nk), CuPy.  ``cross`` (nao, nk)
-    with a ket states dm = cross ket^T + ket cross^T, for the exchange's pairs.
+    a real symmetric CuPy dm, or that matrix times ``ket`` (nao, nocc), CuPy, ``ket`` the
+    occupied columns of ``kmf.mo_coeff``.  ``cross`` (nao, nocc) with a ket states
+    dm = cross ket^T + ket cross^T, for the exchange's pairs.
     '''
     ni, grids, xc = kmf._numint, kmf.grids, kmf.xc
     if grids.coords is None:
@@ -75,15 +77,19 @@ def fused_response(cell, kmf):
         omega, alpha, hyb = ni.rsh_and_hybrid_coeff(xc)
         coulG_k = exchange_coulG(cell, mesh, omega, alpha, hyb, kmf.exxdiv)
         mo = cp.asarray(kmf.mo_coeff[0])
+        occ = cp.asnumpy(cp.asarray(kmf.mo_occ[0])) > 0
         proj = projector(mo, cell.pbc_intor('int1e_ovlp', hermi=1))
 
     def exchange(dm, ket, cross):
         if cross is not None:
             return exchange_cross_ket(cell, mesh, ket, cross, coulG_k, verbose=kmf.verbose)
-        lam, U = factor(proj @ dm @ proj.T, mo)
-        K = exchange_ket(cell, mesh, lam, U, mo if ket is None else ket, coulG_k,
-                         verbose=kmf.verbose)
-        return K if ket is not None else K @ proj
+        M = proj @ dm @ proj.T
+        if ket is not None:
+            if ket.shape[1] != occ.sum():
+                raise ValueError(f'ket: the {occ.sum()} occupied MOs, got {ket.shape[1]} columns')
+            return exchange_occ_ket(cell, mesh, M, mo, occ, coulG_k, verbose=kmf.verbose)
+        lam, U = factor(M, mo)
+        return exchange_ket(cell, mesh, lam, U, mo, coulG_k, verbose=kmf.verbose) @ proj
 
     def respond(dm, ket=None, cross=None):
         wv = potential_weights(dm)

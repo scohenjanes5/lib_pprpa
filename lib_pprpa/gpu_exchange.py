@@ -1,20 +1,13 @@
-'''Gamma-point exact exchange on the uniform grid from the factors of a density, in bounded memory.
-
-For D = sum_k lam_k u_k u_k^T and ket orbitals v_i (columns of AO coefficient matrices),
-
-    W_i(g) = sum_k lam_k u_k(g) V[u_k v_i](g),      V[rho] = ifft(w fft(rho)),
-
-K[D] v_i = (vol / ngrid) sum_g ao(g) W_i(g) (K_pq = sum_jk (pj|kq) D_jk, gpu4pyscf's fft_jk.get_k)
-and the exchange force of D is the same W against the gradient AOs.  One codensity FFT per
-(k, i) pair, real-to-complex with ``gpu_coulomb``'s symmetrised kernel, by ``gpu_fft_chain``'s
-five kernels on a mesh they apply to (sides 7-smooth), else by cuFFT.  A block of ket grids
-and its W stay on the device while the factor grids are evaluated block by block, so memory is
-set by the ket block, not by the rank of D.  ``factor`` gives (lam, U) of a symmetric density
-from its coefficients over a basis (``projector``).  NumPy or CuPy coefficients; one device.
-
-A CPHF density D = c o^T + o c^T (o the occupied orbitals, c = C_v x) on the occupied kets:
-the c o^T half has the symmetric codensities o_j o_i, taken once, the o c^T half the c_j o_i,
-1.5 n^2 pairs for the 2n x n of D's factors (``exchange_cross_ket``).
+'''Gamma-point exact exchange on the uniform grid, W_i = sum_k lam_k u_k V[u_k v_i] for
+D = U diag(lam) U^T and kets v_i (V[rho] = ifft(w fft(rho))): K[D] v_i = (vol/ngrid) ao^T W_i,
+the exchange force the same W against the gradient AOs.  One real-to-complex codensity FFT per
+pair, by ``gpu_fft_chain`` on 7-smooth meshes, else cuFFT; ket grids and W stay on the device
+while the factor grids pass in blocks.  On the occupied kets o, D's blocks over the MOs
+(o M_oo o^T + c o^T + o c^T + D_vv, c = C_v M_vo) need the pairs o_j o_i once (W_i += s_j
+V[o_j o_i], s = c + o M_oo), n^2 pairs c_j o_i (W_i += o_j V[c_j o_i]) and D_vv's factors:
+``exchange_occ_ket`` takes these or D's factors, whichever has fewer pairs;
+``exchange_cross_ket`` a CPHF density (1.5 n^2 pairs, not 2 n^2).  With ``L`` the ket and
+occupied passes give the exchange force instead of K C.
 '''
 
 import numpy as np
@@ -23,15 +16,12 @@ from pyscf import lib
 from pyscf.lib import logger
 
 from lib_pprpa import gpu_fft_chain
-from lib_pprpa.gpu_coulomb import ao_loop, codensity, coulomb_potential, half_kernel, mo_on_grid
-from lib_pprpa.gpu_mem import free_bytes, max_fft_batch, plan_budget
+from lib_pprpa.gpu_coulomb import (ao_force, ao_project, codensity, coulomb_potential,
+                                   half_kernel, mo_on_grid)
+from lib_pprpa.gpu_mem import EXCHANGE_FFT_BYTES, free_bytes, max_fft_batch, plan_budget
 
-__all__ = ['factor', 'projector', 'exchange_ket', 'exchange_cross_ket', 'exchange_force']
+__all__ = ['factor', 'projector', 'exchange_ket', 'exchange_cross_ket', 'exchange_occ_ket']
 
-# Bytes per (codensity, grid point) of one coulomb_potential batch: 56.4 (codensities, half
-# spectrum, real output, two cuFFT work areas, measured on the 159^3 mesh, see gpu_ao2mo);
-# gpu_fft_chain's two half-spectrum buffers take at most half of it.
-_FFT_BYTES = 64
 # Shares of the per-grid-point budget: ket grids + their W, factor grids; the rest is the FFT batch.
 _KET_SHARE = 0.3
 _FACTOR_SHARE = 0.4
@@ -79,7 +69,7 @@ class _PotentialSum:
     cuFFT and _accumulate.'''
 
     def __init__(self, mesh, w_half, pb):
-        self.mesh, self.w_half = mesh, w_half
+        self.mesh, self.w_half, self.pb = mesh, w_half, pb
         self.chain = (gpu_fft_chain.FFTChain(mesh, w_half, pb)
                       if gpu_fft_chain.applies(mesh) else None)
 
@@ -118,17 +108,22 @@ def _plan(cell, mesh, nket, rank):
     per_point = plan_budget(free_bytes()) // ngrid
     kb = max(1, min(nket, int(_KET_SHARE * per_point) // 16))     # ket grid + W
     ub = max(1, min(rank, int(_FACTOR_SHARE * per_point) // 8))
-    pb = (per_point - 16 * kb - 8 * ub) // _FFT_BYTES
+    return kb, ub, _fft_batch(ngrid, 16 * kb + 8 * ub)
+
+
+def _fft_batch(ngrid, held=0):
+    '''Codensities per FFT batch from the free device memory, beside ``held`` more bytes per
+    grid point still to be allocated.'''
+    pb = (plan_budget(free_bytes()) // ngrid - held) // EXCHANGE_FFT_BYTES
     if pb < 1:
-        raise MemoryError(f'exchange: {per_point} bytes per grid point leave no FFT batch')
-    return kb, ub, max(1, min(pb, max_fft_batch(ngrid)))
+        raise MemoryError(f'exchange: no FFT batch fits beside {held} bytes per grid point')
+    return min(pb, max_fft_batch(ngrid))
 
 
-def _grids(cell, mesh, lam, U, ket_grid, ub, pb, w_half):
-    '''W (nket, ngrid) for the ket grids ``ket_grid`` (nket, ngrid), the factor grids
-    evaluated ``ub`` columns of U at a time, ``pb`` codensities per FFT batch.'''
+def _grids(cell, mesh, lam, U, ket_grid, W, ub, pb, w_half):
+    '''W (nket, ngrid) += the factor terms of U diag(lam) U^T on the ket grids ``ket_grid``,
+    the factor grids evaluated ``ub`` columns of U at a time, ``pb`` codensities per FFT.'''
     nket = ket_grid.shape[0]
-    W = cp.zeros_like(ket_grid)
     sums = _PotentialSum(mesh, w_half, pb)
     for k0, k1 in lib.prange(0, U.shape[1], ub):
         u, = mo_on_grid(cell, [U[:, k0:k1]], mesh)
@@ -145,113 +140,153 @@ def _grids(cell, mesh, lam, U, ket_grid, ub, pb, w_half):
     return W
 
 
-def exchange_ket(cell, mesh, lam, U, ket, coulG, verbose=None):
+def _diagonal(oo, cross):
+    '''True for D's occupied block alone and diagonal (an SCF density): its s grids are o's.'''
+    return (cross is None and oo is not None
+            and not bool(cp.any(cp.asarray(oo) - cp.diag(cp.diagonal(cp.asarray(oo))))))
+
+
+def _occ_grids(cell, mesh, o, w_half, oo=None, cross=None, lam=None, U=None, log=None):
+    '''W (n, ngrid) on the kets o (nao, n) of D = o oo o^T + cross o^T + o cross^T
+    + U diag(lam) U^T, the parts given: the pairs o_j o_i (j >= i) once with s = cross + o oo,
+    the n^2 pairs c_j o_i, the factor pairs u_k o_i.  Holds o, W and s or c on the grid,
+    unblocked: 24 n bytes per grid point, 16 n for a diagonal oo alone (s_j = oo_jj o_j).'''
+    n = o.shape[1]
+    ngrid = int(np.prod(mesh))
+    ones = cp.ones(n)
+    paired = oo is not None or cross is not None
+    sg, scale = None, ones
+    if _diagonal(oo, cross):
+        og, = mo_on_grid(cell, [o], mesh)
+        sg, scale = og, cp.ascontiguousarray(cp.diagonal(cp.asarray(oo)))
+    elif paired:
+        s = cross if oo is None else (o @ oo if cross is None else cross + o @ oo)
+        og, sg = mo_on_grid(cell, [o, s], mesh)
+        s = None
+    else:
+        og, = mo_on_grid(cell, [o], mesh)
+    W = cp.zeros_like(og)
+    if paired:
+        # pairs (j, i <= j) row-major; W_i += s_j V_ji and, off the diagonal, W_j += s_i V_ji
+        sums = _PotentialSum(mesh, w_half, _fft_batch(ngrid))
+        jj, ii = np.tril_indices(n)
+        jidx, iidx = (cp.asarray(a, dtype=np.int32) for a in (jj, ii))
+        if log is not None:
+            log.debug('exchange: %d o o pairs, %d per FFT', len(jj), sums.pb)
+        for p0, p1 in lib.prange(0, len(jj), sums.pb):
+            j, i = jj[p0:p1], ii[p0:p1]
+            P = np.arange(p1 - p0)
+            off = i < j
+            sums.add(W, og, og, jidx, iidx, p0, p1, sg, scale, np.concatenate([i, j[off]]),
+                     np.concatenate([P, P[off]]), np.concatenate([j, i[off]]))
+        sums = jidx = iidx = None
+    if cross is not None:
+        if oo is not None:                 # sg held s, not the cross grids
+            sg = None
+            sg, = mo_on_grid(cell, [cross], mesh)
+        # pairs (i, j) ket-major, P = i * n + j; W_i += o_j V[c_j o_i]
+        sums = _PotentialSum(mesh, w_half, _fft_batch(ngrid))
+        iidx = cp.repeat(cp.arange(n, dtype=np.int32), n)
+        jidx = cp.tile(cp.arange(n, dtype=np.int32), n)
+        if log is not None:
+            log.debug('exchange: %d c o pairs, %d per FFT', n * n, sums.pb)
+        for p0, p1 in lib.prange(0, n * n, sums.pb):
+            P = np.arange(p0, p1)
+            sums.add(W, sg, og, jidx, iidx, p0, p1, og, ones, P // n, P - p0, P % n)
+        sums = jidx = iidx = None
+    sg = None
+    if U is not None and U.shape[1]:
+        per_point = plan_budget(free_bytes()) // ngrid
+        # og and W are held: the factor grids get _plan's factor share of the rest
+        ub = int(_FACTOR_SHARE / (1 - _KET_SHARE) * per_point) // 8
+        ub = max(1, min(U.shape[1], ub))
+        pb = _fft_batch(ngrid, 8 * ub)
+        if log is not None:
+            log.debug('exchange: %d factor pairs, factor blocks %d, %d per FFT',
+                      U.shape[1] * n, ub, pb)
+        _grids(cell, mesh, lam, U, og, W, ub, pb, w_half)
+    return W
+
+
+def _occ_parts(M, mo, occ):
+    '''(keyword arguments of _occ_grids, pairs) for D = mo M mo^T on the kets mo[:, occ]:
+    D's blocks (oo, cross, the virtual block's factors) or D's factors whole, whichever has
+    fewer pairs.  A block below _RANK_TOL of M's largest element is left out.'''
+    M, mo = (cp.asarray(a, dtype=np.float64) for a in (M, mo))
+    occ = np.asarray(occ, dtype=bool)
+    o, v = (cp.asarray(np.flatnonzero(m)) for m in (occ, ~occ))
+    n = len(o)
+    lam, U = factor(M, mo)
+    tiny = _RANK_TOL * float(cp.abs(M).max())
+    m_oo, m_vo = M[o][:, o], M[v][:, o]
+    oo = m_oo if float(cp.abs(m_oo).max()) > tiny else None
+    cross = mo[:, v] @ m_vo if len(v) and float(cp.abs(m_vo).max()) > tiny else None
+    lam_v, U_v = factor(M[v][:, v], mo[:, v]) if len(v) else (None, None)
+    pairs = ((n * (n + 1) // 2 if oo is not None or cross is not None else 0)
+             + (n * n if cross is not None else 0) + (0 if U_v is None else U_v.shape[1] * n))
+    if len(lam) * n <= pairs:
+        return dict(lam=lam, U=U), len(lam) * n
+    return dict(oo=oo, cross=cross, lam=lam_v, U=U_v), pairs
+
+
+def exchange_ket(cell, mesh, lam, U, ket, coulG, L=None, verbose=None):
     '''K[U diag(lam) U^T] @ ket, CuPy (nao, nket), for the kernel ``coulG`` (``get_coulG``'s
-    normalisation).'''
+    normalisation); with L (nao, nket) the exchange force instead, NumPy (natm, 3), dE/dR:
+    -2 sum_{i in A} sum_m L_im (vol/ngrid) sum_g d_x ao_i(g) W_m(g), W of D on the ket columns
+    m (the force of ``gpu_pairing_force`` with W from D and L = C M from another density).
+    The ket columns go in blocks sized to the free memory (_plan).'''
     log = logger.new_logger(cell, verbose)
     t0 = log.init_timer()
+    what = 'exchange' if L is None else 'exchange force'
     mesh = np.asarray(mesh, dtype=int)
-    ngrid = int(np.prod(mesh))
     U, ket, lam = (cp.asarray(a, dtype=np.float64) for a in (U, ket, lam))
     w_half = half_kernel(coulG, mesh)
     nket = ket.shape[1]
     kb, ub, pb = _plan(cell, mesh, nket, U.shape[1])
-    log.debug('exchange: rank %d, ket %d in blocks of %d, factor blocks %d, %d pairs per FFT%s',
+    log.debug('%s: rank %d, ket %d in blocks of %d, factor blocks %d, %d pairs per FFT%s', what,
               U.shape[1], nket, kb, ub, pb,
               ' (five-pass FFT)' if gpu_fft_chain.applies(mesh) else '')
-    K = cp.empty((cell.nao, nket))
+    out = cp.empty((cell.nao, nket)) if L is None else np.zeros((cell.natm, 3))
     for i0, i1 in lib.prange(0, nket, kb):
         ket_grid, = mo_on_grid(cell, [ket[:, i0:i1]], mesh)
-        W = _grids(cell, mesh, lam, U, ket_grid, ub, pb, w_half)
+        W = _grids(cell, mesh, lam, U, ket_grid, cp.zeros_like(ket_grid), ub, pb, w_half)
         ket_grid = None
-        Kb = cp.zeros((cell.nao, i1 - i0))
-        for g0, g1, aoT in ao_loop(cell, mesh, extra_per_point=8 * (i1 - i0)):
-            Kb += aoT @ W[:, g0:g1].T
-        # the loop variable keeps the last AO chunk, as large as the plan allowed, through
-        # the next ket block, whose budget was planned without it
-        aoT = None
-        K[:, i0:i1] = Kb * (cell.vol / ngrid)
+        if L is None:
+            out[:, i0:i1] = ao_project(cell, mesh, W)
+        else:
+            out += ao_force(cell, mesh, W, L[:, i0:i1])
         W = None
-    log.timer(f'exchange: {U.shape[1] * nket} codensity pairs', *t0)
-    return K
+    log.timer(f'{what}: {U.shape[1] * nket} codensity pairs', *t0)
+    return out
 
 
 def exchange_cross_ket(cell, mesh, ket, cross, coulG, verbose=None):
     '''K[cross ket^T + ket cross^T] @ ket, CuPy (nao, n), for ket and cross (nao, n) and the
     kernel ``coulG`` (``get_coulG``'s normalisation): a CPHF density C_v x C_o^T + h.c. on the
-    occupied orbitals (ket C_o, cross C_v x).  W_i = sum_j c_j V[o_j o_i] + o_j V[c_j o_i]
-    with both orbital sets on the grid once, the o_j o_i pairs j >= i once, one AO projection.
-    Holds the two orbital grids and W, unblocked: 24 n bytes per grid point.'''
+    occupied orbitals (ket C_o, cross C_v x), 1.5 n^2 pairs (_occ_grids).'''
     log = logger.new_logger(cell, verbose)
     t0 = log.init_timer()
     mesh = np.asarray(mesh, dtype=int)
-    ngrid = int(np.prod(mesh))
     n = ket.shape[1]
-    per_point = plan_budget(free_bytes()) // ngrid - 24 * n
-    pb = per_point // _FFT_BYTES
-    if pb < 1:
-        raise MemoryError(f'cross exchange: {per_point} bytes per grid point leave no FFT batch')
-    pb = min(pb, max_fft_batch(ngrid))
-    log.debug('cross exchange: %d kets, %d pairs per FFT%s', n, pb,
-              ' (five-pass FFT)' if gpu_fft_chain.applies(mesh) else '')
-    w_half = half_kernel(coulG, mesh)
-    sums = _PotentialSum(mesh, w_half, pb)
-    o, c = mo_on_grid(cell, [cp.asarray(ket, dtype=np.float64),
-                             cp.asarray(cross, dtype=np.float64)], mesh)
-    W = cp.zeros_like(o)
-    ones = cp.ones(n)
-    # c o^T: pairs (j, i <= j) row-major; W_i += c_j V_ji and, off the diagonal, W_j += c_i V_ji
-    jj, ii = np.tril_indices(n)
-    jidx, iidx = cp.asarray(jj, dtype=np.int32), cp.asarray(ii, dtype=np.int32)
-    for p0, p1 in lib.prange(0, len(jj), pb):
-        j, i = jj[p0:p1], ii[p0:p1]
-        P = np.arange(p1 - p0)
-        off = i < j
-        sums.add(W, o, o, jidx, iidx, p0, p1, c, ones, np.concatenate([i, j[off]]),
-                 np.concatenate([P, P[off]]), np.concatenate([j, i[off]]))
-    # o c^T: pairs (i, j) ket-major, P = i * n + j; W_i += o_j V[c_j o_i]
-    iidx = cp.repeat(cp.arange(n, dtype=np.int32), n)
-    jidx = cp.tile(cp.arange(n, dtype=np.int32), n)
-    for p0, p1 in lib.prange(0, n * n, pb):
-        P = np.arange(p0, p1)
-        sums.add(W, c, o, jidx, iidx, p0, p1, o, ones, P // n, P - p0, P % n)
-    o = c = jidx = iidx = sums = None
-    K = cp.zeros((cell.nao, n))
-    for g0, g1, aoT in ao_loop(cell, mesh, extra_per_point=8 * n):
-        K += aoT @ W[:, g0:g1].T
-    aoT = W = None
+    ket, cross = (cp.asarray(a, dtype=np.float64) for a in (ket, cross))
+    W = _occ_grids(cell, mesh, ket, half_kernel(coulG, mesh), cross=cross, log=log)
+    K = ao_project(cell, mesh, W)
     log.timer(f'cross exchange: {n * (n + 1) // 2 + n * n} codensity pairs', *t0)
-    return K * (cell.vol / ngrid)
+    return K
 
 
-def exchange_force(cell, mesh, lam, U, ket, L, coulG, verbose=None):
-    '''-2 sum_{i in A} sum_m L_im G[x, i, m], NumPy (natm, 3), with
-    G[x, i, m] = (vol/ngrid) sum_g d_x ao_i(g) W_m(g) and W of D = U diag(lam) U^T on the ket
-    columns m: the exchange force of ``gpu_pairing_force`` with W from D and L = C M from
-    another density (L (nao, nket) matches the ket columns).  dE/dR convention.'''
+def exchange_occ_ket(cell, mesh, M, mo, occ, coulG, L=None, verbose=None):
+    '''K[mo M mo^T] @ mo[:, occ], CuPy (nao, n), for a symmetric M (nmo, nmo) over the MOs
+    ``mo`` and their occupied mask ``occ`` (NumPy bool); with L (nao, n) the exchange force
+    against it instead, as ``exchange_ket``.  D's blocks or its factors, whichever has fewer
+    pairs (_occ_parts).'''
     log = logger.new_logger(cell, verbose)
     t0 = log.init_timer()
+    what = 'exchange' if L is None else 'exchange force'
     mesh = np.asarray(mesh, dtype=int)
-    ngrid = int(np.prod(mesh))
-    U, ket, lam, L = (cp.asarray(a, dtype=np.float64) for a in (U, ket, lam, L))
-    w_half = half_kernel(coulG, mesh)
-    nket = ket.shape[1]
-    kb, ub, pb = _plan(cell, mesh, nket, U.shape[1])
-    t = cp.zeros((3, cell.nao))
-    for i0, i1 in lib.prange(0, nket, kb):
-        ket_grid, = mo_on_grid(cell, [ket[:, i0:i1]], mesh)
-        W = _grids(cell, mesh, lam, U, ket_grid, ub, pb, w_half)
-        ket_grid = None
-        G = cp.zeros((3, cell.nao, i1 - i0))
-        for g0, g1, ao in ao_loop(cell, mesh, deriv=1, extra_per_point=8 * (i1 - i0)):
-            Wc = cp.ascontiguousarray(W[:, g0:g1])
-            for x in range(3):
-                G[x] += ao[1 + x].T @ Wc.T
-        ao = Wc = W = None             # the last AO chunk too (see exchange_ket)
-        t += cp.einsum('xim,im->xi', G, L[:, i0:i1]) * (cell.vol / ngrid)
-    t = t.get()
-    de = np.zeros((cell.natm, 3))
-    for ia, (_, _, p0, p1) in enumerate(cell.aoslice_by_atom()):
-        de[ia] = -2.0 * t[:, p0:p1].sum(axis=1)
-    log.timer(f'exchange force: {U.shape[1] * nket} codensity pairs', *t0)
-    return de
+    parts, pairs = _occ_parts(M, mo, occ)
+    o = cp.asarray(mo, dtype=np.float64)[:, cp.asarray(np.flatnonzero(occ))]
+    W = _occ_grids(cell, mesh, o, half_kernel(coulG, mesh), log=log, **parts)
+    out = ao_project(cell, mesh, W) if L is None else ao_force(cell, mesh, W, L)
+    log.timer(f'{what} on the occupied kets: {pairs} codensity pairs', *t0)
+    return out

@@ -15,7 +15,7 @@ import cupy as cp
 
 from lib_pprpa.pair_operator import pack_offset
 
-__all__ = ['FFT_BATCH_MIN', 'pack_offset', 'eri_bytes', 'free_bytes', 'plan_budget',
+__all__ = ['FFT_BATCH_MIN', 'EXCHANGE_FFT_BYTES', 'pack_offset', 'eri_bytes', 'free_bytes', 'plan_budget',
            'pooled', 'is_pooled', 'empty_pinned', 'is_pinned', 'max_fft_batch']
 
 
@@ -31,6 +31,11 @@ _RESERVE_MIN = 512 * 1024**2
 # of the time per transform of batch 128 on 107^3 and 159^3 meshes (H200); batch 1
 # is 16% / 52% slower.
 FFT_BATCH_MIN = 16
+# Bytes per (codensity, grid point) of one exchange FFT batch (gpu_exchange, gpu_pairing_force):
+# coulomb_potential peaks at 56.4 (codensities, half spectrum, real output, two cuFFT work
+# areas, measured on the 159^3 mesh, see gpu_ao2mo) plus 8 for the scratch of the W updates;
+# gpu_fft_chain's two half-spectrum buffers take at most half of it.
+EXCHANGE_FFT_BYTES = 64
 # Largest block pooled() keeps in cupy's pool.  The per-iteration blocks it is for are
 # 0.1-1.5 GB (numint grid blocks, FFT batch outputs); one-per-pass blocks above it (AO
 # chunks of 20+ GB) gain nothing from caching, and a cached one that a smaller array

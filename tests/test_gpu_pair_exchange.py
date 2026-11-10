@@ -48,7 +48,8 @@ def test_relaxed_density_from_pair_potential(diamond, mult):
     from scipy.linalg import block_diag
     from lib_pprpa.grad.grad_utils import get_xy_full
     from lib_pprpa.grad.pprpa import make_rdm1_relaxed_rhf_pprpa
-    from lib_pprpa.gpu_pairing_force import pair_exchange, pair_potential_lowrank
+    from lib_pprpa.gpu_coulomb import ao_project
+    from lib_pprpa.gpu_pairing_force import pair_potential_lowrank
     from lib_pprpa.pprpa_davidson import ppRPA_Davidson
     cell, mf = diamond
     nocc = cell.nelectron // 2
@@ -73,7 +74,7 @@ def test_relaxed_density_from_pair_potential(diamond, mult):
                                       cphf_max_cycle=50, pair_get_k=dense)
     got = make_rdm1_relaxed_rhf_pprpa(solver, mf, xy=xy, mult=mult, cphf_conv_tol=1e-10,
                                       cphf_max_cycle=50,
-                                      pair_k=pair_exchange(cell, cell.mesh, W))
+                                      pair_k=ao_project(cell, cell.mesh, W).get())
     np.testing.assert_allclose(got[0], ref[0], rtol=0, atol=1e-9)
     np.testing.assert_allclose(got[1], ref[1], rtol=0, atol=1e-9)
 
@@ -83,8 +84,8 @@ def test_shared_pair_potential(diamond, mult):
     """One pass of pair potentials gives K[X + Y] @ orbp (against the dense kernel) and
     the pairing force (against the force that builds its own potentials)."""
     from scipy.linalg import block_diag
-    from lib_pprpa.gpu_pairing_force import (pair_exchange, pair_potential_lowrank,
-                                             pairing_k_force_lowrank)
+    from lib_pprpa.gpu_coulomb import ao_project
+    from lib_pprpa.gpu_pairing_force import pair_potential_lowrank, pairing_k_force_lowrank
     cell, mf = diamond
     rng = np.random.default_rng(2)
     nocc = cell.nelectron // 2
@@ -96,7 +97,7 @@ def test_shared_pair_potential(diamond, mult):
     M = block_diag(y, x)
     dm = orbp @ M @ orbp.T
     W = pair_potential_lowrank(cell, cell.mesh, orbp, M)
-    got = pair_exchange(cell, cell.mesh, W)
+    got = ao_project(cell, cell.mesh, W).get()
     ref = (_dense_k(cell, dm[None]) @ orbp)[0]
     assert got.shape == ref.shape
     assert np.abs(got - ref).max() < 1e-9 * np.abs(ref).max()

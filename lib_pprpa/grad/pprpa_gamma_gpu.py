@@ -12,7 +12,7 @@ W=energy-weighted dm, X=pp-RPA 2-RDM amplitude density):
   hcore   : hcore_contracted.hcore_deriv_contracted(T)  (density on the mesh once)
   ovlp    : krhf_g.contract_h1e_dm(s1, W)            (note +=, W carries -dme0)
   J ref   : polarization Q(T)-Q(P) via jk_energy_per_atom(j=1,sr=lr=0), FFTDF
-  hyb K   : Q(T)-Q(P) = -1/2 [F_b(D, T) + F_b(P, D)], gpu_exchange.exchange_force with
+  hyb K   : Q(T)-Q(P) = -1/2 [F_b(D, T) + F_b(P, D)], gpu_exchange.exchange_ket (L=) with
             the hybrid's hyb SR + alpha LR kernel, FFT    (hybrids)
   pairing : gpu_pairing_force.pairing_k_force_lowrank(C, M) for X = C M C^T, FFT
   Vxc     : 2*einsum(v1ao[1:,atom], T) from grad_utils_gpu_pbc._contract_xc_kernel
@@ -47,12 +47,11 @@ from lib_pprpa.grad.pprpa import make_rdm1_relaxed_warm
 from lib_pprpa.grad import pprpa_gamma as _cpu
 from lib_pprpa.grad.grad_utils import get_xy_full
 from lib_pprpa.grad.grad_utils_gpu_pbc import _contract_xc_kernel as _cxk_gpu
-from lib_pprpa.gpu_coulomb import exchange_coulG
+from lib_pprpa.gpu_coulomb import ao_project, exchange_coulG
 from lib_pprpa.gpu_emulation import emulation_available, fp64_emulation
-from lib_pprpa.gpu_exchange import exchange_force, factor
+from lib_pprpa.gpu_exchange import exchange_ket, exchange_occ_ket
 from lib_pprpa.gpu_mem import pooled
-from lib_pprpa.gpu_pairing_force import (pair_exchange, pair_potential_lowrank,
-                                         pairing_k_force_lowrank)
+from lib_pprpa.gpu_pairing_force import pair_potential_lowrank, pairing_k_force_lowrank
 from lib_pprpa.gpu_response import fused_response
 from lib_pprpa.grad.hcore_contracted import hcore_deriv_contracted
 
@@ -190,7 +189,7 @@ def grad_elec(pprpa_grad, xy, mult, atmlst=None):
         xy, pprpa.oo_dim, mult, nocc=nocc, nvir=nvir)
     Mp = block_diag(occ_y, vir_x)
     Wp = pair_potential_lowrank(cell, cell.mesh, orbp, Mp, devices=pprpa_grad.devices)
-    pair_k = pair_exchange(cell, cell.mesh, Wp)
+    pair_k = ao_project(cell, cell.mesh, Wp).get()
     de_pairing = pairing_k_force_lowrank(cell, cell.mesh, orbp, Mp, W=Wp)
     Wp = None
     P_mo, W_mo = make_rdm1_relaxed_warm(pprpa_grad, mf, xy, mult, vresp=vresp, pair_k=pair_k)
@@ -237,14 +236,17 @@ def grad_elec(pprpa_grad, xy, mult, atmlst=None):
     if abs(hyb) > 1e-12 or abs(alpha) > 1e-12:
         # hybrid reference exchange via the same polarization identity, on the SCF's mesh:
         # Q = -1/2 F with F(M) = F_b(M, M) bilinear (W from the first, L from the second), so
-        # F(T) - F(P) = F_b(D, T) + F_b(P, D): W of D on every MO, W of P on the occupied ones
+        # F(T) - F(P) = F_b(D, T) + F_b(P, D): W of D on every MO (on the virtual ones from
+        # its factors, on the occupied ones from the pairs o_j o_i once), W of P on the
+        # occupied ones (from P's blocks or factors)
         coulG = exchange_coulG(cell, cell.mesh, omega, alpha, hyb, mf.exxdiv)
         occ = mf.mo_occ > 0
         n, cocc = mf.mo_occ[occ], mo[:, occ]
-        lam_p, U_p = factor(P_mo, mo)
-        de_k = exchange_force(cell, cell.mesh, n, cocc, mo, mo @ (P_mo + np.diag(mf.mo_occ)),
-                              coulG)
-        de_k += exchange_force(cell, cell.mesh, lam_p, U_p, cocc, cocc * n, coulG)
+        L = mo @ (P_mo + np.diag(mf.mo_occ))
+        de_k = exchange_ket(cell, cell.mesh, n, cocc, mo[:, ~occ], coulG, L=L[:, ~occ])
+        de_k += exchange_occ_ket(cell, cell.mesh, np.diag(mf.mo_occ), mo, occ, coulG,
+                                 L=L[:, occ])
+        de_k += exchange_occ_ket(cell, cell.mesh, P_mo, mo, occ, coulG, L=cocc * n)
         de -= 0.5 * cp.asarray(de_k)
 
     de += cp.asarray(de_pairing)

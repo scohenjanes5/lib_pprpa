@@ -9,8 +9,8 @@ the free memory; K = P^T K P with P the S-projector onto the span of C (exact th
 and J go to FFTDF.
 
 With ``ace`` set, an orbital-tagged density gets the adaptively compressed exchange (Lin,
-JCTC 12, 2242 (2016)): W = K C_occ from the occupied pairs alone (``gpu_pairing_force``'s
-symmetric pair potential, nocc (nocc + 1) / 2 codensities instead of nocc x nmo) and
+JCTC 12, 2242 (2016)): W = K C_occ from the occupied pairs alone (``exchange_occ_ket``,
+nocc (nocc + 1) / 2 codensities instead of nocc x nmo) and
 
     K_ace = W (C_occ^T W)^-1 W^T,
 
@@ -24,8 +24,7 @@ import cupy as cp
 from gpu4pyscf.pbc import tools as gtools
 from gpu4pyscf.pbc.df.fft import FFTDF
 
-from lib_pprpa.gpu_exchange import exchange_ket, factor, projector
-from lib_pprpa.gpu_pairing_force import pair_exchange, pair_potential_lowrank
+from lib_pprpa.gpu_exchange import exchange_ket, exchange_occ_ket, factor, projector
 
 __all__ = ['LowRankFFTDF', 'full_exchange_orbitals']
 
@@ -55,12 +54,11 @@ class LowRankFFTDF(FFTDF):
         cell = self.cell
         mo_coeff = getattr(dm, 'mo_coeff', None)
         if mo_coeff is not None and self.ace:
-            occ = cp.asarray(dm.mo_occ[0])
+            occ = cp.asnumpy(cp.asarray(dm.mo_occ[0]))
             cocc = cp.asarray(mo_coeff[0])[:, occ > 0]
-            W = pair_potential_lowrank(cell, self.mesh, cocc.get(), np.diag(occ[occ > 0].get()),
-                                       verbose=self.verbose, coulG=coulG)
-            KC = cp.asarray(pair_exchange(cell, self.mesh, W))      # K C_occ
-            W = None
+            # K C_occ from the occupied pairs once (D's occupied block is diag(occ))
+            KC = exchange_occ_ket(cell, self.mesh, np.diag(occ[occ > 0]), cocc,
+                                  np.ones(cocc.shape[1], dtype=bool), coulG, verbose=self.verbose)
             M = cocc.T @ KC
             vk = KC @ cp.linalg.solve(.5 * (M + M.T), KC.T)
             return vj, (.5 * (vk + vk.T))[None]
