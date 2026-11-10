@@ -114,9 +114,13 @@ def test_cross_exchange_in_blocks(monkeypatch):
 
     monkeypatch.setattr(gx, "free_bytes", tight)
     calls = []
-    potential = gx.coulomb_potential
-    monkeypatch.setattr(gx, "coulomb_potential",
-                        lambda rho, *a: calls.append(len(rho)) or potential(rho, *a))
+    add = gx._PotentialSum.add
+
+    def counted(self, W, A, B, aidx, bidx, p0, p1, *rest):
+        calls.append(p1 - p0)
+        add(self, W, A, B, aidx, bidx, p0, p1, *rest)
+
+    monkeypatch.setattr(gx._PotentialSum, "add", counted)
     got = cp.asnumpy(gx.exchange_cross_ket(cell, cell.mesh, o, v @ t, coulG))
     assert max(calls) == 2
     assert np.abs(got - ref).max() < 1e-11 * np.abs(ref).max()

@@ -6,7 +6,8 @@ For D = sum_k lam_k u_k u_k^T and ket orbitals v_i (columns of AO coefficient ma
 
 K[D] v_i = (vol / ngrid) sum_g ao(g) W_i(g) (K_pq = sum_jk (pj|kq) D_jk, gpu4pyscf's fft_jk.get_k)
 and the exchange force of D is the same W against the gradient AOs.  One codensity FFT per
-(k, i) pair, real-to-complex with ``gpu_coulomb``'s symmetrised kernel.  A block of ket grids
+(k, i) pair, real-to-complex with ``gpu_coulomb``'s symmetrised kernel, by ``gpu_fft_chain``'s
+five kernels on a mesh they apply to (sides 7-smooth), else by cuFFT.  A block of ket grids
 and its W stay on the device while the factor grids are evaluated block by block, so memory is
 set by the ket block, not by the rank of D.  ``factor`` gives (lam, U) of a symmetric density
 from its coefficients over a basis (``projector``).  NumPy or CuPy coefficients; one device.
@@ -21,13 +22,15 @@ import cupy as cp
 from pyscf import lib
 from pyscf.lib import logger
 
+from lib_pprpa import gpu_fft_chain
 from lib_pprpa.gpu_coulomb import ao_loop, codensity, coulomb_potential, half_kernel, mo_on_grid
 from lib_pprpa.gpu_mem import free_bytes, max_fft_batch, plan_budget
 
 __all__ = ['factor', 'projector', 'exchange_ket', 'exchange_cross_ket', 'exchange_force']
 
 # Bytes per (codensity, grid point) of one coulomb_potential batch: 56.4 (codensities, half
-# spectrum, real output, two cuFFT work areas, measured on the 159^3 mesh, see gpu_ao2mo).
+# spectrum, real output, two cuFFT work areas, measured on the 159^3 mesh, see gpu_ao2mo);
+# gpu_fft_chain's two half-spectrum buffers take at most half of it.
 _FFT_BYTES = 64
 # Shares of the per-grid-point budget: ket grids + their W, factor grids; the rest is the FFT batch.
 _KET_SHARE = 0.3
@@ -52,17 +55,40 @@ _ACCUMULATE = cp.ElementwiseKernel(
     'pprpa_exchange_accumulate')
 
 
+def _csr(target, pair, src):
+    '''(rows, ptr, pair, src), int32 device arrays: the contributions k grouped by target row,
+    those of rows[t] at [ptr[t], ptr[t + 1]).'''
+    order = np.argsort(target, kind='stable')
+    rows, start = np.unique(target[order], return_index=True)
+    ptr = np.append(start, len(order))
+    return tuple(cp.asarray(a, dtype=np.int32) for a in (rows, ptr, pair[order], src[order]))
+
+
 def _accumulate(W, V, S, scale, target, pair, src):
     '''W[target_k] += scale[src_k] S[src_k] V[pair_k] for the contributions k of one FFT batch
     (NumPy integer arrays; V the batch's potentials, S the source grids): one pass over V,
     each target row of W read and written once, no temporaries of the grid's size.'''
-    order = np.argsort(target, kind='stable')
-    rows, start = np.unique(target[order], return_index=True)
-    ptr = np.append(start, len(order))
-    rows, ptr, pair, src = (cp.asarray(a, dtype=np.int32)
-                            for a in (rows, ptr, pair[order], src[order]))
+    rows, ptr, pair, src = _csr(target, pair, src)
     ngrid = V.shape[1]
     _ACCUMULATE(V, S, scale, rows, ptr, pair, src, ngrid, W, size=len(rows) * ngrid)
+
+
+class _PotentialSum:
+    '''W[target_k] += scale[src_k] S[src_k] V[A[a_P] B[b_P]], P = p0 + pair_k, for one FFT batch
+    of at most ``pb`` codensities: gpu_fft_chain on a mesh it applies to, else codensity,
+    cuFFT and _accumulate.'''
+
+    def __init__(self, mesh, w_half, pb):
+        self.mesh, self.w_half = mesh, w_half
+        self.chain = (gpu_fft_chain.FFTChain(mesh, w_half, pb)
+                      if gpu_fft_chain.applies(mesh) else None)
+
+    def add(self, W, A, B, aidx, bidx, p0, p1, S, scale, target, pair, src):
+        if self.chain is None:
+            V = coulomb_potential(codensity(A, B, aidx, bidx, p0, p1), self.mesh, self.w_half)
+            _accumulate(W, V, S, scale, target, pair, src)
+        else:
+            self.chain.add(W, A, B, aidx, bidx, p0, p1, S, scale, *_csr(target, pair, src))
 
 
 def factor(M, C):
@@ -103,6 +129,7 @@ def _grids(cell, mesh, lam, U, ket_grid, ub, pb, w_half):
     evaluated ``ub`` columns of U at a time, ``pb`` codensities per FFT batch.'''
     nket = ket_grid.shape[0]
     W = cp.zeros_like(ket_grid)
+    sums = _PotentialSum(mesh, w_half, pb)
     for k0, k1 in lib.prange(0, U.shape[1], ub):
         u, = mo_on_grid(cell, [U[:, k0:k1]], mesh)
         lu = lam[k0:k1]
@@ -111,10 +138,9 @@ def _grids(cell, mesh, lam, U, ket_grid, ub, pb, w_half):
         iidx = cp.repeat(cp.arange(nket, dtype=np.int32), nk)
         kidx = cp.tile(cp.arange(nk, dtype=np.int32), nket)
         for p0, p1 in lib.prange(0, nk * nket, pb):
-            V = coulomb_potential(codensity(u, ket_grid, kidx, iidx, p0, p1), mesh, w_half)
             P = np.arange(p0, p1)
-            _accumulate(W, V, u, lu, P // nk, P - p0, P % nk)     # lam_k u_k V[u_k v_i]
-            V = None
+            # lam_k u_k V[u_k v_i]
+            sums.add(W, u, ket_grid, kidx, iidx, p0, p1, u, lu, P // nk, P - p0, P % nk)
         u = None
     return W
 
@@ -130,8 +156,9 @@ def exchange_ket(cell, mesh, lam, U, ket, coulG, verbose=None):
     w_half = half_kernel(coulG, mesh)
     nket = ket.shape[1]
     kb, ub, pb = _plan(cell, mesh, nket, U.shape[1])
-    log.debug('exchange: rank %d, ket %d in blocks of %d, factor blocks %d, %d pairs per FFT',
-              U.shape[1], nket, kb, ub, pb)
+    log.debug('exchange: rank %d, ket %d in blocks of %d, factor blocks %d, %d pairs per FFT%s',
+              U.shape[1], nket, kb, ub, pb,
+              ' (five-pass FFT)' if gpu_fft_chain.applies(mesh) else '')
     K = cp.empty((cell.nao, nket))
     for i0, i1 in lib.prange(0, nket, kb):
         ket_grid, = mo_on_grid(cell, [ket[:, i0:i1]], mesh)
@@ -165,8 +192,10 @@ def exchange_cross_ket(cell, mesh, ket, cross, coulG, verbose=None):
     if pb < 1:
         raise MemoryError(f'cross exchange: {per_point} bytes per grid point leave no FFT batch')
     pb = min(pb, max_fft_batch(ngrid))
-    log.debug('cross exchange: %d kets, %d pairs per FFT', n, pb)
+    log.debug('cross exchange: %d kets, %d pairs per FFT%s', n, pb,
+              ' (five-pass FFT)' if gpu_fft_chain.applies(mesh) else '')
     w_half = half_kernel(coulG, mesh)
+    sums = _PotentialSum(mesh, w_half, pb)
     o, c = mo_on_grid(cell, [cp.asarray(ket, dtype=np.float64),
                              cp.asarray(cross, dtype=np.float64)], mesh)
     W = cp.zeros_like(o)
@@ -175,22 +204,18 @@ def exchange_cross_ket(cell, mesh, ket, cross, coulG, verbose=None):
     jj, ii = np.tril_indices(n)
     jidx, iidx = cp.asarray(jj, dtype=np.int32), cp.asarray(ii, dtype=np.int32)
     for p0, p1 in lib.prange(0, len(jj), pb):
-        V = coulomb_potential(codensity(o, o, jidx, iidx, p0, p1), mesh, w_half)
         j, i = jj[p0:p1], ii[p0:p1]
         P = np.arange(p1 - p0)
         off = i < j
-        _accumulate(W, V, c, ones, np.concatenate([i, j[off]]), np.concatenate([P, P[off]]),
-                    np.concatenate([j, i[off]]))
-        V = None
+        sums.add(W, o, o, jidx, iidx, p0, p1, c, ones, np.concatenate([i, j[off]]),
+                 np.concatenate([P, P[off]]), np.concatenate([j, i[off]]))
     # o c^T: pairs (i, j) ket-major, P = i * n + j; W_i += o_j V[c_j o_i]
     iidx = cp.repeat(cp.arange(n, dtype=np.int32), n)
     jidx = cp.tile(cp.arange(n, dtype=np.int32), n)
     for p0, p1 in lib.prange(0, n * n, pb):
-        V = coulomb_potential(codensity(c, o, jidx, iidx, p0, p1), mesh, w_half)
         P = np.arange(p0, p1)
-        _accumulate(W, V, o, ones, P // n, P - p0, P % n)
-        V = None
-    o = c = jidx = iidx = None
+        sums.add(W, c, o, jidx, iidx, p0, p1, o, ones, P // n, P - p0, P % n)
+    o = c = jidx = iidx = sums = None
     K = cp.zeros((cell.nao, n))
     for g0, g1, aoT in ao_loop(cell, mesh, extra_per_point=8 * n):
         K += aoT @ W[:, g0:g1].T
