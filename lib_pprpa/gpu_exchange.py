@@ -20,7 +20,8 @@ from lib_pprpa.gpu_coulomb import (ao_force, ao_project, codensity, coulomb_pote
                                    half_kernel, mo_on_grid)
 from lib_pprpa.gpu_mem import EXCHANGE_FFT_BYTES, free_bytes, max_fft_batch, plan_budget
 
-__all__ = ['factor', 'projector', 'exchange_ket', 'exchange_cross_ket', 'exchange_occ_ket']
+__all__ = ['factor', 'projector', 'exchange_ket', 'exchange_cross_ket', 'exchange_occ_ket',
+           'reference_exchange_force']
 
 # Shares of the per-grid-point budget: ket grids + their W, factor grids; the rest is the FFT batch.
 _KET_SHARE = 0.3
@@ -290,3 +291,22 @@ def exchange_occ_ket(cell, mesh, M, mo, occ, coulG, L=None, verbose=None):
     out = ao_project(cell, mesh, W) if L is None else ao_force(cell, mesh, W, L)
     log.timer(f'{what} on the occupied kets: {pairs} codensity pairs', *t0)
     return out
+
+
+def reference_exchange_force(cell, mesh, mo, mo_occ, coulG, P=None, verbose=None):
+    '''dE/dR, NumPy (natm, 3), of the exchange energy -1/4 tr(D K[D]) of the closed-shell
+    reference D = mo diag(mo_occ) mo^T (``coulG`` with the hybrid's factors); with the relaxed
+    density P (MO basis) the polarisation identity's Q(D + P) - Q(P) instead.  Q = -F/2 with
+    F(M) = F_b(M, M), F_b(A, B) the force of A's W against B's L, so the difference is
+    -1/2 [F_b(D, D + P) + F_b(P, D)]: W of D on the virtual MOs from its factors and on the
+    occupied ones from the pairs o_j o_i once, W of P on the occupied ones.'''
+    mo, mo_occ = np.asarray(mo, dtype=np.float64), np.asarray(mo_occ, dtype=np.float64)
+    occ = mo_occ > 0
+    D = np.diag(mo_occ)
+    L = mo @ (D if P is None else D + P)
+    de = exchange_occ_ket(cell, mesh, D, mo, occ, coulG, L=L[:, occ], verbose=verbose)
+    if P is not None:
+        n, cocc = mo_occ[occ], mo[:, occ]
+        de += exchange_ket(cell, mesh, n, cocc, mo[:, ~occ], coulG, L=L[:, ~occ], verbose=verbose)
+        de += exchange_occ_ket(cell, mesh, P, mo, occ, coulG, L=cocc * n, verbose=verbose)
+    return -0.5 * de

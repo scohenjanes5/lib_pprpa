@@ -31,17 +31,17 @@ import cupy as cp
 from pyscf.lib import chkfile
 from pyscf.pbc import gto, dft as cdft
 from pyscf.pbc.tools.pyscf_ase import pyscf_to_ase_atoms
-from gpu4pyscf.pbc import dft as gdft
 
 from ase.io import read
 from ase.io.extxyz import write_extxyz
 from lib_pprpa.grad.ase_utils import pprpaobj, kernel as ase_opt
+from lib_pprpa.gpu_reference import make_krks, run_scf
 from lib_pprpa.pprpa_davidson_gpu import attach_gpu_contraction
 from lib_pprpa.grad import pprpa_gamma          # noqa: F401  (attaches .Gradients)
 from lib_pprpa.grad import pprpa_gamma_gpu as gpugrad
 
 # ---------------- settings ----------------
-XC       = "pbe"          # functional for the KS reference (use "hf" for HF)
+XC       = "pbe"          # KS reference; a hybrid ("pbe0", "0.18*HF+0.82*PBE,PBE") gets ACE
 CHANNEL  = "pp"           # "pp" (charge +2 ref) or "hh" (charge -2 ref)
 CHARGE   = +2 if CHANNEL == "pp" else -2
 MULT     = sys.argv[1] if len(sys.argv) > 1 else "t"   # 's' or 't'
@@ -49,7 +49,6 @@ ISTATE   = 0
 NROOT    = 2
 FMAX     = 0.05          # eV/Ang convergence
 MAXSTEPS = 15
-KPTS     = np.zeros((1, 3))     # Gamma point
 CHK, RESTART, TRAJ = "scf.chk", "bfgs.pkl", "opt.traj"
 CPHF_CHK = "cphf.chk"           # CPHF warm start between geometry steps and runs
 
@@ -90,12 +89,10 @@ def _pipeline(cell, want_grad):
     (e_state, dE/dR) when want_grad."""
     cell.build()
 
-    # 1) GPU KRKS SCF for orbitals
-    kg = gdft.KRKS(cell, kpts=KPTS, xc=XC)
-    kg.exxdiv = None
-    kg.conv_tol = 1e-9
+    # 1) GPU KRKS SCF for orbitals (a hybrid's exchange adaptively compressed)
+    kg = make_krks(cell, XC)
     kg.chkfile = CHK
-    kg.kernel(scf_guess(kg))
+    run_scf(kg, scf_guess(kg))
 
     # 2) lightweight CPU RKS shell carrying the GPU orbitals (pprpaobj reads numpy)
     mf = cdft.RKS(cell, xc=XC)

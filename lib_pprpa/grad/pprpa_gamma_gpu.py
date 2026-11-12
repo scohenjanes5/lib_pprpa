@@ -12,7 +12,7 @@ W=energy-weighted dm, X=pp-RPA 2-RDM amplitude density):
   hcore   : hcore_contracted.hcore_deriv_contracted(T)  (density on the mesh once)
   ovlp    : krhf_g.contract_h1e_dm(s1, W)            (note +=, W carries -dme0)
   J ref   : polarization Q(T)-Q(P) via jk_energy_per_atom(j=1,sr=lr=0), FFTDF
-  hyb K   : Q(T)-Q(P) = -1/2 [F_b(D, T) + F_b(P, D)], gpu_exchange.exchange_ket (L=) with
+  hyb K   : Q(T)-Q(P) = -1/2 [F_b(D, T) + F_b(P, D)], gpu_exchange.reference_exchange_force with
             the hybrid's hyb SR + alpha LR kernel, FFT    (hybrids)
   pairing : gpu_pairing_force.pairing_k_force_lowrank(C, M) for X = C M C^T, FFT
   Vxc     : 2*einsum(v1ao[1:,atom], T) from grad_utils_gpu_pbc._contract_xc_kernel
@@ -49,7 +49,7 @@ from lib_pprpa.grad.grad_utils import get_xy_full
 from lib_pprpa.grad.grad_utils_gpu_pbc import _contract_xc_kernel as _cxk_gpu
 from lib_pprpa.gpu_coulomb import ao_project, exchange_coulG
 from lib_pprpa.gpu_emulation import emulation_available, fp64_emulation
-from lib_pprpa.gpu_exchange import exchange_ket, exchange_occ_ket
+from lib_pprpa.gpu_exchange import reference_exchange_force
 from lib_pprpa.gpu_mem import pooled
 from lib_pprpa.gpu_pairing_force import pair_potential_lowrank, pairing_k_force_lowrank
 from lib_pprpa.gpu_response import fused_response
@@ -234,20 +234,9 @@ def grad_elec(pprpa_grad, xy, mult, atmlst=None):
     de += cp.asarray(eJ[0] - eJ[1])
 
     if abs(hyb) > 1e-12 or abs(alpha) > 1e-12:
-        # hybrid reference exchange via the same polarization identity, on the SCF's mesh:
-        # Q = -1/2 F with F(M) = F_b(M, M) bilinear (W from the first, L from the second), so
-        # F(T) - F(P) = F_b(D, T) + F_b(P, D): W of D on every MO (on the virtual ones from
-        # its factors, on the occupied ones from the pairs o_j o_i once), W of P on the
-        # occupied ones (from P's blocks or factors)
+        # hybrid reference exchange via the same polarization identity, on the SCF's mesh
         coulG = exchange_coulG(cell, cell.mesh, omega, alpha, hyb, mf.exxdiv)
-        occ = mf.mo_occ > 0
-        n, cocc = mf.mo_occ[occ], mo[:, occ]
-        L = mo @ (P_mo + np.diag(mf.mo_occ))
-        de_k = exchange_ket(cell, cell.mesh, n, cocc, mo[:, ~occ], coulG, L=L[:, ~occ])
-        de_k += exchange_occ_ket(cell, cell.mesh, np.diag(mf.mo_occ), mo, occ, coulG,
-                                 L=L[:, occ])
-        de_k += exchange_occ_ket(cell, cell.mesh, P_mo, mo, occ, coulG, L=cocc * n)
-        de -= 0.5 * cp.asarray(de_k)
+        de += cp.asarray(reference_exchange_force(cell, cell.mesh, mo, mf.mo_occ, coulG, P=P_mo))
 
     de += cp.asarray(de_pairing)
 

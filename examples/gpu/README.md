@@ -14,7 +14,7 @@ This folder has three GPU periodic examples:
 The two optimization examples share the same FFT back end:
 
 ```
-GPU KRKS SCF (gpu4pyscf)
+GPU KRKS SCF                          (lib_pprpa.gpu_reference: make_krks, run_scf)
   -> [energy solve: AO-direct OR MO-eri — see below]
   -> GPU Gamma-point pp-RPA gradient    (lib_pprpa.grad.pprpa_gamma_gpu)
   -> ASE BFGS                           (lib_pprpa.grad.ase_utils.kernel)
@@ -163,6 +163,15 @@ export LD_LIBRARY_PATH=$CU/lib:$SP/cutensor/lib:$LD_LIBRARY_PATH
 
 ## Scope / notes
 - Gamma point, RKS/RHF reference, LDA/GGA/hybrid functionals.
+- The reference comes from `lib_pprpa.gpu_reference`: `make_krks(cell, xc)` is
+  gpu4pyscf's Gamma KRKS (`exxdiv` None), with `gpu_fftdf.LowRankFFTDF`'s
+  adaptively compressed exchange (ACE) for a hybrid; `run_scf` converges it and
+  replaces the ACE virtual orbitals, which are not those of the full exchange,
+  by the full-exchange ones the pp-RPA needs.  `dft_gradient(kmf)` is the DFT
+  force of that reference (a bulk or embedding force constant at the same
+  functional): gpu4pyscf's multigrid gradient of the semilocal part at its
+  orbitals, plus the exact-exchange force of a global hybrid.  Range-separated
+  hybrids get the ACE SCF but no `dft_gradient`.
 - The RKS CPHF/Z-vector solve uses `gpu_response.fused_response` (J inside the
   fxc pass) for LDA/GGA and native `KRKS.gen_response(singlet=None, hermi=1)`
   otherwise; both cache the XC kernel once for all response applications.  The

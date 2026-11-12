@@ -42,10 +42,10 @@ from pyscf.data.nist import BOHR
 from pyscf.lib import chkfile
 from pyscf.pbc import gto, dft as cdft
 from pyscf.pbc.tools.pyscf_ase import pyscf_to_ase_atoms
-from gpu4pyscf.pbc import dft as gdft
 
 from lib_pprpa.pprpa_davidson import ppRPA_Davidson
 from lib_pprpa.gpu_ao2mo import gpu_ao2mo_blocks
+from lib_pprpa.gpu_reference import make_krks, run_scf
 from lib_pprpa.pprpa_eri_gpu import attach_gpu_eri_contraction, release_gpu_eri
 from lib_pprpa.grad import pprpa_gamma          # noqa: F401 (attaches .Gradients)
 from lib_pprpa.grad import pprpa_gamma_gpu as gpugrad
@@ -61,13 +61,12 @@ FMAX     = float(sys.argv[6]) if len(sys.argv) > 6 else 0.05
 MAXSTEPS = int(sys.argv[7]) if len(sys.argv) > 7 else 80
 
 # ---------------- defect / method settings (NV defaults) ----------------
-XC      = "pbe"
+XC      = "pbe"         # a hybrid ("0.18*HF+0.82*PBE,PBE", DDH) gets the ACE exchange
 CHANNEL = "hh"          # NV (-3) ground state from the dianion-like reference
 CHARGE  = -3
 BASIS   = "gth-dzvp"
 PSEUDO  = "gth-pbe"
 NROOT   = max(5, ISTATE + 1)
-GAMMA   = np.zeros((1, 3))      # pp-RPA is Gamma-point only
 CHK, RESTART, TRAJ = "scf.chk", "bfgs.pkl", "opt.traj"
 DEVICES = None                  # e.g. [0, 1]: dispatch ao2mo, the Davidson ERIs and the
                                 # 2-RDM exchange over these CUDA devices (default: current)
@@ -119,12 +118,10 @@ def _pipeline(cell, want_grad):
     nfo = nocc_all - nocc
     nact = nocc + nvir
 
-    # GPU SCF
-    kg = gdft.KRKS(cell, kpts=GAMMA, xc=XC)
-    kg.exxdiv = None
-    kg.conv_tol = 1e-9
+    # GPU SCF (a hybrid's exchange adaptively compressed, then the full-exchange orbitals)
+    kg = make_krks(cell, XC)
     kg.chkfile = CHK
-    kg.kernel(scf_guess(kg))
+    run_scf(kg, scf_guess(kg))
     mo = cp.asnumpy(kg.mo_coeff[0])
     moe = cp.asnumpy(kg.mo_energy[0])
     mo_occ = cp.asnumpy(kg.mo_occ[0])
