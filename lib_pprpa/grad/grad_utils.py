@@ -1465,7 +1465,8 @@ def _contract_xc_kernel(mf, xc_code, dmvo, dmoo=None, with_vxc=True, with_kxc=Tr
     return f1vo, f1oo, v1ao, k1ao
 
 
-def get_veff_krks(ks_grad, dm=None, kpts=None, ao_cache=None):
+def get_veff_krks(ks_grad, dm=None, kpts=None, ao_cache=None, with_vxc=True):
+    """(vxc, vjk) derivative skeletons of dm; with_vxc=False skips the XC grid pass (vxc None)."""
     from pyscf.pbc.grad.krks import get_vxc
     mf = ks_grad.base
     cell = ks_grad.cell
@@ -1487,6 +1488,8 @@ def get_veff_krks(ks_grad, dm=None, kpts=None, ao_cache=None):
     max_memory = max(2000, ks_grad.max_memory*.9-mem_now)
     if ks_grad.grid_response:
         raise NotImplementedError
+    elif not with_vxc:
+        vxc = None
     else:
         vxc = get_vxc(ni, cell, grids, mf.xc, dm, kpts,
                            max_memory=max_memory, verbose=ks_grad.verbose,
@@ -1508,7 +1511,10 @@ def get_veff_krks(ks_grad, dm=None, kpts=None, ao_cache=None):
     return vxc, vjk
 
 
-def _contract_xc_kernel_krks(mf, xc_code, dmvo, max_memory=2000, ao_cache=None):
+def _contract_xc_kernel_krks(mf, xc_code, dmvo, max_memory=2000, ao_cache=None, with_vxc=False):
+    """(f1vo, f1oo, v1ao, k1ao): f1vo the fxc skeleton of dmvo; with_vxc also v1ao (3, nao, nao),
+    the Vxc skeleton of the reference density in the same grid pass, as
+    pyscf.pbc.grad.krks.get_vxc."""
     from pyscf import lib
     from pyscf.lib import logger
     from pyscf.grad.tdrks import _lda_eval_mat_, _gga_eval_mat_, _mgga_eval_mat_
@@ -1532,7 +1538,7 @@ def _contract_xc_kernel_krks(mf, xc_code, dmvo, max_memory=2000, ao_cache=None):
     f1vo = np.zeros((4, nao, nao))  # 0th-order, d/dx, d/dy, d/dz
     deriv = 2
     f1oo = None
-    v1ao = None
+    v1ao = np.zeros((3, nao, nao)) if with_vxc else None
     k1ao = None
 
     if xctype == 'HF':
@@ -1563,12 +1569,21 @@ def _contract_xc_kernel_krks(mf, xc_code, dmvo, max_memory=2000, ao_cache=None):
             rho1 = rho1[np.newaxis]
         wv = lib.einsum('yg,xyg,g->xg', rho1, fxc, weight)
         fmat_(mol, f1vo, aok0, wv, mask, shls_slice, ao_loc)
+        if with_vxc:
+            # get_vxc's skeleton of the reference density from the same AOs and vxc
+            wv = vxc * weight
+            if xctype == 'LDA':
+                aow = np.einsum('pi,p->pi', aok0[0], wv[0])
+                rks_grad._d1_dot_(v1ao, mol, aok0[1:4], aow, mask, ao_loc, True)
+            else:
+                wv[0] *= .5
+                rks_grad._gga_grad_sum_(v1ao, mol, aok0, wv, mask, ao_loc)
 
     f1vo[1:] *= -1
     if f1oo is not None:
         f1oo[1:] *= -1
     if v1ao is not None:
-        v1ao[1:] *= -1
+        v1ao *= -1                      # get_vxc returns -vmat
     if k1ao is not None:
         k1ao[1:] *= -1
     return f1vo, f1oo, v1ao, k1ao
