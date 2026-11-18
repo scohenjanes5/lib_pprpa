@@ -10,7 +10,8 @@ and J go to FFTDF.
 
 With ``ace`` set, an orbital-tagged density gets the adaptively compressed exchange (Lin,
 JCTC 12, 2242 (2016)): W = K C_occ from the occupied pairs alone (``exchange_occ_ket``,
-nocc (nocc + 1) / 2 codensities instead of nocc x nmo) and
+nocc (nocc + 1) / 2 codensities instead of nocc x nmo; when its occupied grids and W do not
+fit on the device at once, ket blocks over nocc^2 codensities) and
 
     K_ace = W (C_occ^T W)^-1 W^T,
 

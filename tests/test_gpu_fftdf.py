@@ -160,6 +160,57 @@ def test_ket_blocks_start_alike(monkeypatch):
     assert max(used) - used[0] < 4096
 
 
+def test_occupied_exchange_in_ket_blocks(monkeypatch):
+    """When the occupied grids do not fit beside an FFT batch, the ACE exchange and the
+    occupied-ket exchange and force take D's factors in ket blocks, and agree with the
+    resident pair passes."""
+    import cupy as cp
+    import lib_pprpa.gpu_exchange as gx
+    from lib_pprpa.gpu_coulomb import exchange_coulG
+    from lib_pprpa.gpu_fftdf import LowRankFFTDF
+    cell = _cell()
+    kmf = _scf(cell, "pbe", lowrank=False)
+    dm = kmf.make_rdm1()
+    mo, mo_occ = cp.asnumpy(kmf.mo_coeff[0]), cp.asnumpy(kmf.mo_occ[0])
+    occ = mo_occ > 0
+    M = np.diag(mo_occ)
+    L = mo[:, occ] * mo_occ[occ]
+    coulG = exchange_coulG(cell, cell.mesh, 0.0, 0.25, 0.25, None)
+    args = dict(hermi=1, kpts=KPTS, with_j=False, exxdiv=None)
+    df = LowRankFFTDF(cell, KPTS)
+    df.ace = True
+
+    def run():
+        return (cp.asnumpy(df.get_jk(dm, **args)[1][0]),
+                cp.asnumpy(gx.exchange_occ_ket(cell, cell.mesh, M, mo, occ, coulG)),
+                gx.exchange_occ_ket(cell, cell.mesh, M, mo, occ, coulG, L=L))
+
+    ngrid = int(np.prod(cell.mesh))
+    assert gx._resident_fits(cell.mesh, 24 * int(occ.sum()))
+    resident = run()
+    calls = []
+    ket = gx.exchange_ket
+    monkeypatch.setattr(gx, "exchange_ket",
+                        lambda *a, **k: calls.append(k.get("L") is not None) or ket(*a, **k))
+    # four occupied orbitals always fit where the blocked plan does: say they do not, and
+    # give the blocks 240 bytes per grid point (ket blocks of 4, factor blocks of 12)
+    monkeypatch.setattr(gx, "_resident_fits", lambda mesh, held: False)
+    monkeypatch.setattr(gx, "free_bytes", lambda: 240 * ngrid + 512 * 1024**2)
+    blocked = run()
+    assert calls == [False, False, True]           # ACE, occupied K, occupied force
+    for got, ref in zip(blocked, resident):
+        assert np.abs(got - ref).max() < 1e-12 * np.abs(ref).max()
+
+
+def test_resident_fits(monkeypatch):
+    """Resident grids fit while one codensity's FFT bytes remain beside them."""
+    import lib_pprpa.gpu_exchange as gx
+    mesh = (20, 20, 20)
+    monkeypatch.setattr(gx, "free_bytes", lambda: 240 * 8000 + 512 * 1024**2)
+    assert gx._resident_fits(mesh, 240 - 64)
+    assert not gx._resident_fits(mesh, 240 - 63)
+
+
 @pytest.mark.parametrize("xc", ("b3lyp", "hse06"))
 def test_hybrid_scf_energy(xc):
     cell = _cell()

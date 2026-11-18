@@ -5,9 +5,11 @@ pair, by ``gpu_fft_chain`` on 7-smooth meshes, else cuFFT; ket grids and W stay 
 while the factor grids pass in blocks.  On the occupied kets o, D's blocks over the MOs
 (o M_oo o^T + c o^T + o c^T + D_vv, c = C_v M_vo) need the pairs o_j o_i once (W_i += s_j
 V[o_j o_i], s = c + o M_oo), n^2 pairs c_j o_i (W_i += o_j V[c_j o_i]) and D_vv's factors:
-``exchange_occ_ket`` takes these or D's factors, whichever has fewer pairs;
-``exchange_cross_ket`` a CPHF density (1.5 n^2 pairs, not 2 n^2).  With ``L`` the ket and
-occupied passes give the exchange force instead of K C.
+``exchange_occ_ket`` takes these or D's factors, whichever has fewer pairs, with o and W on
+the whole grid; when those grids do not fit beside an FFT batch (n orbitals on a large mesh) it
+takes D's factors through ``exchange_ket``'s ket blocks instead.  ``exchange_cross_ket`` a CPHF
+density (1.5 n^2 pairs, not 2 n^2).  With ``L`` the ket and occupied passes give the exchange
+force instead of K C.
 '''
 
 import numpy as np
@@ -110,6 +112,23 @@ def _plan(cell, mesh, nket, rank):
     kb = max(1, min(nket, int(_KET_SHARE * per_point) // 16))     # ket grid + W
     ub = max(1, min(rank, int(_FACTOR_SHARE * per_point) // 8))
     return kb, ub, _fft_batch(ngrid, 16 * kb + 8 * ub)
+
+
+def _resident_fits(mesh, held):
+    '''True when ``held`` bytes per grid point, kept on the device for a whole pass (orbital
+    grids and their W), leave room in the free device memory for an FFT batch: the passes
+    that hold them run with any batch of one codensity or more.'''
+    ngrid = int(np.prod(mesh))
+    return plan_budget(free_bytes()) // ngrid - held >= EXCHANGE_FFT_BYTES
+
+
+def _occ_grids_held(n, parts):
+    '''Bytes per grid point _occ_grids holds with the keyword arguments ``parts``: o and W,
+    and s or the cross grids when D's blocks pair the occupied orbitals (not for a diagonal
+    o o block alone, whose s grids are o's).'''
+    oo, cross = parts.get('oo'), parts.get('cross')
+    paired = (oo is not None or cross is not None) and not _diagonal(oo, cross)
+    return 8 * n * (3 if paired else 2)
 
 
 def _fft_batch(ngrid, held=0):
@@ -280,13 +299,19 @@ def exchange_occ_ket(cell, mesh, M, mo, occ, coulG, L=None, verbose=None):
     '''K[mo M mo^T] @ mo[:, occ], CuPy (nao, n), for a symmetric M (nmo, nmo) over the MOs
     ``mo`` and their occupied mask ``occ`` (NumPy bool); with L (nao, n) the exchange force
     against it instead, as ``exchange_ket``.  D's blocks or its factors, whichever has fewer
-    pairs (_occ_parts).'''
+    pairs (_occ_parts); D's factors in ``exchange_ket``'s ket blocks when the occupied grids do
+    not fit on the device at once.'''
     log = logger.new_logger(cell, verbose)
     t0 = log.init_timer()
     what = 'exchange' if L is None else 'exchange force'
     mesh = np.asarray(mesh, dtype=int)
     parts, pairs = _occ_parts(M, mo, occ)
     o = cp.asarray(mo, dtype=np.float64)[:, cp.asarray(np.flatnonzero(occ))]
+    if not _resident_fits(mesh, _occ_grids_held(o.shape[1], parts)):
+        lam, U = factor(M, mo)
+        log.info('%s: %d occupied grids do not fit on the device; %d factor pairs in ket '
+                 'blocks', what, o.shape[1], len(lam) * o.shape[1])
+        return exchange_ket(cell, mesh, lam, U, o, coulG, L=L, verbose=log)
     W = _occ_grids(cell, mesh, o, half_kernel(coulG, mesh), log=log, **parts)
     out = ao_project(cell, mesh, W) if L is None else ao_force(cell, mesh, W, L)
     log.timer(f'{what} on the occupied kets: {pairs} codensity pairs', *t0)
