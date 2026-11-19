@@ -28,6 +28,7 @@ from lib_pprpa.grad.grad_utils_gpu_pbc import relaxed_xc_gradient as _xcg_gpu
 from lib_pprpa.grad.hcore_contracted import hcore_deriv_contracted
 from lib_pprpa.grad.pprpa import make_rdm1_relaxed_warm
 from lib_pprpa.grad.pprpa_gamma_gpu import make_gpu_vresp
+from lib_pprpa.gpu_gdf import TieredCderi
 from lib_pprpa.gpu_mem import pooled
 from lib_pprpa.pprpa_util import start_clock, stop_clock
 from lib_pprpa.pbc_gdf import validate_gdf_context, validate_gdf_mf
@@ -150,11 +151,12 @@ class _GDFDerivativeEngine:
             cell, with_df.auxcell, _guess_omega(cell), kmesh).build()
         self.linear_dep_threshold = with_df.linear_dep_threshold
 
-    def jk_sum(self, terms):
+    def jk_sum(self, terms, release_cderi=False):
         """Derivative of ``sum weight*(j_factor*E_J - k_factor/2*E_K)`` per atom over
         ``terms`` of (dm, hermi, j_factor, k_factor, exxdiv, weight), dm (nao, nao) symmetric
         for hermi=1 or antisymmetric for hermi=2 (no Coulomb part), with one pass of every
-        integral (``gdf_jk_deriv.ejk_derivatives``)."""
+        integral (``gdf_jk_deriv.ejk_derivatives``).  ``release_cderi`` frees the device rows
+        of a tiered cderi once the densities' fit is read from it."""
         nao = self.gpu_mf.cell.nao
         for dm, hermi, j_factor, *_ in terms:
             if hermi not in (1, 2):
@@ -167,9 +169,12 @@ class _GDFDerivativeEngine:
         with_df = self.gpu_mf.with_df
         if getattr(with_df, '_cderi', None) is None:
             with_df = None
+        release_cderi = (release_cderi and with_df is not None
+                         and isinstance(with_df._cderi[0], TieredCderi))
         return np.asarray(ejk_derivatives(
             self.opt, terms, omega=0.0,
-            linear_dep_threshold=self.linear_dep_threshold, with_df=with_df)[0])
+            linear_dep_threshold=self.linear_dep_threshold, with_df=with_df,
+            release_cderi=release_cderi)[0])
 
 
 def grad_elec(pprpa_grad, xy, mult, atmlst=None):
@@ -217,6 +222,8 @@ def grad_elec(pprpa_grad, xy, mult, atmlst=None):
 
     p_mo, w_mo = make_rdm1_relaxed_warm(pprpa_grad, mf, xy, mult, vresp=vresp,
                                         pair_get_k=pair_get_k)
+    # the response and the pair exchange no longer read the cderi
+    vresp = pair_get_k = None
 
     w = mo @ w_mo @ mo.T - kg_cpu.make_rdm1e(
         kmf_cpu.mo_energy, kmf_cpu.mo_coeff, kmf_cpu.mo_occ)[0]
@@ -260,7 +267,7 @@ def grad_elec(pprpa_grad, xy, mult, atmlst=None):
         terms.append((xs, 1, 0.0, 2.0, None, -1.0))
     # one pass of the three-center derivative integrals for all of them
     start_clock('Calculate GDF Coulomb and exchange derivatives')
-    de += gdf_deriv.jk_sum(terms)
+    de += gdf_deriv.jk_sum(terms, release_cderi=pprpa_grad.release_cderi_device)
     stop_clock('Calculate GDF Coulomb and exchange derivatives')
 
     # XC potential skeleton and its response to the relaxed density.  This
@@ -290,6 +297,10 @@ class Gradients(_cpu.Gradients):
         # evaluations does not rebuild them every time.
         self.gpu_df = gpu_df
         self.gpu_grids = gpu_grids
+        # A tiered gpu_df's device rows go to the GDF derivative pass once its last reader
+        # (the densities' fit) is done: its Fourier blocks need tens of GB at NV215.  That
+        # gpu_df then serves no other gradient; a caller reusing it sets this False.
+        self.release_cderi_device = True
         self.base = pprpa
         self.mol = mf.cell
         self.cell = mf.cell

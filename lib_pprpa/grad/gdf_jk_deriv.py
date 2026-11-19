@@ -61,7 +61,7 @@ __all__ = ['ejk_derivatives']
 
 
 def ejk_derivatives(int3c2e_opt, terms, omega=None, verbose=None,
-                    linear_dep_threshold=LINEAR_DEP_THR, with_df=None):
+                    linear_dep_threshold=LINEAR_DEP_THR, with_df=None, release_cderi=False):
     '''Nuclear (natm, 3) and strain (3, 3) derivatives of
     sum_t weight_t * (j_factor_t E_J[dm_t] - k_factor_t/2 E_K[dm_t]) per cell, each term as
     gpu4pyscf's ``pbc.df.grad.rhf._get_ejk_derivatives(int3c2e_opt, dm, hermi, j_factor,
@@ -74,6 +74,8 @@ def ejk_derivatives(int3c2e_opt, terms, omega=None, verbose=None,
         applied, is then read from it (C L.dm, C a^T L b, :func:`lib_pprpa.gpu_gdf.cderi_fit`)
         instead of evaluated with the 0th-order integrals; C is the eigendecomposed metric
         factor gpu4pyscf's cderi carries, the one the metric below is built from.
+    release_cderi : free the device rows of with_df's :class:`lib_pprpa.gpu_gdf.TieredCderi`
+        once the fit is read (``release_device``), for the Fourier blocks that follow.
     '''
     cell = int3c2e_opt.cell
     auxcell = int3c2e_opt.auxcell
@@ -241,6 +243,8 @@ def ejk_derivatives(int3c2e_opt, terms, omega=None, verbose=None,
         if aux_coeff.shape[0] != naux:
             raise ValueError("with_df's auxiliary basis is not the integrals' one")
         rho_df, blocks = cderi_fit(with_df, jdms_orig, kpairs_orig, verbose=verbose)
+        if release_cderi:
+            with_df._cderi[0].release_device()
         if rho_df.shape[1] != aux_coeff.shape[1]:
             raise ValueError('with_df: its cderi was fitted with another metric truncation')
         auxvec = rho_df.dot(aux_coeff.T)
