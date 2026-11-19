@@ -36,7 +36,7 @@ import numpy as np
 import cupy as cp
 from pyscf import lib
 from gpu4pyscf.lib import logger
-from gpu4pyscf.lib.cupy_helper import contract, empty_aligned, get_avail_mem, ndarray
+from gpu4pyscf.lib.cupy_helper import contract, empty_aligned, ndarray
 from gpu4pyscf.__config__ import props as gpu_specs
 from gpu4pyscf.df.grad.rhf import factorize_dm
 from gpu4pyscf.df.int3c2e_bdiv import _split_l_ctr_pattern, get_ao_pair_loc
@@ -55,6 +55,7 @@ from gpu4pyscf.pbc.gto.cell import get_Gv_weights
 from gpu4pyscf.pbc.tools.pbc import madelung
 
 from lib_pprpa.gpu_gdf import cderi_fit
+from lib_pprpa.gpu_mem import free_bytes
 
 __all__ = ['ejk_derivatives']
 
@@ -118,7 +119,7 @@ def ejk_derivatives(int3c2e_opt, terms, omega=None, verbose=None,
     aux_loc = auxcell.ao_loc
     naux = int(aux_loc[-1])
 
-    mem_free = get_avail_mem(exclude_memory_pool=True)
+    mem_free = free_bytes()
     mem_avail = mem_free - naux*nocc2*8 - nao**2*8*(nj+1)
     batch_size = max(1, min(naux, int(mem_avail*.5/(nao_pair*8))))
     assert batch_size < POOL_SIZE
@@ -158,7 +159,7 @@ def ejk_derivatives(int3c2e_opt, terms, omega=None, verbose=None,
     wcoulG_LR1[:,:,0] += wcoulG_SR_at_G0 * cp.eye(3)
 
     def g_block_size():
-        mem_avail = get_avail_mem(exclude_memory_pool=True)
+        mem_avail = free_bytes()
         Gsize = (max(nao**2, naux) + max(nao*noccmax, naux) + naux + nao_pair
                  + nao**2 + noccmax**2)
         Gblksize = min(int(mem_avail*.8//(Gsize*16))//32*32, ngrids)
@@ -456,7 +457,7 @@ def _aux_apply(m, blk, out=None):
     ni, nj = blk.shape[1], blk.shape[2]
     if out is None:
         out = cp.empty((m.shape[0], ni, nj))
-    step = min(ni, max(1, int(get_avail_mem(exclude_memory_pool=True)*.4 // (m.shape[0]*nj*8))))
+    step = min(ni, max(1, int(free_bytes()*.4 // (m.shape[0]*nj*8))))
     for i0, i1 in lib.prange(0, ni, step):
         out[:, i0:i1] = contract('uv,vij->uij', m, blk[:, i0:i1])
     return out
