@@ -264,6 +264,10 @@ class TieredCderi:
     def nbytes(self):
         return self.shape[0] * self.shape[1] * 8
 
+    def release_device(self):
+        '''Free the device rows for the caller's last passes; reading them afterwards raises.'''
+        self.dev = None
+
     def store(self, j3c, p0, p1):
         '''Write the columns [p0, p1) of every row from the device array j3c (naux, p1 - p0).'''
         npair = self.shape[1]
@@ -290,7 +294,9 @@ class TieredCderi:
         q0, q1 = key.indices(self.shape[0])[:2]
         q1 = max(q0, q1)
         npair = self.shape[1]
-        same_device = self.dev.device.id == cp.cuda.Device().id
+        if self.dev is None and q0 < self.ndev:
+            raise RuntimeError('the device rows of this cderi were released (release_device)')
+        same_device = self.dev is not None and self.dev.device.id == cp.cuda.Device().id
         if q1 <= self.ndev and same_device:
             return self.dev[q0:q1]
         out = cp.empty((q1 - q0, npair))

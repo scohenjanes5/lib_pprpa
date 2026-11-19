@@ -165,6 +165,21 @@ def test_tiered_cderi_matches_stock_build(diamond, tmp_path):
                                _eri(cderi_active_factors(stock, mo)), rtol=0.0, atol=1e-12)
 
 
+
+def test_tiered_cderi_release_device(diamond, tmp_path):
+    stock, twin = _tiered_twin(diamond, tmp_path, ndev=40, nhost=70)
+    store = twin._cderi[0]
+    naux = store.shape[0]
+    store.release_device()
+    assert store.dev is None
+    # the host and file rows stay readable, the device rows raise
+    np.testing.assert_allclose(store[40:naux].get(), stock._cderi[0][40:naux], rtol=0.0,
+                               atol=1e-12)
+    for q0, q1 in ((3, 17), (35, 50)):
+        with pytest.raises(RuntimeError, match='released'):
+            store[q0:q1]
+
+
 def test_tiered_cderi_through_gpu4pyscf_jk(diamond, tmp_path):
     import cupy as cp
 
